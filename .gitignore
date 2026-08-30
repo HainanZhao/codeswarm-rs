@@ -1,0 +1,16 @@
+# Rust build artifacts
+target/
+dist/
+
+# Local tool caches
+__pycache__/
+.venv/
+
+.DS_Store
+.vscode
+.zed
+*.log
+
+agent.jsonl
+replay.jsonl
+sandbox/

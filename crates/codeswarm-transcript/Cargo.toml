@@ -1,0 +1,14 @@
+[package]
+name = "codeswarm-transcript"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "codeswarm-transcript-bench"
+path = "src/bin/benchmark.rs"
