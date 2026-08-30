@@ -2204,7 +2204,18 @@ impl App {
         let relative = usize::from(column - 1);
         let right_start = metrics.left_width;
         if metrics.right_width > 0 && relative >= right_start {
-            return FooterAction::OpenMode;
+            let control_offset = relative.saturating_sub(right_start);
+            if control_offset < metrics.collaboration_width {
+                return FooterAction::OpenCollaboration;
+            }
+            if control_offset
+                >= metrics
+                    .collaboration_width
+                    .saturating_add(metrics.control_gap)
+            {
+                return FooterAction::OpenMode;
+            }
+            return FooterAction::Ignored;
         }
 
         if self.collaboration == "Pair review" {
@@ -2965,6 +2976,9 @@ struct FooterMetrics {
     right_width: usize,
     agent_width: usize,
     path_width: usize,
+    collaboration_width: usize,
+    mode_width: usize,
+    control_gap: usize,
 }
 
 fn cell_width(value: &str) -> usize {
@@ -2977,11 +2991,26 @@ fn agent_message_prefix(name: &str) -> String {
 }
 
 fn footer_mode_label(app: &App) -> String {
-    if app.mouse_selection_mode {
-        format!(" Select text · {} ", app.mode)
+    let mode = if app.mode == "Auto pilot" {
+        "Auto"
     } else {
-        format!(" {} ", app.mode)
+        app.mode.as_str()
+    };
+    if app.mouse_selection_mode {
+        format!(" Select text · {mode} ")
+    } else {
+        format!(" {mode} ")
     }
+}
+
+fn footer_collaboration_label(app: &App) -> String {
+    let collaboration = match app.collaboration.as_str() {
+        "Roster relay" => "Roster",
+        "Manual routing" => "Manual",
+        "Pair review" => "Pair",
+        value => value,
+    };
+    format!(" {collaboration} ")
 }
 
 fn format_turn_elapsed(started: Instant) -> String {
@@ -2996,7 +3025,14 @@ fn footer_metrics(app: &App, outer_width: u16) -> FooterMetrics {
         return FooterMetrics::default();
     }
     let mode_label = footer_mode_label(app);
-    let right_width = cell_width(&mode_label).min(usize::from(inner_width) / 2);
+    let collaboration_label = footer_collaboration_label(app);
+    let right_budget = usize::from(inner_width) / 2;
+    let mode_width = cell_width(&mode_label).min(right_budget);
+    let remaining = right_budget.saturating_sub(mode_width);
+    let collaboration_width =
+        cell_width(&collaboration_label).min(remaining.saturating_sub(usize::from(remaining > 0)));
+    let control_gap = usize::from(collaboration_width > 0 && mode_width > 0);
+    let right_width = collaboration_width + control_gap + mode_width;
     let left_width = usize::from(inner_width).saturating_sub(right_width);
     let agent_length = footer_agent_spans(app)
         .iter()
@@ -3010,6 +3046,9 @@ fn footer_metrics(app: &App, outer_width: u16) -> FooterMetrics {
         right_width,
         agent_width,
         path_width,
+        collaboration_width,
+        mode_width,
+        control_gap,
     }
 }
 
@@ -3083,6 +3122,7 @@ fn render_footer(buffer: &mut Buffer, area: Rect, app: &App) {
 
     let metrics = footer_metrics(app, area.width);
     let mode_label = footer_mode_label(app);
+    let collaboration_label = footer_collaboration_label(app);
     let agent_spans = footer_agent_spans(app);
 
     if metrics.agent_width > 0 {
@@ -3115,11 +3155,27 @@ fn render_footer(buffer: &mut Buffer, area: Rect, app: &App) {
         return;
     }
     let right_x = inner.right().saturating_sub(metrics.right_width as u16);
-    Paragraph::new(compact_cell_label(&mode_label, metrics.right_width))
+    if metrics.collaboration_width > 0 {
+        Paragraph::new(compact_cell_label(
+            &collaboration_label,
+            metrics.collaboration_width,
+        ))
+        .style(Style::default().fg(ACCENT).bg(STATUS_BG).bold())
+        .render(
+            Rect::new(right_x, area.y, metrics.collaboration_width as u16, 1),
+            buffer,
+        );
+    }
+    let mode_x = right_x.saturating_add(
+        metrics
+            .collaboration_width
+            .saturating_add(metrics.control_gap) as u16,
+    );
+    Paragraph::new(compact_cell_label(&mode_label, metrics.mode_width))
         .alignment(Alignment::Right)
         .style(Style::default().fg(Color::Gray).bg(STATUS_BG))
         .render(
-            Rect::new(right_x, area.y, metrics.right_width as u16, 1),
+            Rect::new(mode_x, area.y, metrics.mode_width as u16, 1),
             buffer,
         );
 }
@@ -5194,8 +5250,9 @@ mod tests {
         assert!(footer.contains("→ ◌ Codex"), "footer={footer:?}");
         assert!(!footer.contains("… Claude"), "footer={footer:?}");
         assert!(footer.contains("/work/codeswarm"), "footer={footer:?}");
-        assert!(!footer.contains("Roster"), "footer={footer:?}");
-        assert!(footer.contains("Auto pilot"), "footer={footer:?}");
+        assert!(footer.contains("Roster"), "footer={footer:?}");
+        assert!(footer.contains("Auto"), "footer={footer:?}");
+        assert!(!footer.contains("Auto pilot"), "footer={footer:?}");
         assert!(
             rows[rows.len() - 2].contains("How can I help you today?"),
             "rows={rows:?}"
@@ -5210,8 +5267,9 @@ mod tests {
         app.set_selected_agent(Some(1));
 
         assert_eq!(app.footer_action(20, 120), FooterAction::SelectAgent(1));
-        assert_eq!(app.footer_action(98, 120), FooterAction::Ignored);
-        assert_eq!(app.footer_action(110, 120), FooterAction::OpenMode);
+        assert_eq!(app.footer_action(106, 120), FooterAction::OpenCollaboration);
+        assert_eq!(app.footer_action(112, 120), FooterAction::Ignored);
+        assert_eq!(app.footer_action(115, 120), FooterAction::OpenMode);
 
         app.set_collaboration("Pair review");
         assert_eq!(app.footer_action(3, 120), FooterAction::Ignored);
@@ -5341,7 +5399,7 @@ mod tests {
         let content = terminal.backend().buffer().content();
         let rendered = content.iter().map(|cell| cell.symbol()).collect::<String>();
         assert!(!rendered.contains("connection lost"));
-        assert!(rendered.contains("Auto pilot"));
+        assert!(rendered.contains("Auto"));
         assert!(app.status.contains("/reload"));
     }
 

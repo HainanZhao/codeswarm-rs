@@ -845,8 +845,8 @@ impl std::fmt::Debug for RelayHost {
 
 impl RelayHost {
     pub fn new(hosts: Vec<AdapterHost>, max_rounds: usize) -> Result<Self, AdapterError> {
-        if hosts.len() < 2 {
-            return Err(AdapterError::Unsupported("relay requires two adapters"));
+        if hosts.is_empty() {
+            return Err(AdapterError::Unsupported("relay requires an adapter"));
         }
         Ok(Self {
             relay: Relay::new(hosts.len(), max_rounds),
@@ -1031,26 +1031,21 @@ impl RelayHost {
 
     pub async fn start(&mut self) -> AdapterResult<()> {
         let event_sink = self.event_sink.clone();
-        for index in 0..self.hosts.len() {
-            if let Err(error) = self.hosts[index].start().await {
-                // The adapter that reported the failure may have allocated a
-                // child process or other resources before returning it. Give
-                // that adapter the same cleanup opportunity as the hosts
-                // that started earlier; this is the all-or-nothing startup
-                // contract exposed by the Python session coordinator.
-                let _ = self.hosts[index].stop().await;
-                for host in &mut self.hosts[..index] {
-                    let _ = host.stop().await;
-                }
-                return Err(error);
+        let startups = self.hosts.iter_mut().map(|host| {
+            let event_sink = event_sink.clone();
+            async move {
+                host.start().await?;
+                refresh_adapter_startup(host, &event_sink).await
             }
-            if let Err(error) = refresh_adapter_startup(&mut self.hosts[index], &event_sink).await {
-                let _ = self.hosts[index].stop().await;
-                for host in &mut self.hosts[..index] {
-                    let _ = host.stop().await;
-                }
-                return Err(error);
+        });
+        let results = futures::future::join_all(startups).await;
+        if let Some(error) = results.into_iter().find_map(Result::err) {
+            // Startup is transactional even though independent adapters are
+            // warmed concurrently. Every host gets a cleanup attempt.
+            for host in &mut self.hosts {
+                let _ = host.stop().await;
             }
+            return Err(error);
         }
         if let Err(error) = self
             .set_policy(codeswarm_core::policy::DEFAULT_POLICY_ID.into())
@@ -3538,6 +3533,60 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct ConcurrentStartAdapter {
+        slot: usize,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl AgentAdapter for ConcurrentStartAdapter {
+        fn slot(&self) -> usize {
+            self.slot
+        }
+
+        fn capabilities(&self) -> AgentCapabilities {
+            AgentCapabilities::default()
+        }
+
+        async fn start(&mut self) -> super::AdapterResult<()> {
+            self.barrier.wait().await;
+            Ok(())
+        }
+
+        async fn send_prompt(&mut self, _prompt: String) -> super::AdapterResult<()> {
+            Ok(())
+        }
+
+        async fn cancel(&mut self) -> super::AdapterResult<bool> {
+            Ok(true)
+        }
+
+        async fn answer_permission(
+            &mut self,
+            _request_id: String,
+            _answer: PermissionAnswer,
+        ) -> super::AdapterResult<()> {
+            Ok(())
+        }
+
+        async fn set_mode(&mut self, _mode: String) -> super::AdapterResult<()> {
+            Ok(())
+        }
+
+        async fn reload(&mut self) -> super::AdapterResult<()> {
+            Ok(())
+        }
+
+        async fn stop(&mut self) -> super::AdapterResult<()> {
+            Ok(())
+        }
+
+        async fn next_event(&mut self) -> Option<super::AdapterResult<AgentEvent>> {
+            std::future::pending().await
+        }
+    }
+
+    #[derive(Debug)]
     struct PermissionBlockingAdapter {
         slot: usize,
         phase: u8,
@@ -4893,6 +4942,27 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ready_slots, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn independent_roster_adapters_start_concurrently() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let hosts = (0..2)
+            .map(|slot| {
+                AdapterHost::new(
+                    Box::new(ConcurrentStartAdapter {
+                        slot,
+                        barrier: Arc::clone(&barrier),
+                    }),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut relay = RelayHost::new(hosts, 4).expect("relay");
+        tokio::time::timeout(std::time::Duration::from_millis(100), relay.start())
+            .await
+            .expect("startup should not serialize barrier participants")
+            .expect("startup succeeds");
     }
 
     #[tokio::test]

@@ -1484,11 +1484,6 @@ fn reconcile_config_roster(
     if desired.is_empty() {
         return Err("select at least one agent for the roster".into());
     }
-    if app.agent_count() < 2 {
-        // Solo adapter loops intentionally do not host live roster controls;
-        // persist the catalog choice for the next multi-agent launch.
-        return Ok(true);
-    }
     if pending_owner.is_some() {
         return Ok(false);
     }
@@ -1794,19 +1789,6 @@ fn run_roster(
     first_slot: usize,
     max_rounds: usize,
 ) -> std::io::Result<()> {
-    if specs.len() == 1 {
-        return match &specs[0] {
-            AgentSpec::Agy(command) => {
-                run_agy_command(terminal, prompt, command, owner_session_id.is_some())
-            }
-            AgentSpec::Acp(program) => run_acp_program(
-                terminal,
-                program.clone(),
-                prompt,
-                owner_session_id.is_some(),
-            ),
-        };
-    }
     let mut app = App::default();
     for (slot, spec) in specs.iter().enumerate() {
         let name = match spec {
@@ -2365,6 +2347,11 @@ async fn run_relay_sequence_with_controls(
             return (false, blocking);
         }
         if !matches!(decision, Some(RelayDecision::Dispatch { .. })) {
+            return (false, blocking);
+        }
+        // A one-agent roster uses the same hot-reload-capable host but never
+        // reviews itself. Adding a peer later naturally enables the ring.
+        if relay.relay().active_slots().count() == 1 {
             return (false, blocking);
         }
         // The first invocation carries the human task. Subsequent invocations
@@ -3066,7 +3053,7 @@ fn run_terminal(
                         }
                         if app.config_roster_dirty() {
                             let roster = app.config_roster_identities();
-                            if turn_active || controls.is_none() {
+                            if controls.is_none() {
                                 match save_roster(&roster) {
                                     Ok(()) => {
                                         app.mark_config_roster_saved();
@@ -3090,7 +3077,13 @@ fn run_terminal(
                                             app.status = format!("unable to save roster: {error}");
                                         }
                                     },
-                                    Ok(false) => app.status = "applying roster changes".into(),
+                                    Ok(false) => {
+                                        app.status = if turn_active {
+                                            "roster changes queued for the turn boundary".into()
+                                        } else {
+                                            "applying roster changes".into()
+                                        }
+                                    }
                                     Err(error) => {
                                         config_reconcile_pending = false;
                                         app.status = format!("unable to apply roster: {error}");
@@ -4561,6 +4554,40 @@ mod tests {
     }
 
     #[test]
+    fn config_roster_reconciliation_hot_adds_to_a_single_agent_session() {
+        let mut app = codeswarm_tui::App::default();
+        app.set_agent_name(0, "Codex");
+        app.set_agent_identity(0, "openai.com");
+        app.set_config_agents(vec![
+            StoreAgent {
+                identity: "openai.com".into(),
+                name: "Codex".into(),
+                adapter: "ACP".into(),
+                command: "codex --acp".into(),
+                available: true,
+                selected: true,
+            },
+            StoreAgent {
+                identity: "qwen.ai".into(),
+                name: "Qwen".into(),
+                adapter: "ACP".into(),
+                command: "qwen --acp".into(),
+                available: true,
+                selected: true,
+            },
+        ]);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut pending_owner = None;
+        assert!(
+            !reconcile_config_roster(&mut app, &sender, &mut pending_owner).expect("reconcile")
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AdapterControl::Add { identity, .. }) if identity == "qwen.ai"
+        ));
+    }
+
+    #[test]
     fn parses_repeated_mixed_roster_with_selected_first_and_round_limit() {
         let args = vec![
             "--roster".into(),
@@ -4686,6 +4713,34 @@ mod tests {
                 answer: PermissionAnswer::Selected { option_id },
             }) if request_id == "request-7" && option_id == "allow-once"
         ));
+    }
+
+    #[tokio::test]
+    async fn single_agent_roster_uses_hot_reload_host_without_self_review() {
+        let host = AdapterHost::new(
+            Box::new(ScriptedAdapter::new(
+                0,
+                AgentCapabilities::default(),
+                [
+                    AgentEvent::Text {
+                        slot: 0,
+                        text: "done".into(),
+                    },
+                    AgentEvent::TurnComplete { slot: 0 },
+                ],
+            )),
+            None,
+        );
+        let mut relay = RelayHost::new(vec![host], 10).expect("single-agent host");
+        relay.start().await.expect("start");
+        let (sender, _events) = std::sync::mpsc::channel::<AdapterResult<AgentEvent>>();
+        let (_control_sender, mut controls) = tokio::sync::mpsc::unbounded_channel();
+        let (stopping, deferred) =
+            run_relay_sequence_with_controls(&mut relay, &mut controls, &sender, "task".into(), 0)
+                .await;
+        assert!(!stopping);
+        assert!(deferred.is_empty());
+        assert_eq!(relay.dispatches().len(), 1);
     }
 
     #[tokio::test]

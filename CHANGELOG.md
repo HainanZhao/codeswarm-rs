@@ -15,12 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Relicensed CodeSwarm under the MIT License.
-- Collapsed tool and thought details now show a one-line preview of their
-  first content line instead of a word count, and `Ctrl+O` expands or
-  collapses the latest detail. Consecutive collapsed tool calls share one
-  activity row and use only the `◆` marker instead of repeating the word
-  "Tool". The old hint advertised Enter, which is reserved for submitting
-  prompts.
+- The footer now exposes compact `Roster`/`Manual`/`Pair` collaboration and
+  `Auto` permission controls. Both open configuration when clicked.
+- Saving roster changes hot-adds, drops, promotes, and reorders live agents,
+  including sessions that started with one agent.
+- Independent roster adapters initialize concurrently to reduce first-message
+  latency while relay turns remain strictly sequential.
+- Ordinary tool and terminal lifecycle rows stay out of the conversation;
+  active turns show elapsed time and concrete tool counts in the footer.
+- Agent replies use one timestamped chat header per turn, with rolling thought
+  previews and a blank separator before each new agent.
 
 ### Fixed
 
