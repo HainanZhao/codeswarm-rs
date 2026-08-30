@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-08-30
+
+### Added
+
+- The row immediately above the prompt is now reserved for transient system
+  notices. Readiness and informational messages expire after three seconds;
+  connection errors and exceptions take priority and expire after six.
+- The composer now has an unlabeled upper rule and a permanent lower
+  separator, keeping it visually distinct from both system notices and the
+  footer without redundant “Prompt” copy.
+
+### Fixed
+
+- A turn now enters the working state as soon as its prompt is accepted, so
+  silent Antigravity reasoning keeps its footer timer active and cannot look
+  complete before the terminal `result` event. Relay lifecycle tests enforce
+  completion-before-handoff ordering.
+
+## [0.7.0] - 2026-08-30
+
 ### Added
 
 - Bundled catalog entries for Qwen Code (`qwen --acp`) and OpenCode

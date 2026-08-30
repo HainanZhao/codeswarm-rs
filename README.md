@@ -7,7 +7,13 @@ interface. It collects no telemetry.
 
 ## Install
 
-Build the release binary with Cargo:
+Install the published binary with Cargo:
+
+```bash
+cargo install codeswarm --locked
+```
+
+Or build the release binary from this repository:
 
 ```bash
 cargo build --release -p codeswarm --locked
@@ -96,6 +102,22 @@ Inside the conversation prompt:
 - `/reload` retries the most recently crashed agent in its roster slot.
 - `/to SLOT` selects any active roster slot for the next message.
 - `/clear` clears the local transcript; `/close` exits the session.
+
+Typing `/` opens a compact command palette with descriptions. The conversation
+chrome stays fixed: a transient one-line system banner, an unlabeled composer,
+a lower separator, and the footer. Readiness notices disappear after three
+seconds; errors take priority and disappear after six. The footer timer starts
+as soon as an agent accepts a prompt, including silent reasoning time.
+
+`/config` is also where live ACP models are selected. Highlight a running
+agent and use `←/→` to cycle the model catalog advertised by that agent, then
+press `Ctrl+S`. Agents that do not advertise model configuration show no
+synthetic choices.
+
+Relay context is incremental. Each agent receives the new human prompt and
+only public human/agent messages it has not seen since its previous turn. Tool
+output, thoughts, terminal output, and the local UI transcript are never
+replayed to peers. The roster introduction is sent once per adapter process.
 
 The interface keeps streamed output coalesced and transcript rows cached, so a
 5,000-word response remains interactive in constrained terminals.

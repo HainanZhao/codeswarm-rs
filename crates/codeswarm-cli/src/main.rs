@@ -1977,15 +1977,16 @@ fn run_agy_task(
             &command,
             &adapter,
         );
-        if let Some(prompt) = prompt
-            && let Err(error) = adapter.send_prompt(prompt).await
-        {
-            let _ = sender.send(Err(error));
-            let _ = adapter.stop().await;
-            if let Some(writer) = &metadata_writer {
-                let _ = writer.flush();
+        if let Some(prompt) = prompt {
+            if let Err(error) = adapter.send_prompt(prompt).await {
+                let _ = sender.send(Err(error));
+                let _ = adapter.stop().await;
+                if let Some(writer) = &metadata_writer {
+                    let _ = writer.flush();
+                }
+                return;
             }
-            return;
+            let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 }));
         }
         let mut response_tail = String::new();
         'events: loop {
@@ -2026,6 +2027,8 @@ fn run_agy_task(
                     Some(AdapterControl::Prompt(prompt)) => {
                         if let Err(error) = adapter.send_prompt(prompt).await {
                             let _ = sender.send(Err(error));
+                        } else {
+                            let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 }));
                         }
                     }
                     Some(AdapterControl::Cancel) => {
@@ -2172,15 +2175,16 @@ fn run_acp_task(
             &command,
             &adapter,
         );
-        if let Some(prompt) = prompt
-            && let Err(error) = adapter.send_prompt(prompt).await
-        {
-            let _ = sender.send(Err(error));
-            let _ = adapter.stop().await;
-            if let Some(writer) = &metadata_writer {
-                let _ = writer.flush();
+        if let Some(prompt) = prompt {
+            if let Err(error) = adapter.send_prompt(prompt).await {
+                let _ = sender.send(Err(error));
+                let _ = adapter.stop().await;
+                if let Some(writer) = &metadata_writer {
+                    let _ = writer.flush();
+                }
+                return;
             }
-            return;
+            let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 }));
         }
         let mut response_tail = String::new();
         'events: loop {
@@ -2221,6 +2225,8 @@ fn run_acp_task(
                     Some(AdapterControl::Prompt(prompt)) => {
                         if let Err(error) = adapter.send_prompt(prompt).await {
                             let _ = sender.send(Err(error));
+                        } else {
+                            let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 }));
                         }
                     }
                     Some(AdapterControl::Cancel) => {
@@ -2827,7 +2833,8 @@ fn run_terminal(
                                 }
                                 _ => {}
                             },
-                            AgentEvent::Text { .. }
+                            AgentEvent::TurnStarted { .. }
+                            | AgentEvent::Text { .. }
                             | AgentEvent::Thought { .. }
                             | AgentEvent::Tool { .. }
                             | AgentEvent::Permission { .. }

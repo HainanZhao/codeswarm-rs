@@ -419,6 +419,7 @@ fn map_event_slot(event: AgentEvent, slot: RosterSlot) -> AgentEvent {
     match event {
         AgentEvent::RosterUpdated { update } => AgentEvent::RosterUpdated { update },
         AgentEvent::Ready { capabilities, .. } => AgentEvent::Ready { slot, capabilities },
+        AgentEvent::TurnStarted { .. } => AgentEvent::TurnStarted { slot },
         AgentEvent::ModesReplaced {
             modes,
             current_mode,
@@ -1439,6 +1440,9 @@ impl RelayHost {
             report_relay_failure(&mut self.relay, &event_sink, *slot, true, error.to_string());
             let _ = self.queue_session_metadata();
             return Err(error);
+        }
+        if let Some(sink) = &self.event_sink {
+            sink(AgentEvent::TurnStarted { slot: *slot });
         }
         if let Some(introduced) = self.introduced.get_mut(*slot) {
             *introduced = true;
@@ -5112,7 +5116,11 @@ mod tests {
         ];
         let mut relay = super::RelayHost::new(hosts, 4).expect("relay");
         relay.set_roster_names(vec!["Claude".into(), "Codex".into()]);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&events);
+        relay.set_event_sink(move |event| captured.lock().expect("events").push(event));
         relay.start().await.expect("start");
+        events.lock().expect("events").clear();
         assert!(matches!(
             relay.run_turn("task", 0).await.expect("first turn"),
             codeswarm_core::relay::RelayDecision::Dispatch { slot: 0, .. }
@@ -5143,6 +5151,19 @@ mod tests {
         assert!(relay.dispatches()[0].1.contains("2. Codex"));
         assert!(relay.dispatches()[1].1.contains(STOP_TOKEN));
         assert!(relay.dispatches()[0].1.contains("Do not use"));
+        let lifecycle = events.lock().expect("events");
+        let positions = lifecycle
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TurnStarted { slot } => Some(("start", *slot)),
+                AgentEvent::TurnComplete { slot } => Some(("complete", *slot)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions,
+            [("start", 0), ("complete", 0), ("start", 1), ("complete", 1)]
+        );
     }
 
     #[tokio::test]

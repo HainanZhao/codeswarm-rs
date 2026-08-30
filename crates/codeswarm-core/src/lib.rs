@@ -136,6 +136,9 @@ pub enum AgentEvent {
         slot: RosterSlot,
         capabilities: AgentCapabilities,
     },
+    TurnStarted {
+        slot: RosterSlot,
+    },
     ModesReplaced {
         slot: RosterSlot,
         modes: Vec<Mode>,
@@ -263,6 +266,10 @@ pub fn reduce(state: &mut SessionState, event: AgentEvent) -> Vec<Effect> {
             if let Some(agent) = state.slots.get_mut(slot) {
                 agent.capabilities = capabilities;
             }
+            vec![Effect::Render]
+        }
+        AgentEvent::TurnStarted { slot } => {
+            state.active_slot = Some(slot);
             vec![Effect::Render]
         }
         AgentEvent::ModesReplaced {

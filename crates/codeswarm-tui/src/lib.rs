@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use codeswarm_core::{AgentCommand, AgentEvent, TerminalEvent, ToolStatus, UsageUpdate};
@@ -354,8 +354,6 @@ impl Default for PromptEditor {
         let mut textarea = TextArea::default();
         textarea.set_block(
             Block::default()
-                .title(" Prompt ")
-                .title_style(Style::default().fg(ACCENT).bold())
                 .borders(Borders::TOP)
                 .padding(Padding::left(1))
                 .border_style(Style::default().fg(SEPARATOR)),
@@ -785,6 +783,19 @@ struct ConfigSnapshot {
     agents: Vec<StoreAgent>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BannerKind {
+    Info,
+    Error,
+}
+
+#[derive(Debug)]
+struct StatusBanner {
+    message: String,
+    kind: BannerKind,
+    expires_at: Instant,
+}
+
 #[derive(Debug)]
 pub struct App {
     pub transcript: Transcript,
@@ -794,6 +805,8 @@ pub struct App {
     prompt_message: String,
     pub active_agent: String,
     pub status: String,
+    last_status_seen: String,
+    status_banner: Option<StatusBanner>,
     mode: String,
     mode_policy: Option<String>,
     requested_mode: Option<String>,
@@ -874,6 +887,8 @@ impl Default for App {
             prompt_message: "How can I help you today?".into(),
             active_agent: "Initializing".into(),
             status: "idle".into(),
+            last_status_seen: "idle".into(),
+            status_banner: None,
             mode: "Auto pilot".into(),
             mode_policy: Some("full-access".into()),
             requested_mode: None,
@@ -2032,6 +2047,80 @@ impl App {
         self.status = status.into();
     }
 
+    fn refresh_status_banner(&mut self, now: Instant) {
+        if self
+            .status_banner
+            .as_ref()
+            .is_some_and(|banner| now >= banner.expires_at)
+        {
+            self.status_banner = None;
+        }
+        if self.status == self.last_status_seen {
+            return;
+        }
+        self.last_status_seen = self.status.clone();
+        let message = self.status.trim();
+        if message.is_empty() {
+            self.status_banner = None;
+            return;
+        }
+        if matches!(
+            message.to_ascii_lowercase().as_str(),
+            "idle" | "starting" | "thinking" | "streaming" | "waiting" | "queued"
+        ) {
+            return;
+        }
+        let lower = message.to_ascii_lowercase();
+        let kind = if [
+            "error",
+            "exception",
+            "failed",
+            "unable",
+            "crashed",
+            "invalid",
+            "unknown",
+            "unavailable",
+            "not found",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+        {
+            BannerKind::Error
+        } else {
+            BannerKind::Info
+        };
+        if kind == BannerKind::Info
+            && self
+                .status_banner
+                .as_ref()
+                .is_some_and(|banner| banner.kind == BannerKind::Error && now < banner.expires_at)
+        {
+            return;
+        }
+        let lifetime = match kind {
+            BannerKind::Info => Duration::from_secs(3),
+            BannerKind::Error => Duration::from_secs(6),
+        };
+        self.status_banner = Some(StatusBanner {
+            message: message.to_owned(),
+            kind,
+            expires_at: now + lifetime,
+        });
+    }
+
+    fn ready_status(&self, slot: usize) -> String {
+        let protocol = self
+            .agent_identity(slot)
+            .and_then(|identity| {
+                self.config_agents
+                    .iter()
+                    .find(|agent| agent.identity.eq_ignore_ascii_case(identity))
+            })
+            .map(|agent| agent.adapter.as_str())
+            .unwrap_or("agent");
+        format!("{} ready · {protocol}", self.agent_name(slot))
+    }
+
     fn sync_prompt_editor(&mut self) {
         if self.prompt_editor.text() != self.prompt {
             self.prompt_editor.set_text(self.prompt.clone());
@@ -2402,7 +2491,13 @@ impl App {
                 if self.failed_agent == Some(*slot) {
                     self.failed_agent = None;
                 }
-                self.status = "ready".into();
+                self.status = self.ready_status(*slot);
+            }
+            AgentEvent::TurnStarted { slot } => {
+                self.mark_agent_turn_started(*slot);
+                self.active_agent = self.agent_name(*slot);
+                self.agent_states.insert(*slot, "working".into());
+                self.status = "thinking".into();
             }
             AgentEvent::ModesReplaced {
                 slot,
@@ -2798,6 +2893,7 @@ impl App {
             self.prompt_height_hint()
                 + 1
                 + 1
+                + 1
                 + usize::from(self.queue_height())
                 + usize::from(self.permission_height())
                 + usize::from(self.help_height())
@@ -2895,6 +2991,7 @@ impl App {
 pub fn render(frame: &mut Frame, app: &mut App) {
     app.sync_prompt_editor();
     app.poll_path_index();
+    app.refresh_status_banner(Instant::now());
     let area = frame.area();
     if app.store_visible {
         if app.store_editing_directory {
@@ -2913,15 +3010,29 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
     let total_height = usize::from(area.height);
-    // Match the Python composer: one quiet information row below the prompt,
-    // regardless of roster size. Agent state belongs in the compact roster,
-    // not in a second full-width status row.
+    // Keep one stable system-message row immediately above the prompt, plus a
+    // separator and footer below it. None appears or disappears with activity.
     let status_height = usize::from(area.height > 0);
-    let minimum_prompt_height = total_height.saturating_sub(status_height).min(2);
-    let reserve_content =
-        usize::from(total_height > status_height.saturating_add(minimum_prompt_height));
+    let system_height = usize::from(area.height > 2);
+    let separator_height = usize::from(area.height > 3);
+    let minimum_prompt_height = total_height
+        .saturating_sub(
+            status_height
+                .saturating_add(system_height)
+                .saturating_add(separator_height),
+        )
+        .min(2);
+    let reserve_content = usize::from(
+        total_height
+            > status_height
+                .saturating_add(system_height)
+                .saturating_add(separator_height)
+                .saturating_add(minimum_prompt_height),
+    );
     let mut optional_height = total_height.saturating_sub(
         status_height
+            .saturating_add(system_height)
+            .saturating_add(separator_height)
             .saturating_add(minimum_prompt_height)
             .saturating_add(reserve_content),
     );
@@ -2941,6 +3052,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .saturating_sub(help_height)
         .saturating_sub(path_picker_height)
         .saturating_sub(command_palette_height);
+    let available_for_prompt = available_for_prompt.saturating_sub(system_height);
+    let available_for_prompt = available_for_prompt.saturating_sub(separator_height);
     let content_height = usize::from(available_for_prompt > minimum_prompt_height);
     let preferred_prompt_height = usize::from(app.prompt_editor.preferred_height(area.width));
     let preferred_prompt_height = if app.density == Density::Compact {
@@ -2957,7 +3070,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Constraint::Length(help_height as u16),
         Constraint::Length(path_picker_height as u16),
         Constraint::Length(command_palette_height as u16),
+        Constraint::Length(system_height as u16),
         Constraint::Length(prompt_height as u16),
+        Constraint::Length(separator_height as u16),
         Constraint::Length(status_height as u16),
     ])
     .split(area);
@@ -2996,8 +3111,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.command_palette_visible() {
         render_command_palette(frame.buffer_mut(), rows[5], app);
     }
-    app.prompt_editor.render(frame, rows[6]);
-    render_footer(frame.buffer_mut(), rows[7], app);
+    render_status_banner(frame.buffer_mut(), rows[6], app);
+    app.prompt_editor.render(frame, rows[7]);
+    render_prompt_separator(frame.buffer_mut(), rows[8]);
+    render_footer(frame.buffer_mut(), rows[9], app);
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3393,6 +3510,41 @@ fn render_command_palette(buffer: &mut Buffer, area: Rect, app: &App) {
         .render(area, buffer);
 }
 
+fn render_status_banner(buffer: &mut Buffer, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    Paragraph::new("")
+        .style(Style::default().bg(TRANSCRIPT_BG))
+        .render(area, buffer);
+    let Some(banner) = &app.status_banner else {
+        return;
+    };
+    let (marker, color) = match banner.kind {
+        BannerKind::Info => ("·", ACCENT),
+        BannerKind::Error => ("!", Color::LightRed),
+    };
+    let message = compact_label(
+        &banner.message.replace(['\n', '\r', '\t'], " "),
+        area.width.saturating_sub(4) as usize,
+    );
+    Paragraph::new(Line::from(vec![
+        Span::styled(format!(" {marker} "), Style::default().fg(color).bold()),
+        Span::styled(message, Style::default().fg(color)),
+    ]))
+    .style(Style::default().bg(PANEL_BG))
+    .render(area, buffer);
+}
+
+fn render_prompt_separator(buffer: &mut Buffer, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    Paragraph::new("─".repeat(area.width as usize))
+        .style(Style::default().fg(SEPARATOR).bg(TRANSCRIPT_BG))
+        .render(area, buffer);
+}
+
 /// Render a path candidate with the characters matched by the fuzzy query
 /// accented.  The offsets come from [`rank_matches`] and are byte offsets in
 /// the original candidate; walking `char_indices` keeps this Unicode-safe
@@ -3450,8 +3602,15 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    if area.height > 2 {
-        let transcript_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(2));
+    let separator_height = u16::from(area.height > 3);
+    let bottom_height = 3_u16.saturating_add(separator_height);
+    if area.height > bottom_height {
+        let transcript_area = Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            area.height.saturating_sub(bottom_height),
+        );
         let width = transcript_area.width as usize;
         let height = usize::from(transcript_area.height);
         if app.follow_tail {
@@ -3468,11 +3627,29 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     if area.height > 1 {
-        let prompt_area = Rect::new(area.x, area.bottom().saturating_sub(2), area.width, 1);
+        let prompt_area = Rect::new(
+            area.x,
+            area.bottom().saturating_sub(2 + separator_height),
+            area.width,
+            1,
+        );
+        if area.height > 2 {
+            render_status_banner(
+                frame.buffer_mut(),
+                Rect::new(area.x, prompt_area.y.saturating_sub(1), area.width, 1),
+                app,
+            );
+        }
         let prompt = compact_prompt(&app.prompt, area.width as usize);
         Paragraph::new(prompt)
             .style(Style::default().fg(PRIMARY_TEXT).bg(PANEL_BG))
             .render(prompt_area, frame.buffer_mut());
+        if separator_height > 0 {
+            render_prompt_separator(
+                frame.buffer_mut(),
+                Rect::new(area.x, prompt_area.y.saturating_add(1), area.width, 1),
+            );
+        }
         render_footer(
             frame.buffer_mut(),
             Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
@@ -3480,13 +3657,15 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
         );
 
         if app.keyboard_help_visible() {
-            let help_height = app.help_height().min(area.height.saturating_sub(2));
+            let help_height = app
+                .help_height()
+                .min(area.height.saturating_sub(bottom_height));
             if help_height > 0 {
                 render_keyboard_help(
                     frame.buffer_mut(),
                     Rect::new(
                         area.x,
-                        prompt_area.y.saturating_sub(help_height),
+                        prompt_area.y.saturating_sub(help_height.saturating_add(1)),
                         area.width,
                         help_height,
                     ),
@@ -3498,11 +3677,15 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
         // overlays the lower transcript rows, but never covers the prompt,
         // which remains the stable input target in compact mode.
         if app.path_picker_visible() {
-            let picker_height = app.path_picker_height().min(area.height.saturating_sub(2));
+            let picker_height = app
+                .path_picker_height()
+                .min(area.height.saturating_sub(bottom_height));
             if picker_height > 0 {
                 let picker_area = Rect::new(
                     area.x,
-                    prompt_area.y.saturating_sub(picker_height),
+                    prompt_area
+                        .y
+                        .saturating_sub(picker_height.saturating_add(1)),
                     area.width,
                     picker_height,
                 );
@@ -3512,13 +3695,15 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
         if app.command_palette_visible() {
             let palette_height = app
                 .command_palette_height()
-                .min(area.height.saturating_sub(2));
+                .min(area.height.saturating_sub(bottom_height));
             if palette_height > 0 {
                 render_command_palette(
                     frame.buffer_mut(),
                     Rect::new(
                         area.x,
-                        prompt_area.y.saturating_sub(palette_height),
+                        prompt_area
+                            .y
+                            .saturating_sub(palette_height.saturating_add(1)),
                         area.width,
                         palette_height,
                     ),
@@ -4709,7 +4894,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Prompt"), "rendered={rendered:?}");
+        assert!(!rendered.contains("Prompt"), "rendered={rendered:?}");
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "─");
         assert!(rendered.contains("review"));
         assert!(rendered.contains("these changes"));
         let buffer = terminal.backend().buffer();
@@ -4851,7 +5037,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("permission:"), "rendered={rendered:?}");
-        assert!(rendered.contains("Prompt"), "rendered={rendered:?}");
+        assert!(!rendered.contains("Prompt"), "rendered={rendered:?}");
+        assert!(rendered.contains('─'), "rendered={rendered:?}");
     }
 
     #[test]
@@ -5422,8 +5609,9 @@ mod tests {
         assert!(footer.contains("Roster"), "footer={footer:?}");
         assert!(footer.contains("Auto"), "footer={footer:?}");
         assert!(!footer.contains("Auto pilot"), "footer={footer:?}");
+        assert!(rows[rows.len() - 2].chars().all(|char| char == '─'));
         assert!(
-            rows[rows.len() - 2].contains("How can I help you today?"),
+            rows[rows.len() - 3].contains("How can I help you today?"),
             "rows={rows:?}"
         );
     }
@@ -5477,10 +5665,12 @@ mod tests {
         let mut app = App::default();
         app.set_agent_name(0, "Codex");
         app.set_agent_name(1, "Qwen");
-        app.apply_event(&codeswarm_core::AgentEvent::Thought {
-            slot: 0,
-            text: "checking".into(),
-        });
+        app.apply_event(&codeswarm_core::AgentEvent::TurnStarted { slot: 0 });
+        assert_eq!(app.transcript.len(), 0);
+        assert_eq!(
+            app.agent_states.get(&0).map(String::as_str),
+            Some("working")
+        );
         app.agent_turn_started.insert(
             0,
             std::time::Instant::now() - std::time::Duration::from_secs(65),
@@ -5575,7 +5765,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_status_stays_out_of_the_compact_footer() {
+    fn failure_status_uses_the_system_row_not_the_footer() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
@@ -5589,7 +5779,11 @@ mod tests {
             .expect("draw error");
         let content = terminal.backend().buffer().content();
         let rendered = content.iter().map(|cell| cell.symbol()).collect::<String>();
-        assert!(!rendered.contains("connection lost"));
+        assert!(rendered.contains("connection lost"));
+        let footer = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 23)].symbol())
+            .collect::<String>();
+        assert!(!footer.contains("connection lost"));
         assert!(rendered.contains("Auto"));
         assert!(app.status.contains("/reload"));
     }
@@ -5800,6 +5994,8 @@ mod tests {
             ConfigAction::Cancel
         );
         assert!(app.take_full_repaint_request());
+        app.last_status_seen = app.status.clone();
+        app.status_banner = None;
         terminal.clear().expect("clear stale modal cells");
         terminal
             .draw(|frame| render(frame, &mut app))
@@ -6587,7 +6783,7 @@ mod tests {
 
     #[test]
     fn transcript_renders_chat_headers_instead_of_log_prefixes() {
-        let backend = TestBackend::new(80, 12);
+        let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
         app.set_agent_name(0, "Codex");
@@ -7017,6 +7213,78 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(selection_footer.contains("Select text"));
+    }
+
+    #[test]
+    fn reserved_system_row_is_blank_transient_and_error_prioritized() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("terminal");
+        let mut app = App::default();
+        app.set_agent_name(0, "Codex");
+        app.set_agent_identity(0, "openai.com");
+        app.set_config_agents(vec![StoreAgent {
+            identity: "openai.com".into(),
+            name: "Codex".into(),
+            adapter: "ACP".into(),
+            command: "codex-acp".into(),
+            available: true,
+            selected: true,
+        }]);
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("blank row");
+        let row = |terminal: &Terminal<TestBackend>, y: u16| {
+            (0..80)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let rules = (0..16)
+            .filter(|y| {
+                row(&terminal, *y)
+                    .chars()
+                    .filter(|char| *char == '─')
+                    .count()
+                    > 70
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rules.len(), 2, "rules={rules:?}");
+        let prompt_y = rules[0];
+        assert!(
+            !terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .contains("Prompt")
+        );
+        assert!(row(&terminal, rules[1]).chars().all(|char| char == '─'));
+        assert!(row(&terminal, prompt_y - 1).trim().is_empty());
+
+        app.apply_event(&codeswarm_core::AgentEvent::Ready {
+            slot: 0,
+            capabilities: codeswarm_core::AgentCapabilities::default(),
+        });
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("ready banner");
+        assert!(row(&terminal, prompt_y - 1).contains("Codex ready · ACP"));
+
+        app.status = "unable to connect Codex".into();
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("error banner");
+        app.status = "queued".into();
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("preserve error");
+        assert!(row(&terminal, prompt_y - 1).contains("unable to connect Codex"));
+
+        app.status_banner.as_mut().expect("banner").expires_at = std::time::Instant::now();
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("expired banner");
+        assert!(row(&terminal, prompt_y - 1).trim().is_empty());
     }
 
     #[test]
