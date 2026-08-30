@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Relicensed CodeSwarm under the MIT License.
 - Collapsed tool and thought details now show a one-line preview of their
   first content line instead of a word count, and `Ctrl+O` expands or
   collapses the latest detail. Consecutive collapsed tool calls share one
@@ -430,7 +431,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is gone along with it.
 - The "Your agent here — sponsor this project" tile in the store and the former
   testimonial/about commands (which were unrelated to agent conversations).
-  Attribution to Will McGugan and the AGPL notice remain in the license.
+  Attribution to Will McGugan remains in the license.
 - The "Recommended — Best of the bunch" store section, along with the
   `recommended` agent-schema field it read. It held a single agent, which was
   also listed again under Coding agents.

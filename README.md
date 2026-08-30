@@ -127,7 +127,5 @@ workspace package archive validation.
 
 ## License
 
-CodeSwarm is licensed under
-[AGPL-3.0](https://github.com/HainanZhao/codeswarm/blob/main/LICENSE). See the
-[commercial license notice](https://github.com/HainanZhao/codeswarm/blob/main/COMMERCIAL_LICENSE.md)
-for commercial licensing.
+CodeSwarm is licensed under the
+[MIT License](https://github.com/HainanZhao/codeswarm-rs/blob/main/LICENSE).
