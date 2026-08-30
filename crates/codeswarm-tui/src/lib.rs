@@ -1373,7 +1373,29 @@ impl App {
                 }
                 ConfigAction::Changed
             }
-            ConfigKey::MoveUp | ConfigKey::MoveDown => ConfigAction::Ignored,
+            ConfigKey::MoveUp | ConfigKey::MoveDown => {
+                let selected = self
+                    .config_agents
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, agent)| agent.selected.then_some(index))
+                    .collect::<Vec<_>>();
+                let pair = if key == ConfigKey::MoveUp {
+                    selected
+                        .len()
+                        .checked_sub(2)
+                        .map(|index| (selected[index + 1], selected[index]))
+                } else {
+                    selected.get(1).copied().map(|target| (selected[0], target))
+                };
+                let Some((index, target)) = pair else {
+                    return ConfigAction::Ignored;
+                };
+                self.config_agents.swap(index, target);
+                self.config_selected = CONFIG_SETTING_COUNT + target;
+                self.config_roster_dirty = true;
+                ConfigAction::Changed
+            }
             ConfigKey::Confirm => {
                 if self.config_selected >= CONFIG_SETTING_COUNT {
                     let index = self.config_selected - CONFIG_SETTING_COUNT;
@@ -5816,6 +5838,39 @@ mod tests {
         );
         assert_eq!(app.handle_config_key(ConfigKey::Save), ConfigAction::Save);
         assert!(!app.config_visible());
+    }
+
+    #[test]
+    fn alt_reorder_works_when_config_opens_on_collaboration_setting() {
+        let mut app = App::default();
+        app.set_config_agents(vec![
+            StoreAgent {
+                identity: "codex.example".into(),
+                name: "Codex".into(),
+                adapter: "ACP".into(),
+                command: "codex --acp".into(),
+                available: true,
+                selected: true,
+            },
+            StoreAgent {
+                identity: "qwen.example".into(),
+                name: "Qwen".into(),
+                adapter: "ACP".into(),
+                command: "qwen --acp".into(),
+                available: true,
+                selected: true,
+            },
+        ]);
+        app.handle_local_command("/collab");
+        assert_eq!(
+            app.handle_config_key(ConfigKey::MoveDown),
+            ConfigAction::Changed
+        );
+        assert_eq!(
+            app.config_roster_identities(),
+            ["qwen.example", "codex.example"]
+        );
+        assert!(app.config_roster_dirty());
     }
 
     #[test]

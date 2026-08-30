@@ -102,15 +102,29 @@ fn restore_mouse_after_selection_window(
     Ok(true)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ConfigInputDecoder {
     escape_at: Option<Instant>,
+    escape_window: Duration,
+}
+
+impl Default for ConfigInputDecoder {
+    fn default() -> Self {
+        Self::new(Duration::from_millis(150))
+    }
 }
 
 impl ConfigInputDecoder {
+    fn new(escape_window: Duration) -> Self {
+        Self {
+            escape_at: None,
+            escape_window,
+        }
+    }
+
     fn decode(&mut self, key: KeyEvent, now: Instant) -> Option<ConfigKey> {
         if let Some(escape_at) = self.escape_at.take()
-            && now.saturating_duration_since(escape_at) <= Duration::from_millis(150)
+            && now.saturating_duration_since(escape_at) <= self.escape_window
         {
             return match key.code {
                 KeyCode::Up => Some(ConfigKey::MoveUp),
@@ -136,9 +150,10 @@ impl ConfigInputDecoder {
     }
 
     fn take_expired_escape(&mut self, now: Instant) -> bool {
-        if self.escape_at.is_some_and(|escape_at| {
-            now.saturating_duration_since(escape_at) > Duration::from_millis(150)
-        }) {
+        if self
+            .escape_at
+            .is_some_and(|escape_at| now.saturating_duration_since(escape_at) > self.escape_window)
+        {
             self.escape_at = None;
             true
         } else {
@@ -2784,7 +2799,11 @@ fn run_terminal(
     let mut pending_owner: Option<String> = None;
     let mut pending_owner_requested = false;
     let mut config_reconcile_pending = false;
-    let mut config_input = ConfigInputDecoder::default();
+    let mut config_input = ConfigInputDecoder::new(if terminal_capture_enabled() {
+        Duration::from_millis(150)
+    } else {
+        Duration::from_millis(650)
+    });
     let mut selection_until: Option<Instant> = None;
     let mut turn_active = false;
     let mut cancel_requested_at: Option<Instant> = None;
@@ -4015,6 +4034,7 @@ mod tests {
             decoder.decode(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), now),
             Some(ConfigKey::MoveUp)
         );
+        let mut decoder = ConfigInputDecoder::new(Duration::from_millis(650));
         assert_eq!(
             decoder.decode(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), now),
             None
@@ -4022,17 +4042,17 @@ mod tests {
         assert_eq!(
             decoder.decode(
                 KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-                now + Duration::from_millis(20),
+                now + Duration::from_millis(520),
             ),
             Some(ConfigKey::MoveDown)
         );
-        assert!(!decoder.take_expired_escape(now + Duration::from_millis(20)));
+        assert!(!decoder.take_expired_escape(now + Duration::from_millis(520)));
 
         assert_eq!(
             decoder.decode(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), now),
             None
         );
-        assert!(decoder.take_expired_escape(now + Duration::from_millis(200)));
+        assert!(decoder.take_expired_escape(now + Duration::from_millis(700)));
     }
 
     #[test]
