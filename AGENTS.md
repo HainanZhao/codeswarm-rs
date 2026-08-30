@@ -21,8 +21,9 @@
   has a causal dependency on the previous response. Solo sessions (roster size
   1) never construct a relay; `Conversation._relay_active` gates every relay
   code path so the common single-agent case is untouched.
-- Roster index 0 is the session owner: it holds the session's DB row and
-  title, and cannot be dropped (`/close` instead).
+- The coordinator owns the session record. Roster positions only express
+  order; any agent may be dropped as long as at least one remains active.
+  Each active agent persists its own optional provider session handle.
 - A failed adapter is tombstoned immediately so nothing can be dispatched to
   a dead process, and the user is then offered a reload. Reloading puts a
   fresh adapter in the same roster slot, reuses the session id only when the

@@ -98,24 +98,18 @@ pub enum LocalCommand {
     Handled,
     Close,
     Cancel,
-    Mode,
-    Collaboration,
     Export,
-    Add(String),
     Reload,
-    Drop,
-    DropSlot(usize),
-    Promote(usize),
-    Swap(usize, usize),
     SelectAgent(usize),
     SelectText,
-    Diff,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigKey {
     Up,
     Down,
+    PreviousValue,
+    NextValue,
     MoveUp,
     MoveDown,
     Confirm,
@@ -458,6 +452,22 @@ impl PromptEditor {
     /// advertised by an ACP session without reaching into the textarea.
     pub fn completion_candidates(&self) -> &[String] {
         &self.completion_candidates
+    }
+
+    /// Slash commands matching the token at the cursor. This powers the
+    /// passive command palette; completion itself remains explicit via Tab.
+    pub fn slash_suggestions(&self) -> Vec<&str> {
+        let Some((_start, prefix)) = self.completion_prefix() else {
+            return Vec::new();
+        };
+        if !prefix.starts_with('/') {
+            return Vec::new();
+        }
+        self.completion_candidates
+            .iter()
+            .filter(|candidate| candidate.starts_with('/') && candidate.starts_with(&prefix))
+            .map(String::as_str)
+            .collect()
     }
 
     /// Record a successful submission in the bounded history.
@@ -821,6 +831,8 @@ pub struct App {
     agent_identities: BTreeMap<usize, String>,
     agent_states: BTreeMap<usize, String>,
     agent_modes: BTreeMap<usize, (Vec<codeswarm_core::Mode>, Option<String>)>,
+    agent_models: BTreeMap<usize, (String, Vec<codeswarm_core::Mode>, Option<String>)>,
+    pending_model_changes: BTreeMap<String, String>,
     agent_commands: BTreeMap<usize, Vec<AgentCommand>>,
     agent_usage: BTreeMap<usize, UsageUpdate>,
     agent_turn_started: BTreeMap<usize, Instant>,
@@ -899,6 +911,8 @@ impl Default for App {
             agent_identities: BTreeMap::new(),
             agent_states: BTreeMap::new(),
             agent_modes: BTreeMap::new(),
+            agent_models: BTreeMap::new(),
+            pending_model_changes: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_usage: BTreeMap::new(),
             agent_turn_started: BTreeMap::new(),
@@ -942,91 +956,10 @@ impl App {
         let command = parts.next()?.to_ascii_lowercase();
         let argument = parts.collect::<Vec<_>>().join(" ");
         let result = match command.as_str() {
-            "/quit" | "/exit" | "/close" => LocalCommand::Close,
+            "/close" => LocalCommand::Close,
             "/cancel" => LocalCommand::Cancel,
-            "/mode" => {
-                if argument.is_empty() {
-                    self.begin_config();
-                    self.config_selected = 3;
-                    self.status = "mode configuration".into();
-                    LocalCommand::Handled
-                } else if matches!(
-                    argument.to_ascii_lowercase().as_str(),
-                    "chat" | "discuss" | "discussion"
-                ) {
-                    self.mode = "Chat".into();
-                    self.mode_policy = None;
-                    self.requested_mode = None;
-                    self.status = "mode set to Chat".into();
-                    LocalCommand::Mode
-                } else if let Some(mode) = normalized_mode(&argument) {
-                    self.mode = mode.1.into();
-                    self.mode_policy = Some(mode.0.into());
-                    self.requested_mode = Some(mode.0.into());
-                    self.status = format!("mode set to {}", self.mode);
-                    LocalCommand::Mode
-                } else {
-                    self.status = "Use /mode to choose a mode".into();
-                    LocalCommand::Handled
-                }
-            }
-            "/collab" | "/collaboration" => {
-                if argument.is_empty() {
-                    self.begin_config();
-                    self.config_selected = 4;
-                    self.status = "collaboration configuration".into();
-                    LocalCommand::Handled
-                } else {
-                    match argument.to_ascii_lowercase().as_str() {
-                        "roster" => self.collaboration = "Roster relay".into(),
-                        "manual" => self.collaboration = "Manual routing".into(),
-                        "pair" => self.collaboration = "Pair review".into(),
-                        _ => {
-                            self.status =
-                                "Use /collab roster, /collab manual, or /collab pair".into();
-                            return Some(LocalCommand::Handled);
-                        }
-                    }
-                    self.status = format!("collaboration set to {}", self.collaboration);
-                    LocalCommand::Collaboration
-                }
-            }
             "/export" => LocalCommand::Export,
-            "/agents" => {
-                self.begin_config();
-                self.config_selected = CONFIG_SETTING_COUNT;
-                self.status = "roster settings".into();
-                LocalCommand::Handled
-            }
-            "/add" => {
-                if argument.is_empty() {
-                    self.status = "usage: /add AGENT, agy:COMMAND, or acp:COMMAND".into();
-                    LocalCommand::Handled
-                } else {
-                    LocalCommand::Add(argument)
-                }
-            }
             "/reload" => LocalCommand::Reload,
-            "/drop" => argument
-                .parse::<usize>()
-                .map_or(LocalCommand::Drop, LocalCommand::DropSlot),
-            "/promote" => argument
-                .parse::<usize>()
-                .map_or(LocalCommand::Handled, LocalCommand::Promote),
-            "/swap" => {
-                let mut slots = argument
-                    .split_whitespace()
-                    .filter_map(|value| value.parse::<usize>().ok());
-                match (slots.next(), slots.next()) {
-                    (Some(first), Some(second)) if slots.next().is_none() => {
-                        LocalCommand::Swap(first, second)
-                    }
-                    _ => {
-                        self.status = "usage: /swap SLOT SLOT".into();
-                        LocalCommand::Handled
-                    }
-                }
-            }
             "/to" => match argument.parse::<usize>() {
                 Ok(slot) => LocalCommand::SelectAgent(slot),
                 Err(_) => {
@@ -1035,22 +968,6 @@ impl App {
                 }
             },
             "/select" => LocalCommand::SelectText,
-            "/diff" => {
-                match argument.to_ascii_lowercase().as_str() {
-                    "split" => self.diff_split = true,
-                    "unified" | "inline" => self.diff_split = false,
-                    _ => {
-                        self.status = "usage: /diff split or /diff unified".into();
-                        return Some(LocalCommand::Handled);
-                    }
-                }
-                self.status = if self.diff_split {
-                    "diff view set to split".into()
-                } else {
-                    "diff view set to unified".into()
-                };
-                LocalCommand::Diff
-            }
             "/help" => {
                 self.keyboard_help = !self.keyboard_help;
                 self.status = if self.keyboard_help {
@@ -1070,9 +987,7 @@ impl App {
                 LocalCommand::Handled
             }
             "/config" => {
-                self.begin_config();
-                self.config_selected = 0;
-                self.status = "configuration".into();
+                self.open_config();
                 LocalCommand::Handled
             }
             // Agent-provided slash commands share the prompt's command
@@ -1124,7 +1039,32 @@ impl App {
                 agents: self.config_agents.clone(),
             });
         }
+        self.pending_model_changes.clear();
         self.config_visible = true;
+    }
+
+    pub fn open_config(&mut self) {
+        self.begin_config();
+        self.config_selected = 0;
+        self.status = "configuration".into();
+    }
+
+    pub fn open_mode_config(&mut self) {
+        self.begin_config();
+        self.config_selected = 3;
+        self.status = "mode configuration".into();
+    }
+
+    pub fn open_collaboration_config(&mut self) {
+        self.begin_config();
+        self.config_selected = 4;
+        self.status = "collaboration configuration".into();
+    }
+
+    pub fn take_config_model_changes(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.pending_model_changes)
+            .into_iter()
+            .collect()
     }
 
     /// Install the catalog rows shown by the in-session configuration panel.
@@ -1332,6 +1272,7 @@ impl App {
                 }
                 self.requested_mode = None;
                 self.config_collaboration_pending = false;
+                self.pending_model_changes.clear();
                 self.status = "changes discarded".into();
                 ConfigAction::Cancel
             }
@@ -1357,6 +1298,52 @@ impl App {
                 self.config_selected = self.config_selected.saturating_add(1).min(max);
                 ConfigAction::Changed
             }
+            ConfigKey::PreviousValue | ConfigKey::NextValue
+                if self.config_selected >= CONFIG_SETTING_COUNT =>
+            {
+                let index = self.config_selected - CONFIG_SETTING_COUNT;
+                let Some(identity) = self
+                    .config_agents
+                    .get(index)
+                    .map(|agent| agent.identity.clone())
+                else {
+                    return ConfigAction::Ignored;
+                };
+                let Some(slot) = self.agent_identities.iter().find_map(|(slot, candidate)| {
+                    candidate.eq_ignore_ascii_case(&identity).then_some(*slot)
+                }) else {
+                    self.status = "model list is available after the agent starts".into();
+                    return ConfigAction::Ignored;
+                };
+                let Some((_config_id, models, current)) = self.agent_models.get(&slot).cloned()
+                else {
+                    self.status = "this agent did not advertise model selection".into();
+                    return ConfigAction::Ignored;
+                };
+                if models.is_empty() {
+                    self.status = "this agent did not advertise model selection".into();
+                    return ConfigAction::Ignored;
+                }
+                let current = self
+                    .pending_model_changes
+                    .get(&identity)
+                    .cloned()
+                    .or(current);
+                let position = current
+                    .as_ref()
+                    .and_then(|current| models.iter().position(|model| &model.id == current))
+                    .unwrap_or(0);
+                let next = if key == ConfigKey::NextValue {
+                    (position + 1) % models.len()
+                } else {
+                    position.checked_sub(1).unwrap_or(models.len() - 1)
+                };
+                self.pending_model_changes
+                    .insert(identity, models[next].id.clone());
+                self.status = format!("{} model: {}", self.agent_name(slot), models[next].label);
+                ConfigAction::Changed
+            }
+            ConfigKey::PreviousValue | ConfigKey::NextValue => ConfigAction::Ignored,
             ConfigKey::MoveUp | ConfigKey::MoveDown
                 if self.config_selected >= CONFIG_SETTING_COUNT =>
             {
@@ -1751,6 +1738,7 @@ impl App {
         self.agent_identities.remove(&slot);
         self.agent_states.remove(&slot);
         self.agent_modes.remove(&slot);
+        self.agent_models.remove(&slot);
         self.agent_commands.remove(&slot);
         self.agent_usage.remove(&slot);
         self.agent_turn_started.remove(&slot);
@@ -1760,73 +1748,6 @@ impl App {
         }
         self.refresh_prompt_completions();
         removed
-    }
-
-    /// Move the visible identity and per-agent UI state alongside a promoted
-    /// roster member. The coordinator keeps numeric slots stable, but slot
-    /// zero's displayed owner must follow the adapter that now owns it.
-    pub fn promote_agent(&mut self, slot: usize) -> bool {
-        if slot == 0
-            || !self.agent_names.contains_key(&slot)
-            || self
-                .agent_states
-                .get(&slot)
-                .is_some_and(|state| state == "dropped")
-        {
-            return false;
-        }
-        let Some(promoted_name) = self.agent_names.remove(&slot) else {
-            return false;
-        };
-        let owner_name = self.agent_names.remove(&0);
-        self.agent_names.insert(0, promoted_name);
-        if let Some(owner_name) = owner_name {
-            self.agent_names.insert(slot, owner_name);
-        }
-        let promoted_identity = self.agent_identities.remove(&slot);
-        self.agent_identities.remove(&0);
-        if let Some(identity) = promoted_identity {
-            self.agent_identities.insert(0, identity);
-        }
-
-        let promoted_state = self.agent_states.remove(&slot);
-        self.agent_states.remove(&0);
-        if let Some(state) = promoted_state {
-            self.agent_states.insert(0, state);
-        }
-        self.agent_states.insert(slot, "dropped".into());
-
-        let promoted_modes = self.agent_modes.remove(&slot);
-        self.agent_modes.remove(&0);
-        if let Some(promoted_modes) = promoted_modes {
-            self.agent_modes.insert(0, promoted_modes);
-        }
-        let promoted_commands = self.agent_commands.remove(&slot);
-        self.agent_commands.remove(&0);
-        if let Some(promoted_commands) = promoted_commands {
-            self.agent_commands.insert(0, promoted_commands);
-        }
-        let promoted_usage = self.agent_usage.remove(&slot);
-        self.agent_usage.remove(&0);
-        if let Some(promoted_usage) = promoted_usage {
-            self.agent_usage.insert(0, promoted_usage);
-        }
-        let promoted_timer = self.agent_turn_started.remove(&slot);
-        self.agent_turn_started.remove(&0);
-        if let Some(promoted_timer) = promoted_timer {
-            self.agent_turn_started.insert(0, promoted_timer);
-        }
-        let promoted_tools = self.agent_tool_calls.remove(&slot);
-        self.agent_tool_calls.remove(&0);
-        if let Some(promoted_tools) = promoted_tools {
-            self.agent_tool_calls.insert(0, promoted_tools);
-        }
-        self.refresh_prompt_completions();
-        self.active_agent = self.agent_name(0);
-        if self.next_agent == Some(0) || self.next_agent == Some(slot) {
-            self.next_agent = Some(0);
-        }
-        true
     }
 
     pub fn agent_count(&self) -> usize {
@@ -1906,7 +1827,12 @@ impl App {
             .agent_names
             .iter()
             .filter_map(|(candidate_slot, candidate_name)| {
-                (candidate_name == &name).then_some(*candidate_slot)
+                (candidate_name == &name
+                    && self
+                        .agent_states
+                        .get(candidate_slot)
+                        .is_none_or(|state| state != "dropped" && state != "error"))
+                .then_some(*candidate_slot)
             })
             .collect::<Vec<_>>();
         if duplicate_slots.len() <= 1 {
@@ -1985,6 +1911,7 @@ impl App {
         }
         self.agent_states.insert(slot, "dropped".into());
         self.agent_modes.remove(&slot);
+        self.agent_models.remove(&slot);
         self.agent_commands.remove(&slot);
         self.agent_usage.remove(&slot);
         self.agent_turn_started.remove(&slot);
@@ -2042,6 +1969,14 @@ impl App {
         }
         if let Some(second_modes) = second_modes {
             self.agent_modes.insert(first, second_modes);
+        }
+        let first_models = self.agent_models.remove(&first);
+        let second_models = self.agent_models.remove(&second);
+        if let Some(first_models) = first_models {
+            self.agent_models.insert(second, first_models);
+        }
+        if let Some(second_models) = second_models {
+            self.agent_models.insert(first, second_models);
         }
         let first_commands = self.agent_commands.remove(&first);
         let second_commands = self.agent_commands.remove(&second);
@@ -2352,6 +2287,22 @@ impl App {
         }
     }
 
+    pub fn command_palette_visible(&self) -> bool {
+        !self.prompt_editor.slash_suggestions().is_empty()
+    }
+
+    pub fn command_palette_height(&self) -> u16 {
+        if self.command_palette_visible() {
+            self.prompt_editor
+                .slash_suggestions()
+                .len()
+                .min(5)
+                .saturating_add(3) as u16
+        } else {
+            0
+        }
+    }
+
     /// Handle navigation in the path picker.  The caller can pass this before
     /// regular prompt/scroll handling for Up/Down/Enter/Esc keys.
     pub fn handle_path_picker_key(&mut self, key: Key) -> PathPickerAction {
@@ -2434,10 +2385,6 @@ impl App {
                 codeswarm_core::RosterUpdate::Dropped { slot } => {
                     self.mark_agent_dropped(*slot);
                 }
-                codeswarm_core::RosterUpdate::Promoted { from } => {
-                    self.promote_agent(*from);
-                    self.status = "new owner is active".into();
-                }
                 codeswarm_core::RosterUpdate::Swapped { first, second } => {
                     self.swap_agents(*first, *second);
                     self.status = format!("agents {first} and {second} swapped");
@@ -2446,9 +2393,12 @@ impl App {
                     self.status = format!("unable to {action}: {detail}");
                 }
             },
-            AgentEvent::Ready { slot, .. } => {
+            AgentEvent::Ready { slot, capabilities } => {
                 self.active_agent = self.agent_name(*slot);
                 self.agent_states.insert(*slot, "ready".into());
+                if !capabilities.supports_models {
+                    self.agent_models.remove(slot);
+                }
                 if self.failed_agent == Some(*slot) {
                     self.failed_agent = None;
                 }
@@ -2470,6 +2420,29 @@ impl App {
                     .unwrap_or_default();
                 self.agent_modes
                     .insert(*slot, (modes.clone(), Some(current_mode.clone())));
+            }
+            AgentEvent::ModelsReplaced {
+                slot,
+                config_id,
+                models,
+                current_model,
+            } => {
+                if models.is_empty() || config_id.is_empty() {
+                    self.agent_models.remove(slot);
+                } else {
+                    self.agent_models.insert(
+                        *slot,
+                        (config_id.clone(), models.clone(), current_model.clone()),
+                    );
+                }
+            }
+            AgentEvent::ModelUpdated {
+                slot,
+                current_model,
+            } => {
+                if let Some((_config_id, _models, current)) = self.agent_models.get_mut(slot) {
+                    *current = Some(current_model.clone());
+                }
             }
             AgentEvent::UserText { slot, text } => {
                 self.mark_agent_turn_started(*slot);
@@ -2693,7 +2666,7 @@ impl App {
                 }
                 self.failed_agent = Some(*slot);
                 self.status = if *started {
-                    format!("crashed: {detail} · /reload or /drop")
+                    format!("crashed: {detail} · /reload or remove in /config")
                 } else {
                     format!("failed to start: {detail}")
                 };
@@ -2828,7 +2801,8 @@ impl App {
                 + usize::from(self.queue_height())
                 + usize::from(self.permission_height())
                 + usize::from(self.help_height())
-                + usize::from(self.path_picker_height()),
+                + usize::from(self.path_picker_height())
+                + usize::from(self.command_palette_height()),
         )
     }
 
@@ -2958,12 +2932,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let help_height = usize::from(app.help_height()).min(optional_height);
     optional_height = optional_height.saturating_sub(help_height);
     let path_picker_height = usize::from(app.path_picker_height()).min(optional_height);
+    optional_height = optional_height.saturating_sub(path_picker_height);
+    let command_palette_height = usize::from(app.command_palette_height()).min(optional_height);
     let available_for_prompt = total_height
         .saturating_sub(status_height)
         .saturating_sub(permission_height)
         .saturating_sub(queue_height)
         .saturating_sub(help_height)
-        .saturating_sub(path_picker_height);
+        .saturating_sub(path_picker_height)
+        .saturating_sub(command_palette_height);
     let content_height = usize::from(available_for_prompt > minimum_prompt_height);
     let preferred_prompt_height = usize::from(app.prompt_editor.preferred_height(area.width));
     let preferred_prompt_height = if app.density == Density::Compact {
@@ -2979,6 +2956,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Constraint::Length(permission_height as u16),
         Constraint::Length(help_height as u16),
         Constraint::Length(path_picker_height as u16),
+        Constraint::Length(command_palette_height as u16),
         Constraint::Length(prompt_height as u16),
         Constraint::Length(status_height as u16),
     ])
@@ -3015,8 +2993,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.path_picker_visible() {
         render_path_picker(frame.buffer_mut(), rows[4], app);
     }
-    app.prompt_editor.render(frame, rows[5]);
-    render_footer(frame.buffer_mut(), rows[6], app);
+    if app.command_palette_visible() {
+        render_command_palette(frame.buffer_mut(), rows[5], app);
+    }
+    app.prompt_editor.render(frame, rows[6]);
+    render_footer(frame.buffer_mut(), rows[7], app);
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3358,6 +3339,60 @@ fn render_path_picker(buffer: &mut Buffer, area: Rect, app: &App) {
         .render(area, buffer);
 }
 
+fn command_description(command: &str) -> &'static str {
+    match command {
+        "/cancel" => "Stop active work",
+        "/clear" => "Clear this transcript",
+        "/close" => "Close CodeSwarm",
+        "/config" => "Open settings",
+        "/export" => "Export conversation Markdown",
+        "/help" => "Show keyboard and command help",
+        "/reload" => "Restart a crashed agent",
+        "/select" => "Temporarily enable text selection",
+        "/to" => "Choose the next agent",
+        _ => "Agent command",
+    }
+}
+
+fn render_command_palette(buffer: &mut Buffer, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let suggestions = app.prompt_editor.slash_suggestions();
+    if suggestions.is_empty() {
+        return;
+    }
+    let shown = suggestions.len().min(5);
+    let mut lines = Vec::with_capacity(shown.saturating_add(1));
+    lines.push(Line::styled(
+        format!(
+            " Commands · {shown} of {} · type to filter · Tab complete",
+            suggestions.len()
+        ),
+        Style::default().fg(Color::Gray),
+    ));
+    for command in suggestions.into_iter().take(shown) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {command:<10}"),
+                Style::default().fg(ACCENT).bold(),
+            ),
+            Span::styled(
+                command_description(command),
+                Style::default().fg(THOUGHT_TEXT),
+            ),
+        ]));
+    }
+    Paragraph::new(lines)
+        .style(Style::default().bg(PANEL_BG))
+        .block(
+            Block::default()
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .border_style(Style::default().fg(SEPARATOR)),
+        )
+        .render(area, buffer);
+}
+
 /// Render a path candidate with the characters matched by the fuzzy query
 /// accented.  The offsets come from [`rank_matches`] and are byte offsets in
 /// the original candidate; walking `char_indices` keeps this Unicode-safe
@@ -3472,6 +3507,23 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
                     picker_height,
                 );
                 render_path_picker(frame.buffer_mut(), picker_area, app);
+            }
+        }
+        if app.command_palette_visible() {
+            let palette_height = app
+                .command_palette_height()
+                .min(area.height.saturating_sub(2));
+            if palette_height > 0 {
+                render_command_palette(
+                    frame.buffer_mut(),
+                    Rect::new(
+                        area.x,
+                        prompt_area.y.saturating_sub(palette_height),
+                        area.width,
+                        palette_height,
+                    ),
+                    app,
+                );
             }
         }
     } else {
@@ -3597,8 +3649,8 @@ fn render_keyboard_help(buffer: &mut Buffer, area: Rect) {
         " Scroll: wheel or PgUp/PgDn · Ctrl+↑/↓ fine · End follow tail",
         " Input: Enter send · Shift+Enter newline · Tab complete",
         " Turn: Ctrl+Enter direct · Ctrl+C cancel · Ctrl+K cancel queued",
-        " Agents: /agents /add /to SLOT /reload /drop /promote /swap",
-        " Session: /config /mode /collab /clear /export /diff /select /close",
+        " Agents: /to SLOT /reload",
+        " Session: /config /clear /export /select /close",
     ];
     Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>())
         .style(Style::default().fg(Color::Gray).bg(PANEL_BG))
@@ -3717,7 +3769,7 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 agent.name.clone()
             };
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!(" {marker} {checked} "), line_style),
                 Span::styled(format!("{name:<20}"), line_style),
                 Span::styled(
@@ -3728,7 +3780,28 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
                         Color::Yellow
                     }),
                 ),
-            ]));
+            ];
+            if let Some(slot) = app.agent_identities.iter().find_map(|(slot, identity)| {
+                identity
+                    .eq_ignore_ascii_case(&agent.identity)
+                    .then_some(*slot)
+            }) && let Some((_config_id, models, current)) = app.agent_models.get(&slot)
+            {
+                let selected_model = app
+                    .pending_model_changes
+                    .get(&agent.identity)
+                    .or(current.as_ref())
+                    .or_else(|| models.first().map(|model| &model.id));
+                if let Some(model) =
+                    selected_model.and_then(|id| models.iter().find(|model| &model.id == id))
+                {
+                    spans.push(Span::styled(
+                        format!(" · {} ←/→", model.label),
+                        Style::default().fg(ACCENT),
+                    ));
+                }
+            }
+            lines.push(Line::from(spans));
             continue;
         }
         let (label, value, mutable) = rows[index];
@@ -3776,7 +3849,7 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
     let actions = if compact {
         " Ctrl+S Save · Esc Discard"
     } else {
-        " Ctrl+S Save · Esc Discard · Enter Change · ↑/↓ Navigate · Alt/Shift+↑/↓ or [ ] Order"
+        " Ctrl+S Save · Esc Discard · Enter Change · ↑/↓ Navigate · ←/→ Model · Alt/Shift+↑/↓ or [ ] Order"
     };
     lines.push(Line::styled(
         format!("{actions}  ({}/{})", app.config_selected + 1, total_rows),
@@ -4457,12 +4530,13 @@ mod tests {
     use tui_textarea::{Input, Key};
 
     use super::{
-        ACCENT, AGENT_COLORS, App, ConfigAction, ConfigKey, FooterAction, LocalCommand, PANEL_BG,
-        PRIMARY_TEXT, PathPickerAction, PermissionAction, PermissionKey, PromptAction,
-        PromptEditor, STATUS_BG, StoreAction, StoreAgent, StoreKey, THOUGHT_TEXT, TRANSCRIPT_BG,
-        agent_header_color, agent_slot_color, block_style, cell_width, compact_cell_label,
-        compact_workspace_path, file_reference_spans, footer_agent_label, format_turn_elapsed,
-        markdown_spans, markdown_style, marker_style, render, row_style, selected_style,
+        ACCENT, AGENT_COLORS, App, CONFIG_SETTING_COUNT, ConfigAction, ConfigKey, FooterAction,
+        LocalCommand, PANEL_BG, PRIMARY_TEXT, PathPickerAction, PermissionAction, PermissionKey,
+        PromptAction, PromptEditor, STATUS_BG, StoreAction, StoreAgent, StoreKey, THOUGHT_TEXT,
+        TRANSCRIPT_BG, agent_header_color, agent_slot_color, block_style, cell_width,
+        compact_cell_label, compact_workspace_path, file_reference_spans, footer_agent_label,
+        format_turn_elapsed, markdown_spans, markdown_style, marker_style, render, row_style,
+        selected_style,
     };
 
     fn key(key: Key) -> Input {
@@ -4581,6 +4655,43 @@ mod tests {
             }
         );
         assert_eq!(editor.text(), "/history");
+    }
+
+    #[test]
+    fn slash_suggestions_appear_immediately_and_filter_without_tab() {
+        let mut editor = PromptEditor::default();
+        editor.set_completion_candidates(["/add", "/help", "/history", "@README.md"]);
+        editor.set_text("/");
+        assert_eq!(editor.slash_suggestions(), ["/add", "/help", "/history"]);
+        editor.set_text("/he");
+        assert_eq!(editor.slash_suggestions(), ["/help"]);
+        editor.set_text("ordinary text");
+        assert!(editor.slash_suggestions().is_empty());
+    }
+
+    #[test]
+    fn slash_command_palette_renders_descriptions_above_the_prompt() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).expect("terminal");
+        let mut app = App::default();
+        app.set_prompt_completions(["/add", "/help", "/history"]);
+        app.prompt = "/he".into();
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw command palette");
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+        assert!(rendered.contains("Commands · 1 of 1"));
+        assert!(rendered.contains("/help"));
+        assert!(rendered.contains("Show keyboard and command help"));
+        assert!(!rendered.contains("/history"));
     }
 
     #[test]
@@ -5546,6 +5657,10 @@ mod tests {
         );
         assert!(app.roster_summary().contains("Claude #1"));
         assert!(app.roster_summary().contains("Claude #2"));
+
+        app.mark_agent_dropped(0);
+        assert_eq!(app.agent_name(1), "Claude");
+        assert!(!app.roster_summary().contains("#2"));
     }
 
     #[test]
@@ -5570,52 +5685,6 @@ mod tests {
             .expect("Gemini footer/header cell");
         assert_eq!(footer_color, agent_slot_color(1));
         assert_ne!(footer_color, agent_slot_color(0));
-    }
-
-    #[test]
-    fn promoting_a_live_agent_moves_its_identity_and_marks_old_owner_dropped() {
-        let mut app = App::default();
-        app.set_agent_name(0, "Claude");
-        app.set_agent_name(1, "Codex");
-        app.apply_event(&codeswarm_core::AgentEvent::Ready {
-            slot: 0,
-            capabilities: codeswarm_core::AgentCapabilities::default(),
-        });
-        app.apply_event(&codeswarm_core::AgentEvent::Ready {
-            slot: 1,
-            capabilities: codeswarm_core::AgentCapabilities::default(),
-        });
-
-        assert!(app.promote_agent(1));
-        assert_eq!(app.agent_name(0), "Codex");
-        assert_eq!(app.agent_name(1), "Claude");
-        assert_eq!(
-            app.agent_states.get(&1).map(String::as_str),
-            Some("dropped")
-        );
-        assert_eq!(app.active_agent, "Codex");
-        assert!(!app.promote_agent(1));
-    }
-
-    #[test]
-    fn roster_ui_changes_only_after_a_confirmed_backend_update() {
-        let mut app = App::default();
-        app.set_agent_name(0, "Owner");
-        app.set_agent_name(1, "Reviewer");
-        app.apply_event(&codeswarm_core::AgentEvent::RosterUpdated {
-            update: codeswarm_core::RosterUpdate::Rejected {
-                action: "promote agent 1".into(),
-                detail: "old owner refused to stop".into(),
-            },
-        });
-        assert_eq!(app.agent_name(0), "Owner");
-        assert_eq!(app.agent_name(1), "Reviewer");
-        app.apply_event(&codeswarm_core::AgentEvent::RosterUpdated {
-            update: codeswarm_core::RosterUpdate::Promoted { from: 1 },
-        });
-        assert_eq!(app.agent_name(0), "Reviewer");
-        assert_eq!(app.agent_name(1), "Owner");
-        assert_eq!(app.active_roster_slots(), vec![0]);
     }
 
     #[test]
@@ -5658,45 +5727,26 @@ mod tests {
     }
 
     #[test]
-    fn commands_update_mode_and_collaboration_without_agent_dispatch() {
+    fn canonical_commands_remain_and_config_duplicates_are_rejected() {
         let mut app = App::default();
-        assert_eq!(
-            app.handle_local_command("/mode chat"),
-            Some(LocalCommand::Mode)
-        );
-        assert_eq!(app.mode(), "Chat");
-        assert_eq!(
-            app.handle_local_command("/collab manual"),
-            Some(LocalCommand::Collaboration)
-        );
-        assert_eq!(app.collaboration(), "Manual routing");
-        assert_eq!(
-            app.handle_local_command("/collab invalid"),
-            Some(LocalCommand::Handled)
-        );
-        assert_eq!(
-            app.handle_local_command("/agents"),
-            Some(LocalCommand::Handled)
-        );
-        assert!(app.config_visible());
-        app.handle_config_key(ConfigKey::Cancel);
-        assert_eq!(
-            app.handle_local_command("/add acp:reviewer --acp"),
-            Some(LocalCommand::Add("acp:reviewer --acp".into()))
-        );
-        assert_eq!(app.handle_local_command("/drop"), Some(LocalCommand::Drop));
-        assert_eq!(
-            app.handle_local_command("/drop 2"),
-            Some(LocalCommand::DropSlot(2))
-        );
-        assert_eq!(
-            app.handle_local_command("/promote 2"),
-            Some(LocalCommand::Promote(2))
-        );
-        assert_eq!(
-            app.handle_local_command("/swap 0 2"),
-            Some(LocalCommand::Swap(0, 2))
-        );
+        for removed in [
+            "/mode chat",
+            "/collab manual",
+            "/agents",
+            "/add codex",
+            "/swap 0 1",
+            "/diff split",
+            "/drop",
+            "/drop 2",
+            "/quit",
+            "/exit",
+        ] {
+            assert_eq!(
+                app.handle_local_command(removed),
+                Some(LocalCommand::Handled)
+            );
+            assert!(app.status.starts_with("unknown command:"), "{removed}");
+        }
         assert_eq!(
             app.handle_local_command("/to 12"),
             Some(LocalCommand::SelectAgent(12))
@@ -5705,11 +5755,6 @@ mod tests {
             app.handle_local_command("/select"),
             Some(LocalCommand::SelectText)
         );
-        assert_eq!(
-            app.handle_local_command("/diff split"),
-            Some(LocalCommand::Diff)
-        );
-        assert!(app.diff_split());
     }
 
     #[test]
@@ -5841,6 +5886,58 @@ mod tests {
     }
 
     #[test]
+    fn live_agent_models_are_selected_from_the_advertised_catalog() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Codex");
+        app.set_agent_identity(0, "openai.com");
+        app.set_config_agents(vec![StoreAgent {
+            identity: "openai.com".into(),
+            name: "Codex".into(),
+            adapter: "ACP".into(),
+            command: "codex-acp".into(),
+            available: true,
+            selected: true,
+        }]);
+        app.apply_event(&codeswarm_core::AgentEvent::ModelsReplaced {
+            slot: 0,
+            config_id: "model".into(),
+            models: vec![
+                codeswarm_core::Mode {
+                    id: "fast".into(),
+                    label: "Fast".into(),
+                },
+                codeswarm_core::Mode {
+                    id: "smart".into(),
+                    label: "Smart".into(),
+                },
+            ],
+            current_model: Some("fast".into()),
+        });
+        app.open_config();
+        app.config_selected = CONFIG_SETTING_COUNT;
+        assert_eq!(
+            app.handle_config_key(ConfigKey::NextValue),
+            ConfigAction::Changed
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw live model choice");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Smart ←/→"), "rendered={rendered:?}");
+        assert_eq!(
+            app.take_config_model_changes(),
+            vec![("openai.com".into(), "smart".into())]
+        );
+    }
+
+    #[test]
     fn alt_reorder_works_when_config_opens_on_collaboration_setting() {
         let mut app = App::default();
         app.set_config_agents(vec![
@@ -5861,7 +5958,7 @@ mod tests {
                 selected: true,
             },
         ]);
-        app.handle_local_command("/collab");
+        app.open_collaboration_config();
         assert_eq!(
             app.handle_config_key(ConfigKey::MoveDown),
             ConfigAction::Changed
@@ -6195,8 +6292,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("/export"), "rendered={rendered:?}");
-        assert!(rendered.contains("/collab"), "rendered={rendered:?}");
-        assert!(rendered.contains("/mode"), "rendered={rendered:?}");
+        assert!(rendered.contains("/config"), "rendered={rendered:?}");
+        assert!(!rendered.contains("/collab"), "rendered={rendered:?}");
+        assert!(!rendered.contains("/mode"), "rendered={rendered:?}");
         assert!(rendered.contains("/clear"), "rendered={rendered:?}");
         assert!(
             rendered.contains("Esc / F1 / ? close"),

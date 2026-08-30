@@ -154,6 +154,8 @@ impl ConfigInputDecoder {
             KeyCode::Char(']') => Some(ConfigKey::MoveDown),
             KeyCode::Up => Some(ConfigKey::Up),
             KeyCode::Down => Some(ConfigKey::Down),
+            KeyCode::Left => Some(ConfigKey::PreviousValue),
+            KeyCode::Right => Some(ConfigKey::NextValue),
             KeyCode::Enter => Some(ConfigKey::Confirm),
             KeyCode::Esc => {
                 self.escape_at = Some(now);
@@ -278,9 +280,12 @@ enum AdapterControl {
     },
     SetStrategy(CollaborationStrategy),
     SetMode(String),
+    SetModel {
+        identity: String,
+        model: String,
+    },
     Reload(usize),
     Drop(usize),
-    Promote(usize),
     Swap(usize, usize),
     Cancel,
     Stop,
@@ -388,7 +393,7 @@ enum Launch {
     Roster {
         specs: Vec<AgentSpec>,
         identities: Vec<String>,
-        owner_session_id: Option<String>,
+        session_ids: Vec<Option<String>>,
         prompt: Option<String>,
         first_slot: usize,
         max_rounds: usize,
@@ -485,7 +490,7 @@ fn main() -> std::io::Result<()> {
         Launch::Roster {
             specs,
             identities,
-            owner_session_id,
+            session_ids,
             prompt,
             first_slot,
             max_rounds,
@@ -493,7 +498,7 @@ fn main() -> std::io::Result<()> {
             &mut terminal,
             specs,
             identities,
-            owner_session_id,
+            session_ids,
             prompt,
             first_slot,
             max_rounds,
@@ -592,8 +597,8 @@ Options:
   -h, --help                      Show this help
   -v, --version                   Show the version
 
-Prompt commands include /config, /agents, /add, /mode, /collab, /reload, /drop,
-/promote, /swap, /diff, /export, /clear, and /close."#
+Prompt commands include /help, /config, /cancel, /reload, /to, /select,
+/export, /clear, and /close."#
     );
 }
 
@@ -713,7 +718,7 @@ fn parse_named_agent_launch(arguments: &[String]) -> Option<Launch> {
     Some(Launch::Roster {
         specs,
         identities,
-        owner_session_id: None,
+        session_ids: Vec::new(),
         prompt,
         first_slot,
         max_rounds,
@@ -779,42 +784,31 @@ fn resume_launch_from_metadata(
     if stored_cwd != cwd {
         return Err("No resumable CodeSwarm session for this project".into());
     }
-    if metadata
-        .get("agent_supports_load_session")
-        .and_then(serde_json::Value::as_bool)
-        == Some(false)
-        || metadata
-            .get("owner_session_id")
-            .or_else(|| metadata.get("agent_session_id"))
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-    {
-        return Err("The previous agent did not provide a resumable session".into());
-    }
-    let identities = metadata
-        .get("roster")
+    let agents = metadata
+        .get("agents")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "Saved session has no roster".to_owned())?;
+        .ok_or_else(|| "Saved session has no agents".to_owned())?;
+    if agents.is_empty() {
+        return Err("Saved session has no active agents".into());
+    }
     let catalog = catalog_from_settings(settings);
-    let saved_launch_specs = metadata
-        .get("roster_launch_specs")
-        .and_then(serde_json::Value::as_array);
-    let saved_identities = identities
+    let saved_identities = agents
         .iter()
-        .map(|identity| {
-            identity
-                .as_str()
+        .map(|agent| {
+            agent
+                .get("identity")
+                .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
-                .ok_or_else(|| "Saved session roster is invalid".to_owned())
+                .ok_or_else(|| "Saved agent identity is invalid".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let specs = identities
+    let specs = agents
         .iter()
-        .enumerate()
-        .map(|(index, identity)| {
-            let identity = identity
-                .as_str()
-                .ok_or_else(|| "Saved session roster is invalid".to_owned())?;
+        .map(|saved| {
+            let identity = saved
+                .get("identity")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "Saved agent identity is invalid".to_owned())?;
             if let Some(spec) = catalog
                 .iter()
                 .find(|agent| agent.active && agent.identity.eq_ignore_ascii_case(identity))
@@ -822,10 +816,6 @@ fn resume_launch_from_metadata(
             {
                 return Ok(spec);
             }
-            let saved = saved_launch_specs
-                .and_then(|specs| specs.get(index))
-                .and_then(serde_json::Value::as_object)
-                .ok_or_else(|| format!("Saved agent is no longer available: {identity}"))?;
             let protocol = saved
                 .get("protocol")
                 .and_then(serde_json::Value::as_str)
@@ -843,17 +833,25 @@ fn resume_launch_from_metadata(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if specs.is_empty() {
-        return Err("Saved session has no active agents".into());
+    let session_ids = agents
+        .iter()
+        .map(|agent| {
+            let supports_load = agent
+                .get("supports_load_session")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            supports_load
+                .then(|| agent.get("session_id")?.as_str().map(str::to_owned))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if session_ids.iter().all(Option::is_none) {
+        return Err("The previous agents did not provide a resumable session".into());
     }
     Ok(Launch::Roster {
         specs,
         identities: saved_identities,
-        owner_session_id: metadata
-            .get("owner_session_id")
-            .or_else(|| metadata.get("agent_session_id"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
+        session_ids,
         prompt: None,
         first_slot: 0,
         max_rounds: 100,
@@ -886,7 +884,7 @@ fn bare_launch_from_settings(settings: &str) -> Launch {
                 Launch::Roster {
                     specs,
                     identities,
-                    owner_session_id: None,
+                    session_ids: Vec::new(),
                     prompt: None,
                     first_slot: 0,
                     max_rounds: 100,
@@ -978,7 +976,7 @@ fn parse_roster_launch(arguments: &[String]) -> Option<Launch> {
     Some(Launch::Roster {
         specs,
         identities,
-        owner_session_id: None,
+        session_ids: Vec::new(),
         prompt: Some(prompt?),
         first_slot,
         max_rounds,
@@ -995,35 +993,6 @@ fn parse_agent_spec(value: &str) -> Option<AgentSpec> {
         "acp" => Some(AgentSpec::Acp(command.to_owned())),
         _ => None,
     }
-}
-
-/// Resolve either the explicit `agy:COMMAND`/`acp:COMMAND` form or an active
-/// catalog identity, short name, or alias for live roster additions.
-fn resolve_live_agent_spec(value: &str) -> Option<(AgentSpec, String)> {
-    parse_agent_spec(value)
-        .map(|spec| {
-            let identity = agent_spec_command(&spec).to_owned();
-            (spec, identity)
-        })
-        .or_else(|| {
-            let settings = settings_path()
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .unwrap_or_default();
-            let query = value.trim();
-            catalog_from_settings(&settings)
-                .into_iter()
-                .find(|agent| {
-                    agent.active
-                        && (agent.identity.eq_ignore_ascii_case(query)
-                            || agent.short_name.eq_ignore_ascii_case(query)
-                            || agent.name.eq_ignore_ascii_case(query)
-                            || agent
-                                .aliases
-                                .iter()
-                                .any(|alias| alias.eq_ignore_ascii_case(query)))
-                })
-                .map(|agent| (agent_spec(&agent), agent.identity))
-        })
 }
 
 fn display_agent_name(command: &str) -> String {
@@ -1097,7 +1066,7 @@ fn command_executable(command: &str) -> Option<String> {
         .map(|(program, _)| program.to_ascii_lowercase())
 }
 
-/// Build the single-owner snapshot used by direct (non-relay) launches.
+/// Build the coordinator snapshot used by direct (non-relay) launches.
 ///
 /// `RelayHost` owns the equivalent method for a multi-agent session. Keeping
 /// this helper at the CLI boundary means custom adapters remain supported by
@@ -1115,44 +1084,21 @@ fn standalone_session_metadata(
         "cwd".into(),
         serde_json::Value::String(cwd.display().to_string()),
     );
-    data.insert("roster".into(), serde_json::json!([identity]));
     data.insert(
-        "roster_launch_specs".into(),
-        serde_json::json!([{"protocol": adapter.protocol(), "command": command}]),
+        "title".into(),
+        serde_json::Value::String("CodeSwarm".into()),
     );
-    data.insert("owner".into(), serde_json::Value::String(name.to_owned()));
-    data.insert("title".into(), serde_json::Value::String(name.to_owned()));
-    data.insert("agent".into(), serde_json::Value::String(name.to_owned()));
-    data.insert(
-        "agent_identity".into(),
-        serde_json::Value::String(identity.to_owned()),
-    );
-    data.insert(
-        "protocol".into(),
-        serde_json::Value::String(adapter.protocol().to_owned()),
-    );
-    data.insert(
-        "agent_data".into(),
-        serde_json::json!({
-            "name": name,
-            "identity": identity,
-            "protocol": adapter.protocol(),
-        }),
-    );
-    data.insert(
-        "agent_supports_load_session".into(),
-        serde_json::Value::Bool(adapter.capabilities().supports_session_load),
-    );
+    let mut agent = serde_json::json!({
+        "name": name,
+        "identity": identity,
+        "protocol": adapter.protocol(),
+        "command": command,
+        "supports_load_session": adapter.capabilities().supports_session_load,
+    });
     if let Some(session_id) = adapter.session_id() {
-        data.insert(
-            "agent_session_id".into(),
-            serde_json::Value::String(session_id.clone()),
-        );
-        data.insert(
-            "owner_session_id".into(),
-            serde_json::Value::String(session_id),
-        );
+        agent["session_id"] = serde_json::Value::String(session_id);
     }
+    data.insert("agents".into(), serde_json::json!([agent]));
     SessionMetadata::new(data)
 }
 
@@ -1334,7 +1280,7 @@ fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std:
                     })
                     .map(agent_spec)
                     .collect::<Vec<_>>();
-                return run_roster(terminal, specs, identities, None, None, 0, 100);
+                return run_roster(terminal, specs, identities, Vec::new(), None, 0, 100);
             }
             StoreAction::Close => return Ok(()),
             StoreAction::Directory(_) => {}
@@ -1551,7 +1497,7 @@ fn find_live_slot(app: &App, identity: &str) -> Option<usize> {
 fn reconcile_config_roster(
     app: &mut App,
     controls: &tokio::sync::mpsc::UnboundedSender<AdapterControl>,
-    pending_owner: &mut Option<String>,
+    pending_first: &mut Option<String>,
 ) -> Result<bool, String> {
     let desired = app
         .config_agents()
@@ -1562,52 +1508,45 @@ fn reconcile_config_roster(
     if desired.is_empty() {
         return Err("select at least one agent for the roster".into());
     }
-    if pending_owner.is_some() {
+    if pending_first.is_some() {
         return Ok(false);
     }
 
-    // The first selected identity is the owner. If it is already present in
-    // a peer slot, promote it before dropping any other selected peer.
-    let desired_owner = &desired[0].identity;
-    if !live_slot_identity(app, 0).eq_ignore_ascii_case(desired_owner) {
-        if let Some(peer_slot) = find_live_slot(app, desired_owner) {
+    // Make the selected first agent the first live slot without restarting
+    // either process. A missing agent is appended, then swapped after Ready.
+    let desired_first = &desired[0].identity;
+    let first_live_slot = app.active_roster_slots().first().copied().unwrap_or(0);
+    if !live_slot_identity(app, first_live_slot).eq_ignore_ascii_case(desired_first) {
+        if let Some(peer_slot) = find_live_slot(app, desired_first) {
             controls
-                .send(AdapterControl::Promote(peer_slot))
-                .map_err(|_| "unable to queue owner transfer".to_owned())?;
+                .send(AdapterControl::Swap(first_live_slot, peer_slot))
+                .map_err(|_| "unable to queue roster reorder".to_owned())?;
             return Ok(false);
         } else {
-            // Match the Python coordinator's two-phase behavior: a catalog
-            // entry selected as the new owner is started as a normal peer,
-            // then promoted only after its Ready event proves the adapter is
-            // usable. The add loop below records the slot for that handoff.
             let agent = &desired[0];
             let spec = if agent.adapter.eq_ignore_ascii_case("native") {
                 AgentSpec::Agy(agent.command.clone())
             } else {
                 AgentSpec::Acp(agent.command.clone())
             };
-            *pending_owner = Some(agent.identity.clone());
+            *pending_first = Some(agent.identity.clone());
             controls
                 .send(AdapterControl::Add {
                     spec,
                     identity: agent.identity.clone(),
                 })
-                .map_err(|_| "unable to queue new owner".to_owned())?;
+                .map_err(|_| "unable to queue first agent".to_owned())?;
             return Ok(false);
         }
     }
 
-    // Drop catalog peers removed from the desired roster. Ad-hoc names are
+    // Drop catalog agents removed from the desired roster. Ad-hoc names are
     // intentionally retained because they have no catalog identity to map.
     let desired_identities = desired
         .iter()
         .map(|agent| agent.identity.to_ascii_lowercase())
         .collect::<std::collections::BTreeSet<_>>();
-    for slot in app
-        .active_roster_slots()
-        .into_iter()
-        .filter(|slot| *slot > 0)
-    {
+    for slot in app.active_roster_slots().into_iter() {
         let identity = live_slot_identity(app, slot);
         if app
             .config_agents()
@@ -1862,7 +1801,7 @@ fn run_roster(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     specs: Vec<AgentSpec>,
     identities: Vec<String>,
-    owner_session_id: Option<String>,
+    session_ids: Vec<Option<String>>,
     prompt: Option<String>,
     first_slot: usize,
     max_rounds: usize,
@@ -1883,7 +1822,7 @@ fn run_roster(
     let (events, controls, worker) = spawn_relay(
         specs,
         identities,
-        owner_session_id,
+        session_ids,
         prompt,
         first_slot,
         max_rounds,
@@ -2008,7 +1947,7 @@ fn run_agy_task(
         let name = display_agent_name(&command);
         let identity = catalog_identity_for_command(&command);
         let session_id = resume
-            .then(|| load_owner_session_id(&cwd, &name, &identity))
+            .then(|| load_agent_session_id(&cwd, &identity))
             .flatten();
         let mut adapter = session_id.map_or_else(
             || AgyAdapter::new(0, cwd.clone(), command.clone()),
@@ -2104,13 +2043,25 @@ fn run_agy_task(
                             let _ = sender.send(Err(error));
                         }
                     }
+                    Some(AdapterControl::SetModel { model, .. }) => {
+                        match adapter.set_model(model.clone()).await {
+                            Ok(()) => {
+                                let _ = sender.send(Ok(AgentEvent::ModelUpdated {
+                                    slot: 0,
+                                    current_model: model,
+                                }));
+                            }
+                            Err(error) => {
+                                let _ = sender.send(Err(error));
+                            }
+                        }
+                    }
                     Some(AdapterControl::Reload(_)) => {
                         if let Err(error) = adapter.reload().await {
                             let _ = sender.send(Err(error));
                         }
                     }
                     Some(AdapterControl::Drop(_))
-                    | Some(AdapterControl::Promote(_))
                     | Some(AdapterControl::Swap(_, _))
                     | Some(AdapterControl::Add { .. }) => {}
                     Some(AdapterControl::Queue { .. })
@@ -2183,7 +2134,7 @@ fn run_acp_task(
         let name = display_agent_name(&command);
         let identity = catalog_identity_for_command(&command);
         let session_id = resume
-            .then(|| load_owner_session_id(&cwd, &name, &identity))
+            .then(|| load_agent_session_id(&cwd, &identity))
             .flatten();
         let mut adapter = session_id.map_or_else(
             || AcpAdapter::new(0, cwd.clone(), program.clone(), args.clone()),
@@ -2287,13 +2238,25 @@ fn run_acp_task(
                             let _ = sender.send(Err(error));
                         }
                     }
+                    Some(AdapterControl::SetModel { model, .. }) => {
+                        match adapter.set_model(model.clone()).await {
+                            Ok(()) => {
+                                let _ = sender.send(Ok(AgentEvent::ModelUpdated {
+                                    slot: 0,
+                                    current_model: model,
+                                }));
+                            }
+                            Err(error) => {
+                                let _ = sender.send(Err(error));
+                            }
+                        }
+                    }
                     Some(AdapterControl::Reload(_)) => {
                         if let Err(error) = adapter.reload().await {
                             let _ = sender.send(Err(error));
                         }
                     }
                     Some(AdapterControl::Drop(_))
-                    | Some(AdapterControl::Promote(_))
                     | Some(AdapterControl::Swap(_, _))
                     | Some(AdapterControl::Add { .. }) => {}
                     Some(AdapterControl::Queue { .. })
@@ -2313,7 +2276,7 @@ fn run_acp_task(
 fn spawn_relay(
     specs: Vec<AgentSpec>,
     identities: Vec<String>,
-    owner_session_id: Option<String>,
+    session_ids: Vec<Option<String>>,
     prompt: Option<String>,
     first_slot: usize,
     max_rounds: usize,
@@ -2330,7 +2293,7 @@ fn spawn_relay(
             control_receiver,
             specs,
             identities,
-            owner_session_id,
+            session_ids,
             prompt,
             first_slot,
             max_rounds,
@@ -2444,7 +2407,7 @@ fn run_relay_task(
     mut controls: tokio::sync::mpsc::UnboundedReceiver<AdapterControl>,
     specs: Vec<AgentSpec>,
     identities: Vec<String>,
-    owner_session_id: Option<String>,
+    session_ids: Vec<Option<String>>,
     prompt: Option<String>,
     first_slot: usize,
     max_rounds: usize,
@@ -2482,23 +2445,20 @@ fn run_relay_task(
             .into_iter()
             .enumerate()
             .map(|(slot, spec)| {
+                let session_id = session_ids.get(slot).and_then(Clone::clone);
                 let adapter = match spec {
                     AgentSpec::Agy(command) => {
-                        let adapter = if slot == 0 {
-                            owner_session_id.as_ref().map_or_else(
-                                || AgyAdapter::new(slot, cwd.clone(), command.clone()),
-                                |session_id| {
-                                    AgyAdapter::with_session_id(
-                                        slot,
-                                        cwd.clone(),
-                                        command.clone(),
-                                        session_id,
-                                    )
-                                },
-                            )
-                        } else {
-                            AgyAdapter::new(slot, cwd.clone(), command)
-                        };
+                        let adapter = session_id.as_ref().map_or_else(
+                            || AgyAdapter::new(slot, cwd.clone(), command.clone()),
+                            |session_id| {
+                                AgyAdapter::with_session_id(
+                                    slot,
+                                    cwd.clone(),
+                                    command.clone(),
+                                    session_id,
+                                )
+                            },
+                        );
                         Ok(Box::new(adapter) as Box<dyn AgentAdapter>)
                     }
                     AgentSpec::Acp(command) => {
@@ -2510,29 +2470,18 @@ fn run_relay_task(
                                 )));
                             }
                         };
-                        let adapter = if slot == 0 {
-                            owner_session_id.as_ref().map_or_else(
-                                || {
-                                    AcpAdapter::new(
-                                        slot,
-                                        cwd.clone(),
-                                        program.clone(),
-                                        args.clone(),
-                                    )
-                                },
-                                |session_id| {
-                                    AcpAdapter::with_session_id(
-                                        slot,
-                                        cwd.clone(),
-                                        program.clone(),
-                                        args.clone(),
-                                        session_id,
-                                    )
-                                },
-                            )
-                        } else {
-                            AcpAdapter::new(slot, cwd.clone(), program, args)
-                        };
+                        let adapter = session_id.as_ref().map_or_else(
+                            || AcpAdapter::new(slot, cwd.clone(), program.clone(), args.clone()),
+                            |session_id| {
+                                AcpAdapter::with_session_id(
+                                    slot,
+                                    cwd.clone(),
+                                    program.clone(),
+                                    args.clone(),
+                                    session_id,
+                                )
+                            },
+                        );
                         Ok(Box::new(adapter) as Box<dyn AgentAdapter>)
                     }
                 }?;
@@ -2676,6 +2625,18 @@ fn run_relay_task(
                         let _ = sender.send(Err(error));
                     }
                 }
+                Some(AdapterControl::SetModel { identity, model }) => {
+                    let slot = relay.active_slot_for_identity(&identity);
+                    let result = match slot {
+                        Some(slot) => relay.set_model(slot, model).await,
+                        None => Err(AdapterError::Transport(
+                            "model target is no longer active".into(),
+                        )),
+                    };
+                    if let Err(error) = result {
+                        let _ = sender.send(Err(error));
+                    }
+                }
                 Some(AdapterControl::Reload(slot)) => {
                     if let Err(error) = relay.reload(slot).await {
                         let _ = sender.send(Ok(AgentEvent::RosterUpdated {
@@ -2691,16 +2652,6 @@ fn run_relay_task(
                         let _ = sender.send(Ok(AgentEvent::RosterUpdated {
                             update: codeswarm_core::RosterUpdate::Rejected {
                                 action: format!("drop agent {slot}"),
-                                detail: error.to_string(),
-                            },
-                        }));
-                    }
-                }
-                Some(AdapterControl::Promote(slot)) => {
-                    if let Err(error) = relay.promote_owner(slot).await {
-                        let _ = sender.send(Ok(AgentEvent::RosterUpdated {
-                            update: codeswarm_core::RosterUpdate::Rejected {
-                                action: format!("promote agent {slot}"),
                                 detail: error.to_string(),
                             },
                         }));
@@ -2796,9 +2747,7 @@ fn run_terminal(
     let history_project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     app.load_prompt_history(load_prompt_history(&history_project_root));
     let completion_candidates = [
-        "/add", "/agents", "/cancel", "/clear", "/close", "/collab", "/config", "/diff", "/exit",
-        "/export", "/help", "/mode", "/quit", "/reload", "/drop", "/promote", "/select", "/swap",
-        "/to",
+        "/cancel", "/clear", "/close", "/config", "/export", "/help", "/reload", "/select", "/to",
     ]
     .into_iter()
     .map(String::from)
@@ -2810,8 +2759,7 @@ fn run_terminal(
     let mut mode_catalog_slots = std::collections::BTreeSet::new();
     let mut mode_capable_slots = std::collections::BTreeSet::new();
     let mut mode_sync_in_flight: Option<String> = None;
-    let mut pending_owner: Option<String> = None;
-    let mut pending_owner_requested = false;
+    let mut pending_first: Option<String> = None;
     let mut config_reconcile_pending = false;
     let mut config_input = ConfigInputDecoder::new(if terminal_capture_enabled() {
         Duration::from_millis(150)
@@ -2849,31 +2797,24 @@ fn run_terminal(
                         match &event {
                             AgentEvent::RosterUpdated { update } => match update {
                                 codeswarm_core::RosterUpdate::Added { slot, identity, .. }
-                                    if pending_owner.as_ref().is_some_and(|owner| {
-                                        owner.eq_ignore_ascii_case(identity)
-                                    }) && !pending_owner_requested =>
+                                    if pending_first.as_ref().is_some_and(|first| {
+                                        first.eq_ignore_ascii_case(identity)
+                                    }) =>
                                 {
-                                    pending_owner_requested = true;
+                                    let first_live =
+                                        app.active_roster_slots().first().copied().unwrap_or(0);
                                     if let Some(controls) = &controls
-                                        && controls.send(AdapterControl::Promote(*slot)).is_err()
+                                        && controls
+                                            .send(AdapterControl::Swap(first_live, *slot))
+                                            .is_err()
                                     {
                                         app.status =
-                                            "new owner started but transfer could not be queued"
+                                            "new first agent started but reorder could not be queued"
                                                 .into();
                                     }
                                 }
-                                codeswarm_core::RosterUpdate::Promoted { from } => {
-                                    if pending_owner_requested {
-                                        pending_owner = None;
-                                        pending_owner_requested = false;
-                                    }
-                                    if selected_slot == Some(*from) {
-                                        selected_slot = Some(0);
-                                    } else if selected_slot == Some(0) {
-                                        selected_slot = Some(*from);
-                                    }
-                                }
                                 codeswarm_core::RosterUpdate::Swapped { first, second } => {
+                                    pending_first = None;
                                     if selected_slot == Some(*first) {
                                         selected_slot = Some(*second);
                                     } else if selected_slot == Some(*second) {
@@ -2882,8 +2823,7 @@ fn run_terminal(
                                 }
                                 codeswarm_core::RosterUpdate::Rejected { .. } => {
                                     config_reconcile_pending = false;
-                                    pending_owner = None;
-                                    pending_owner_requested = false;
+                                    pending_first = None;
                                 }
                                 _ => {}
                             },
@@ -2912,6 +2852,8 @@ fn run_terminal(
                                 mode_catalog_slots.insert(*slot);
                             }
                             AgentEvent::ModeUpdated { .. }
+                            | AgentEvent::ModelsReplaced { .. }
+                            | AgentEvent::ModelUpdated { .. }
                             | AgentEvent::CommandsReplaced { .. }
                             | AgentEvent::UsageUpdated { .. } => {}
                         }
@@ -2968,7 +2910,7 @@ fn run_terminal(
                             && config_reconcile_pending
                             && let Some(controls) = &controls
                         {
-                            match reconcile_config_roster(app, controls, &mut pending_owner) {
+                            match reconcile_config_roster(app, controls, &mut pending_first) {
                                 Ok(true) => {
                                     config_reconcile_pending = false;
                                     let roster = app.config_roster_identities();
@@ -3098,10 +3040,10 @@ fn run_terminal(
                         app.status = format!("selected {}", app.agent_name(slot));
                     }
                     FooterAction::OpenCollaboration => {
-                        let _ = app.handle_local_command("/collab");
+                        app.open_collaboration_config();
                     }
                     FooterAction::OpenMode => {
-                        let _ = app.handle_local_command("/mode");
+                        app.open_mode_config();
                     }
                     FooterAction::Ignored => {}
                 }
@@ -3148,7 +3090,7 @@ fn run_terminal(
                                 }
                             } else if let Some(controls) = &controls {
                                 config_reconcile_pending = true;
-                                match reconcile_config_roster(app, controls, &mut pending_owner) {
+                                match reconcile_config_roster(app, controls, &mut pending_first) {
                                     Ok(true) => match save_roster(&roster) {
                                         Ok(()) => {
                                             config_reconcile_pending = false;
@@ -3185,6 +3127,11 @@ fn run_terminal(
                             let _ = controls.send(AdapterControl::SetStrategy(
                                 collaboration_strategy(app.collaboration()),
                             ));
+                        }
+                        if let Some(controls) = &controls {
+                            for (identity, model) in app.take_config_model_changes() {
+                                let _ = controls.send(AdapterControl::SetModel { identity, model });
+                            }
                         }
                     }
                     continue;
@@ -3418,45 +3365,6 @@ fn run_terminal(
                                             app.status = "nothing to cancel".into();
                                         }
                                     }
-                                    LocalCommand::Mode => {
-                                        if let Some(mode) = app.take_requested_mode()
-                                            && let Some(controls) = &controls
-                                        {
-                                            let _ = controls.send(AdapterControl::SetMode(mode));
-                                        }
-                                    }
-                                    LocalCommand::Collaboration => {
-                                        if let Some(controls) = &controls {
-                                            let _ = controls.send(AdapterControl::SetStrategy(
-                                                collaboration_strategy(app.collaboration()),
-                                            ));
-                                        }
-                                    }
-                                    LocalCommand::Add(spec) => {
-                                        let Some(controls) = &controls else {
-                                            app.status = "add unavailable in solo session".into();
-                                            continue;
-                                        };
-                                        let Some((agent_spec, identity)) =
-                                            resolve_live_agent_spec(&spec)
-                                        else {
-                                            app.status =
-                                                "usage: /add AGENT, agy:COMMAND, or acp:COMMAND"
-                                                    .into();
-                                            continue;
-                                        };
-                                        if controls
-                                            .send(AdapterControl::Add {
-                                                spec: agent_spec,
-                                                identity,
-                                            })
-                                            .is_ok()
-                                        {
-                                            app.status = "adding agent".into();
-                                        } else {
-                                            app.status = "unable to add agent".into();
-                                        }
-                                    }
                                     LocalCommand::Reload => {
                                         if let Some(slot) = app.failed_agent()
                                             && let Some(controls) = &controls
@@ -3464,50 +3372,6 @@ fn run_terminal(
                                             let _ = controls.send(AdapterControl::Reload(slot));
                                         } else {
                                             app.status = "no crashed agent to reload".into();
-                                        }
-                                    }
-                                    LocalCommand::DropSlot(slot) => {
-                                        if slot == 0 {
-                                            app.status =
-                                                "owner cannot be dropped; use /close".into();
-                                        } else if let Some(controls) = &controls {
-                                            if controls.send(AdapterControl::Drop(slot)).is_ok() {
-                                                app.status = format!("dropping agent {slot}");
-                                            } else {
-                                                app.status = "unable to drop agent".into();
-                                            }
-                                        } else {
-                                            app.status = "drop unavailable in solo session".into();
-                                        }
-                                    }
-                                    LocalCommand::Promote(slot) => {
-                                        if slot == 0 {
-                                            app.status = "agent 0 is already the owner".into();
-                                        } else if let Some(controls) = &controls {
-                                            if controls.send(AdapterControl::Promote(slot)).is_ok()
-                                            {
-                                                app.status = format!("promoting agent {slot}");
-                                            } else {
-                                                app.status = "unable to promote agent".into();
-                                            }
-                                        } else {
-                                            app.status =
-                                                "promote unavailable in solo session".into();
-                                        }
-                                    }
-                                    LocalCommand::Swap(first, second) => {
-                                        if let Some(controls) = &controls {
-                                            if controls
-                                                .send(AdapterControl::Swap(first, second))
-                                                .is_ok()
-                                            {
-                                                app.status =
-                                                    format!("swapping agents {first} and {second}");
-                                            } else {
-                                                app.status = "unable to swap agents".into();
-                                            }
-                                        } else {
-                                            app.status = "swap unavailable in solo session".into();
                                         }
                                     }
                                     LocalCommand::SelectAgent(slot) => {
@@ -3527,25 +3391,6 @@ fn run_terminal(
                                         app.set_mouse_selection_mode(true);
                                         app.status = "text selection enabled for 15 seconds".into();
                                     }
-                                    LocalCommand::Drop => {
-                                        if let Some(slot) = app.failed_agent()
-                                            && let Some(controls) = &controls
-                                        {
-                                            if slot == 0 {
-                                                app.status =
-                                                    "owner cannot be dropped; use /close".into();
-                                                continue;
-                                            }
-                                            if selected_slot.is_none() {
-                                                let _ = controls.send(AdapterControl::Stop);
-                                                return Ok(());
-                                            }
-                                            let _ = controls.send(AdapterControl::Drop(slot));
-                                            app.status = format!("dropping agent {slot}");
-                                        } else {
-                                            app.status = "no crashed agent to drop".into();
-                                        }
-                                    }
                                     LocalCommand::Export => match export_conversation(app) {
                                         Ok(path) => {
                                             app.status = format!(
@@ -3557,12 +3402,6 @@ fn run_terminal(
                                             app.status = format!("export failed: {error}")
                                         }
                                     },
-                                    LocalCommand::Diff => {
-                                        if let Err(error) = save_ui_preferences(app) {
-                                            app.status =
-                                                format!("unable to save diff preference: {error}");
-                                        }
-                                    }
                                 }
                             } else if let Some(controls) = &controls {
                                 app.record_human_message(&prompt, false);
@@ -3696,34 +3535,19 @@ fn legacy_project_path_key(project_root: &Path) -> String {
 }
 
 fn session_metadata_candidates(project_root: &Path) -> Vec<PathBuf> {
-    vec![
-        session_metadata_path_for(project_root),
-        state_directory()
-            .join("sessions")
-            .join(legacy_project_path_key(project_root))
-            .join("session.json"),
-        state_directory().join("session.json"),
-    ]
+    vec![session_metadata_path_for(project_root)]
 }
 
-fn load_owner_session_id(cwd: &Path, owner_name: &str, owner_identity: &str) -> Option<String> {
+fn load_agent_session_id(cwd: &Path, identity: &str) -> Option<String> {
     session_metadata_candidates(cwd)
         .into_iter()
-        .find_map(|path| load_owner_session_id_from(&path, cwd, owner_name, owner_identity))
+        .find_map(|path| load_agent_session_id_from(&path, cwd, identity))
 }
 
-fn load_owner_session_id_from(
-    metadata_path: &Path,
-    cwd: &Path,
-    owner_name: &str,
-    owner_identity: &str,
-) -> Option<String> {
+fn load_agent_session_id_from(metadata_path: &Path, cwd: &Path, identity: &str) -> Option<String> {
     let loaded = SessionMetadataStore::open(metadata_path).read().ok()??;
     let stored_cwd = loaded.get("cwd").and_then(serde_json::Value::as_str)?;
-    // Compare canonical paths where possible.  A session launched through a
-    // symlink should still resume when the next invocation uses the real
-    // path (and vice versa); Python's project-root normalization has the same
-    // effect.
+    // A session launched through a symlink still resumes from the real path.
     let stored_cwd = Path::new(stored_cwd)
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(stored_cwd));
@@ -3731,33 +3555,21 @@ fn load_owner_session_id_from(
     if stored_cwd != current_cwd {
         return None;
     }
-    let owner_matches = ["owner", "agent", "agent_identity"]
-        .into_iter()
-        .filter_map(|key| loaded.get(key).and_then(serde_json::Value::as_str))
-        .any(|stored_owner| {
-            stored_owner.eq_ignore_ascii_case(owner_name)
-                || stored_owner.eq_ignore_ascii_case(owner_identity)
-        });
-    if !owner_matches {
-        return None;
-    }
-    // A session handle is only resumable when the adapter advertised the
-    // protocol's load-session capability.  Without this guard a fresh
-    // invocation of a non-resumable ACP agent can be poisoned by stale
-    // metadata from a previous owner.
-    if loaded
-        .get("agent_supports_load_session")
-        .and_then(serde_json::Value::as_bool)
-        == Some(false)
-    {
-        return None;
-    }
-    // `owner_session_id` is the explicit Rust snapshot key.  Fall back to
-    // the Python-compatible session-row name so snapshots produced before
-    // that alias was added remain resumable.
     loaded
-        .get("owner_session_id")
-        .or_else(|| loaded.get("agent_session_id"))
+        .get("agents")?
+        .as_array()?
+        .iter()
+        .find(|agent| {
+            agent
+                .get("identity")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|saved| saved.eq_ignore_ascii_case(identity))
+                && agent
+                    .get("supports_load_session")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        })?
+        .get("session_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
 }
@@ -4060,6 +3872,14 @@ mod tests {
             decoder.decode(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), now),
             Some(ConfigKey::MoveDown)
         );
+        assert_eq!(
+            decoder.decode(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), now),
+            Some(ConfigKey::PreviousValue)
+        );
+        assert_eq!(
+            decoder.decode(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), now),
+            Some(ConfigKey::NextValue)
+        );
         let mut decoder = ConfigInputDecoder::new(Duration::from_millis(650));
         assert_eq!(
             decoder.decode(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), now),
@@ -4192,18 +4012,20 @@ mod tests {
     }
 
     #[test]
-    fn resume_launch_requires_matching_workspace_and_loadable_owner_session() {
+    fn resume_launch_requires_matching_workspace_and_a_loadable_agent_session() {
         let root =
             std::env::temp_dir().join(format!("codeswarm-resume-test-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("create workspace");
         let mut data = serde_json::Map::new();
         data.insert("cwd".into(), serde_json::json!(root));
-        data.insert("roster".into(), serde_json::json!(["openai.com"]));
         data.insert(
-            "agent_supports_load_session".into(),
-            serde_json::json!(true),
+            "agents".into(),
+            serde_json::json!([{
+                "name": "Codex", "identity": "openai.com", "protocol": "acp",
+                "command": "codex-acp", "supports_load_session": true,
+                "session_id": "session-1"
+            }]),
         );
-        data.insert("owner_session_id".into(), serde_json::json!("session-1"));
         let metadata = SessionMetadata::new(data);
         assert!(matches!(
             resume_launch_from_metadata(&metadata, &root, "{}"),
@@ -4226,6 +4048,45 @@ mod tests {
             session_metadata_path_for(&collision_right)
         );
         assert!(resume_launch_from_metadata(&metadata, &other, "{}").is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_restores_each_agent_handle_and_rejects_the_removed_owner_schema() {
+        let root = std::env::temp_dir().join(format!(
+            "codeswarm-multi-agent-resume-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create workspace");
+        let current = SessionMetadata::new(
+            serde_json::json!({
+                "cwd": root.display().to_string(),
+                "agents": [
+                    {"name": "One", "identity": "one.example", "protocol": "acp", "command": "one", "supports_load_session": true, "session_id": "one-session"},
+                    {"name": "Two", "identity": "two.example", "protocol": "acp", "command": "two", "supports_load_session": true, "session_id": "two-session"}
+                ]
+            })
+            .as_object()
+            .expect("metadata")
+            .clone(),
+        );
+        assert!(matches!(
+            resume_launch_from_metadata(&current, &root, "{}"),
+            Ok(Launch::Roster { session_ids, .. })
+                if session_ids == [Some("one-session".into()), Some("two-session".into())]
+        ));
+
+        let removed = SessionMetadata::new(
+            serde_json::json!({
+                "cwd": root.display().to_string(),
+                "roster": ["one.example"],
+                "owner_session_id": "one-session"
+            })
+            .as_object()
+            .expect("old metadata")
+            .clone(),
+        );
+        assert!(resume_launch_from_metadata(&removed, &root, "{}").is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4405,7 +4266,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_session_metadata_contains_resume_alias_and_custom_protocol() {
+    fn direct_session_metadata_uses_the_agent_list_schema() {
         let adapter = ScriptedAdapter::new(
             0,
             AgentCapabilities {
@@ -4422,19 +4283,13 @@ mod tests {
             &adapter,
         );
         assert_eq!(
-            metadata.get("roster"),
-            Some(&serde_json::json!(["custom.example"]))
+            metadata.get("agents"),
+            Some(&serde_json::json!([{
+                "name": "Custom agent", "identity": "custom.example", "protocol": "custom",
+                "command": "custom-agent --stdio", "supports_load_session": true
+            }]))
         );
-        assert_eq!(
-            metadata.get("owner"),
-            Some(&serde_json::json!("Custom agent"))
-        );
-        assert_eq!(metadata.get("protocol"), Some(&serde_json::json!("custom")));
-        assert_eq!(
-            metadata.get("agent_supports_load_session"),
-            Some(&serde_json::json!(true))
-        );
-        assert!(metadata.get("owner_session_id").is_none());
+        assert!(metadata.get("owner").is_none());
     }
 
     #[test]
@@ -4446,14 +4301,11 @@ mod tests {
         let metadata = SessionMetadata::new(
             serde_json::json!({
                 "cwd": root.display().to_string(),
-                "roster": ["my-agent --stdio"],
-                "owner": "my-agent",
-                "agent_identity": "my-agent --stdio",
-                "agent_supports_load_session": true,
-                "owner_session_id": "provider-session",
-                "roster_launch_specs": [
-                    {"protocol": "acp", "command": "my-agent --stdio"}
-                ]
+                "agents": [{
+                    "name": "my-agent", "identity": "my-agent --stdio",
+                    "protocol": "acp", "command": "my-agent --stdio",
+                    "supports_load_session": true, "session_id": "provider-session"
+                }]
             })
             .as_object()
             .expect("metadata object")
@@ -4464,17 +4316,17 @@ mod tests {
             Ok(Launch::Roster {
                 specs,
                 identities,
-                owner_session_id: Some(session_id),
+                session_ids,
                 ..
             }) if specs == [AgentSpec::Acp("my-agent --stdio".into())]
                 && identities == ["my-agent --stdio"]
-                && session_id == "provider-session"
+                && session_ids == [Some("provider-session".into())]
         ));
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn owner_session_restore_accepts_legacy_agent_session_key_and_symlink_paths() {
+    fn agent_session_restore_matches_identity_and_workspace() {
         let root =
             std::env::temp_dir().join(format!("codeswarm-owner-restore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -4485,20 +4337,26 @@ mod tests {
             "cwd".into(),
             serde_json::Value::String(root.display().to_string()),
         );
-        data.insert("owner".into(), serde_json::json!("Codex"));
-        data.insert("agent_session_id".into(), serde_json::json!("session-42"));
+        data.insert(
+            "agents".into(),
+            serde_json::json!([{
+                "name": "Codex", "identity": "openai.com", "protocol": "acp",
+                "command": "codex-acp", "supports_load_session": true,
+                "session_id": "session-42"
+            }]),
+        );
         codeswarm_core::persistence::SessionMetadataStore::open(&metadata_path)
             .write(&codeswarm_core::persistence::SessionMetadata::new(data))
             .expect("write metadata");
         assert_eq!(
-            super::load_owner_session_id_from(&metadata_path, &root, "Codex", "openai.com"),
+            super::load_agent_session_id_from(&metadata_path, &root, "openai.com"),
             Some("session-42".into())
         );
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn owner_session_restore_skips_non_resumable_adapter_handles() {
+    fn agent_session_restore_skips_non_resumable_handles() {
         let root = std::env::temp_dir().join(format!(
             "codeswarm-owner-nonresumable-{}",
             std::process::id()
@@ -4511,20 +4369,19 @@ mod tests {
             "cwd".into(),
             serde_json::Value::String(root.display().to_string()),
         );
-        data.insert("owner".into(), serde_json::json!("Gemini"));
         data.insert(
-            "owner_session_id".into(),
-            serde_json::json!("stale-session"),
-        );
-        data.insert(
-            "agent_supports_load_session".into(),
-            serde_json::json!(false),
+            "agents".into(),
+            serde_json::json!([{
+                "name": "Gemini", "identity": "geminicli.com", "protocol": "acp",
+                "command": "gemini", "supports_load_session": false,
+                "session_id": "stale-session"
+            }]),
         );
         SessionMetadataStore::open(&metadata_path)
             .write(&SessionMetadata::new(data))
             .expect("write metadata");
         assert_eq!(
-            super::load_owner_session_id_from(&metadata_path, &root, "Gemini", "geminicli.com",),
+            super::load_agent_session_id_from(&metadata_path, &root, "geminicli.com"),
             None
         );
         let _ = std::fs::remove_dir_all(root);
@@ -4561,21 +4418,6 @@ mod tests {
     }
 
     #[test]
-    fn resolves_catalog_names_for_live_additions() {
-        assert_eq!(
-            super::resolve_live_agent_spec("codex"),
-            Some((
-                AgentSpec::Acp("npx -y --package=@agentclientprotocol/codex-acp codex-acp".into()),
-                "openai.com".into()
-            ))
-        );
-        assert_eq!(
-            super::resolve_live_agent_spec("agy:custom-agent"),
-            Some((AgentSpec::Agy("custom-agent".into()), "custom-agent".into()))
-        );
-    }
-
-    #[test]
     fn catalog_native_launch_preserves_full_access_startup_argument() {
         let catalog = codeswarm_core::agents::default_catalog();
         let antigravity = catalog
@@ -4589,7 +4431,7 @@ mod tests {
     }
 
     #[test]
-    fn config_roster_reconciliation_promotes_selected_live_peer() {
+    fn config_roster_reconciliation_swaps_selected_live_first_agent() {
         let mut app = codeswarm_tui::App::default();
         app.set_agent_name(0, "Claude");
         app.set_agent_name(1, "Codex");
@@ -4604,13 +4446,13 @@ mod tests {
             selected: true,
         }]);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut pending_owner = None;
+        let mut pending_first = None;
         assert!(
-            !reconcile_config_roster(&mut app, &sender, &mut pending_owner).expect("reconcile")
+            !reconcile_config_roster(&mut app, &sender, &mut pending_first).expect("reconcile")
         );
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AdapterControl::Promote(1))
+            Ok(AdapterControl::Swap(0, 1))
         ));
         assert_eq!(app.agent_name(0), "Claude");
         assert_eq!(app.active_roster_slots(), vec![0, 1]);
@@ -4642,18 +4484,66 @@ mod tests {
             },
         ]);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut pending_owner = None;
+        let mut pending_first = None;
         assert!(
-            !reconcile_config_roster(&mut app, &sender, &mut pending_owner).expect("reconcile")
+            !reconcile_config_roster(&mut app, &sender, &mut pending_first).expect("reconcile")
         );
         assert!(matches!(
             receiver.try_recv(),
-            Ok(AdapterControl::Promote(1))
+            Ok(AdapterControl::Swap(0, 1))
         ));
     }
 
     #[test]
-    fn config_roster_reconciliation_starts_a_new_owner_before_transfer() {
+    fn reordering_live_first_agent_swaps_without_recreating_either_agent() {
+        let mut app = codeswarm_tui::App::default();
+        app.set_agent_name(0, "Codex");
+        app.set_agent_identity(0, "openai.com");
+        app.set_agent_name(1, "Qwen");
+        app.set_agent_identity(1, "qwen.ai");
+        app.set_config_agents(vec![
+            StoreAgent {
+                identity: "qwen.ai".into(),
+                name: "Qwen".into(),
+                adapter: "ACP".into(),
+                command: "qwen --acp".into(),
+                available: true,
+                selected: true,
+            },
+            StoreAgent {
+                identity: "openai.com".into(),
+                name: "Codex".into(),
+                adapter: "ACP".into(),
+                command: "codex --acp".into(),
+                available: true,
+                selected: true,
+            },
+        ]);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut pending_first = None;
+        assert!(
+            !reconcile_config_roster(&mut app, &sender, &mut pending_first).expect("reconcile")
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AdapterControl::Swap(0, 1))
+        ));
+
+        app.apply_event(&AgentEvent::RosterUpdated {
+            update: codeswarm_core::RosterUpdate::Swapped {
+                first: 0,
+                second: 1,
+            },
+        });
+        assert!(reconcile_config_roster(&mut app, &sender, &mut pending_first).expect("settled"));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(app.agent_count(), 2);
+        assert_eq!(app.agent_name(0), "Qwen");
+        assert_eq!(app.agent_name(1), "Codex");
+    }
+
+    #[test]
+    fn config_roster_reconciliation_starts_a_new_first_agent_before_reorder() {
         let mut app = codeswarm_tui::App::default();
         app.set_agent_name(0, "Claude");
         app.set_agent_name(1, "Gemini");
@@ -4668,15 +4558,15 @@ mod tests {
             selected: true,
         }]);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut pending_owner = None;
+        let mut pending_first = None;
         assert!(
-            !reconcile_config_roster(&mut app, &sender, &mut pending_owner).expect("reconcile")
+            !reconcile_config_roster(&mut app, &sender, &mut pending_first).expect("reconcile")
         );
         assert!(matches!(
             receiver.try_recv(),
             Ok(AdapterControl::Add { .. })
         ));
-        assert_eq!(pending_owner.as_deref(), Some("openai.com"));
+        assert_eq!(pending_first.as_deref(), Some("openai.com"));
         assert_eq!(app.agent_name(2), "Agent 2");
     }
 
@@ -4704,9 +4594,9 @@ mod tests {
             },
         ]);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut pending_owner = None;
+        let mut pending_first = None;
         assert!(
-            !reconcile_config_roster(&mut app, &sender, &mut pending_owner).expect("reconcile")
+            !reconcile_config_roster(&mut app, &sender, &mut pending_first).expect("reconcile")
         );
         assert!(matches!(
             receiver.try_recv(),
@@ -4743,9 +4633,9 @@ mod tests {
             .collect(),
         );
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut pending_owner = None;
+        let mut pending_first = None;
         assert!(
-            !reconcile_config_roster(&mut app, &sender, &mut pending_owner).expect("reconcile")
+            !reconcile_config_roster(&mut app, &sender, &mut pending_first).expect("reconcile")
         );
         assert!(matches!(
             receiver.try_recv(),

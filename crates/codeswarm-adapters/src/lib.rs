@@ -388,13 +388,16 @@ pub trait AgentAdapter: Send {
         answer: PermissionAnswer,
     ) -> AdapterResult<()>;
     async fn set_mode(&mut self, mode: String) -> AdapterResult<()>;
+    async fn set_model(&mut self, _model: String) -> AdapterResult<()> {
+        Err(AdapterError::Unsupported("set_model"))
+    }
     async fn reload(&mut self) -> AdapterResult<()>;
     async fn stop(&mut self) -> AdapterResult<()>;
     async fn next_event(&mut self) -> Option<AdapterResult<AgentEvent>>;
 }
 
 /// Preserve a stable CodeSwarm roster slot when an already-running adapter is
-/// moved to another logical position (for example, owner promotion). Native
+/// moved to another logical position (for example, a roster reorder). Native
 /// protocol implementations keep their original slot internally, while this
 /// boundary rewrites the normalized event identity seen by the reducer.
 struct SlotMappedAdapter {
@@ -428,6 +431,21 @@ fn map_event_slot(event: AgentEvent, slot: RosterSlot) -> AgentEvent {
         AgentEvent::ModeUpdated { current_mode, .. } => {
             AgentEvent::ModeUpdated { slot, current_mode }
         }
+        AgentEvent::ModelsReplaced {
+            config_id,
+            models,
+            current_model,
+            ..
+        } => AgentEvent::ModelsReplaced {
+            slot,
+            config_id,
+            models,
+            current_model,
+        },
+        AgentEvent::ModelUpdated { current_model, .. } => AgentEvent::ModelUpdated {
+            slot,
+            current_model,
+        },
         AgentEvent::UserText { text, .. } => AgentEvent::UserText { slot, text },
         AgentEvent::CommandsReplaced { commands, .. } => {
             AgentEvent::CommandsReplaced { slot, commands }
@@ -493,6 +511,10 @@ impl AgentAdapter for SlotMappedAdapter {
 
     async fn set_mode(&mut self, mode: String) -> AdapterResult<()> {
         self.inner.set_mode(mode).await
+    }
+
+    async fn set_model(&mut self, model: String) -> AdapterResult<()> {
+        self.inner.set_model(model).await
     }
 
     async fn reload(&mut self) -> AdapterResult<()> {
@@ -565,6 +587,10 @@ impl AdapterHost {
 
     pub async fn set_mode(&mut self, mode: String) -> AdapterResult<()> {
         self.adapter.set_mode(mode).await
+    }
+
+    pub async fn set_model(&mut self, model: String) -> AdapterResult<()> {
+        self.adapter.set_model(model).await
     }
 
     pub async fn reload(&mut self) -> AdapterResult<()> {
@@ -914,101 +940,64 @@ impl RelayHost {
         self.metadata_workspace = Some(workspace.into());
     }
 
-    /// Build the Python-compatible flattened session metadata snapshot for the
-    /// current active roster and owner.
+    /// Build the coordinator-owned session snapshot for the active roster.
     pub fn session_metadata(&self) -> SessionMetadata {
-        let mut active = self.relay.active_slots().collect::<Vec<_>>();
-        // Slot zero owns the provider-backed session even after a crash has
-        // tombstoned it for dispatch. Keep that identity in the resumable
-        // snapshot; otherwise peer identities and owner session fields refer
-        // to different agents.
-        if !self.hosts.is_empty() && !active.contains(&0) {
-            active.insert(0, 0);
-        }
-        let identities = active
-            .iter()
-            .filter_map(|slot| self.roster_identities.get(*slot))
-            .cloned()
-            .collect::<Vec<_>>();
-        let owner = self.hosts.first();
+        let active = self.relay.active_slots().collect::<Vec<_>>();
         let mut data = serde_json::Map::new();
         if let Some(workspace) = &self.metadata_workspace {
             data.insert("cwd".into(), serde_json::Value::String(workspace.clone()));
         }
-        data.insert("roster".into(), serde_json::json!(identities));
-        if self.roster_launch_specs.len() == self.hosts.len() {
-            data.insert(
-                "roster_launch_specs".into(),
-                serde_json::Value::Array(
-                    active
-                        .iter()
-                        .filter_map(|slot| self.roster_launch_specs.get(*slot))
-                        .map(|(protocol, command)| {
-                            serde_json::json!({"protocol": protocol, "command": command})
-                        })
-                        .collect(),
-                ),
-            );
-        }
-        if let Some(owner) = owner {
-            let owner_identity = self
-                .roster_identities
-                .first()
-                .cloned()
-                .unwrap_or_else(|| owner.adapter().display_name());
-            let owner_name = self
-                .roster_names
-                .first()
-                .cloned()
-                .unwrap_or_else(|| owner.adapter().display_name());
-            data.insert(
-                "owner".into(),
-                serde_json::Value::String(owner_name.clone()),
-            );
-            data.insert(
-                "title".into(),
-                serde_json::Value::String(owner_name.clone()),
-            );
-            data.insert(
-                "agent".into(),
-                serde_json::Value::String(owner_name.clone()),
-            );
-            data.insert(
-                "agent_identity".into(),
-                serde_json::Value::String(owner_identity.clone()),
-            );
-            data.insert(
-                "protocol".into(),
-                serde_json::Value::String(owner.adapter().protocol().into()),
-            );
-            data.insert(
-                "agent_data".into(),
-                serde_json::json!({
-                    "name": owner_name,
-                    "identity": owner_identity,
-                    "protocol": owner.adapter().protocol(),
-                }),
-            );
-            data.insert(
-                "agent_supports_load_session".into(),
-                serde_json::Value::Bool(owner.adapter().capabilities().supports_session_load),
-            );
-            if let Some(session_id) = owner.session_id() {
-                // Keep both spellings.  `agent_session_id` is the Python
-                // session-row column and is useful to importers; the owner
-                // alias is consumed by the Rust launcher when restoring a
-                // bare invocation.  Writing both also makes snapshots from
-                // older Rust builds resumable after an upgrade.
-                data.insert(
-                    "agent_session_id".into(),
-                    serde_json::Value::String(session_id.clone()),
-                );
-                data.insert(
-                    "owner_session_id".into(),
-                    serde_json::Value::String(session_id),
-                );
-            }
-        }
+        data.insert(
+            "title".into(),
+            serde_json::Value::String("CodeSwarm".into()),
+        );
+        data.insert(
+            "agents".into(),
+            serde_json::Value::Array(
+                active
+                    .into_iter()
+                    .filter_map(|slot| {
+                        let host = self.hosts.get(slot)?;
+                        let (protocol, command) = self.roster_launch_specs.get(slot)?;
+                        let mut agent = serde_json::Map::new();
+                        agent.insert(
+                            "name".into(),
+                            serde_json::Value::String(
+                                self.roster_names
+                                    .get(slot)
+                                    .cloned()
+                                    .unwrap_or_else(|| host.adapter().display_name()),
+                            ),
+                        );
+                        agent.insert(
+                            "identity".into(),
+                            serde_json::Value::String(
+                                self.roster_identities
+                                    .get(slot)
+                                    .cloned()
+                                    .unwrap_or_else(|| host.adapter().display_name()),
+                            ),
+                        );
+                        agent.insert(
+                            "protocol".into(),
+                            serde_json::Value::String(protocol.clone()),
+                        );
+                        agent.insert("command".into(), serde_json::Value::String(command.clone()));
+                        agent.insert(
+                            "supports_load_session".into(),
+                            serde_json::Value::Bool(
+                                host.adapter().capabilities().supports_session_load,
+                            ),
+                        );
+                        if let Some(session_id) = host.session_id() {
+                            agent
+                                .insert("session_id".into(), serde_json::Value::String(session_id));
+                        }
+                        Some(serde_json::Value::Object(agent))
+                    })
+                    .collect(),
+            ),
+        );
         SessionMetadata::new(data)
     }
 
@@ -1115,6 +1104,17 @@ impl RelayHost {
         self.relay.strategy()
     }
 
+    pub fn roster_identity(&self, slot: RosterSlot) -> Option<&str> {
+        self.roster_identities.get(slot).map(String::as_str)
+    }
+
+    pub fn active_slot_for_identity(&self, identity: &str) -> Option<RosterSlot> {
+        self.relay.active_slots().find(|slot| {
+            self.roster_identity(*slot)
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(identity))
+        })
+    }
+
     /// Apply one semantic mode to every active adapter that advertises mode
     /// support. Native adapters may translate the policy to their own IDs.
     pub async fn set_mode(&mut self, mode: String) -> AdapterResult<()> {
@@ -1126,6 +1126,24 @@ impl RelayHost {
             if host.adapter().capabilities().supports_modes {
                 host.set_mode(mode.clone()).await?;
             }
+        }
+        Ok(())
+    }
+
+    pub async fn set_model(&mut self, slot: RosterSlot, model: String) -> AdapterResult<()> {
+        let host = self
+            .hosts
+            .get_mut(slot)
+            .ok_or_else(|| AdapterError::Transport("model target is missing".into()))?;
+        if !host.adapter().capabilities().supports_models {
+            return Err(AdapterError::Unsupported("set_model"));
+        }
+        host.set_model(model.clone()).await?;
+        if let Some(sink) = &self.event_sink {
+            sink(AgentEvent::ModelUpdated {
+                slot,
+                current_model: model,
+            });
         }
         Ok(())
     }
@@ -1176,9 +1194,7 @@ impl RelayHost {
         Ok(())
     }
 
-    /// Stop and tombstone a peer while preserving its stable roster slot.
-    /// Owner removal remains a deliberate error; callers should close or
-    /// promote through a higher-level coordinator instead.
+    /// Stop and tombstone an agent while preserving its stable roster slot.
     pub async fn drop_agent(&mut self, slot: RosterSlot) -> AdapterResult<()> {
         self.relay
             .drop_agent(slot)
@@ -1250,55 +1266,6 @@ impl RelayHost {
             sink(AgentEvent::Ready { slot, capabilities });
         }
         Ok(slot)
-    }
-
-    /// Promote an active peer to the owner slot without restarting it. The
-    /// former owner is stopped and retained as a tombstoned stable slot, so
-    /// queued targets and future reloads cannot silently change identity.
-    pub async fn promote_owner(&mut self, slot: RosterSlot) -> AdapterResult<()> {
-        if slot == 0 {
-            return Ok(());
-        }
-        if slot >= self.hosts.len() {
-            return Err(AdapterError::Transport(
-                "replacement owner is out of range".into(),
-            ));
-        }
-        if !self.relay.active_slots().any(|candidate| candidate == slot) {
-            return Err(AdapterError::Transport(
-                "replacement owner is not active".into(),
-            ));
-        }
-
-        // Shutdown is the only fallible step. Do it before mutating the
-        // roster, leaving all logical state intact if the old owner refuses.
-        self.hosts[0].stop().await?;
-        self.relay
-            .promote_owner(slot)
-            .map_err(|error| AdapterError::Transport(error.into()))?;
-
-        let replacement = self.hosts.remove(slot).remap(0);
-        let old_owner = self.hosts.remove(0).remap(slot);
-        self.hosts.insert(0, replacement);
-        self.hosts.insert(slot, old_owner);
-        self.roster_names.swap(0, slot);
-        self.roster_identities.swap(0, slot);
-        if self.roster_launch_specs.len() == self.hosts.len() {
-            self.roster_launch_specs.swap(0, slot);
-        }
-        self.introduced[0] = false;
-        self.introduced[slot] = false;
-        if let Some(sink) = &self.event_sink {
-            sink(AgentEvent::RosterUpdated {
-                update: RosterUpdate::Promoted { from: slot },
-            });
-            sink(AgentEvent::Ready {
-                slot: 0,
-                capabilities: self.hosts[0].adapter().capabilities(),
-            });
-        }
-        let _ = self.queue_session_metadata();
-        Ok(())
     }
 
     /// Reorder two live adapters without restarting either process. The
@@ -1438,12 +1405,7 @@ impl RelayHost {
                         .get(candidate)
                         .cloned()
                         .unwrap_or_else(|| self.hosts[candidate].adapter().display_name());
-                    let role = match (candidate == 0, candidate == *slot) {
-                        (true, true) => " — you, session owner",
-                        (true, false) => " — session owner",
-                        (false, true) => " — you",
-                        (false, false) => "",
-                    };
+                    let role = if candidate == *slot { " — you" } else { "" };
                     format!("{}. {name}{role}", candidate.saturating_add(1))
                 })
                 .collect::<Vec<_>>();
@@ -1846,6 +1808,7 @@ impl AgentAdapter for AgyAdapter {
             supports_permissions: false,
             supports_terminals: true,
             supports_session_load: true,
+            supports_models: false,
         }
     }
 
@@ -2196,6 +2159,8 @@ pub struct AcpAdapter {
     reader: Option<BufReader<ChildStdout>>,
     capabilities: AgentCapabilities,
     modes: Vec<Mode>,
+    models: Vec<Mode>,
+    model_config_id: Option<String>,
     session_id: Option<String>,
     next_request_id: u64,
     prompt_request_id: Option<u64>,
@@ -2221,6 +2186,8 @@ impl AcpAdapter {
             reader: None,
             capabilities: AgentCapabilities::default(),
             modes: Vec::new(),
+            models: Vec::new(),
+            model_config_id: None,
             session_id: None,
             next_request_id: 1,
             prompt_request_id: None,
@@ -2777,6 +2744,7 @@ impl AcpAdapter {
                 .get("loadSession")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            supports_models: false,
         };
         let session = if let Some(session_id) = self.session_id.clone() {
             if !self.capabilities.supports_session_load {
@@ -2852,6 +2820,26 @@ impl AcpAdapter {
                     .get("currentModeId")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+            }));
+        }
+        self.models.clear();
+        self.model_config_id = None;
+        let current_model =
+            parse_model_config(&session).and_then(|(config_id, models, current)| {
+                self.model_config_id = Some(config_id);
+                self.models = models;
+                current
+            });
+        self.capabilities.supports_models =
+            self.model_config_id.is_some() && !self.models.is_empty();
+        if let Some(config_id) = self.model_config_id.clone()
+            && !self.models.is_empty()
+        {
+            self.queued_events.push_back(Ok(AgentEvent::ModelsReplaced {
+                slot: self.slot,
+                config_id,
+                models: self.models.clone(),
+                current_model,
             }));
         }
         self.queued_events.push_back(Ok(AgentEvent::Ready {
@@ -3059,6 +3047,33 @@ impl AgentAdapter for AcpAdapter {
         Ok(())
     }
 
+    async fn set_model(&mut self, model: String) -> AdapterResult<()> {
+        let session_id = self
+            .session_id
+            .clone()
+            .ok_or_else(|| AdapterError::Transport("ACP session is not initialized".into()))?;
+        let config_id = self
+            .model_config_id
+            .clone()
+            .ok_or(AdapterError::Unsupported("set_model"))?;
+        if !self.models.iter().any(|candidate| candidate.id == model) {
+            return Err(AdapterError::Protocol(
+                "model is not advertised by the agent".into(),
+            ));
+        }
+        let _ = self
+            .request(
+                "session/set_config_option",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "configId": config_id,
+                    "value": model,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn reload(&mut self) -> AdapterResult<()> {
         // `stop` tears down the process and clears its transport-owned
         // session handle. A reload is different from a final shutdown: ACP
@@ -3123,7 +3138,17 @@ impl AgentAdapter for AcpAdapter {
                 Err(error) => return Some(Err(error)),
             }
             match parse_acp_notification(self.slot, &line) {
-                Ok(Some(event)) => return Some(Ok(event)),
+                Ok(Some(event)) => {
+                    if let AgentEvent::ModelsReplaced {
+                        config_id, models, ..
+                    } = &event
+                    {
+                        self.model_config_id = Some(config_id.clone());
+                        self.models = models.clone();
+                        self.capabilities.supports_models = !models.is_empty();
+                    }
+                    return Some(Ok(event));
+                }
                 Ok(None) => {}
                 Err(error) => return Some(Err(error)),
             }
@@ -3163,6 +3188,16 @@ fn parse_acp_notification(slot: RosterSlot, line: &str) -> AdapterResult<Option<
         return Ok(None);
     };
     let kind = update.get("sessionUpdate").and_then(Value::as_str);
+    if kind == Some("config_option_update")
+        && let Some((config_id, models, current_model)) = parse_model_config(update)
+    {
+        return Ok(Some(AgentEvent::ModelsReplaced {
+            slot,
+            config_id,
+            models,
+            current_model,
+        }));
+    }
     if kind == Some("request_permission") {
         let request_id = update
             .get("toolCall")
@@ -3293,6 +3328,43 @@ fn parse_acp_notification(slot: RosterSlot, line: &str) -> AdapterResult<Option<
     }
 }
 
+fn parse_model_config(value: &Value) -> Option<(String, Vec<Mode>, Option<String>)> {
+    let config = value
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|option| {
+            option.get("category").and_then(Value::as_str) == Some("model")
+                && matches!(
+                    option.get("type").and_then(Value::as_str),
+                    Some("select" | "enum")
+                )
+        })?;
+    let config_id = config.get("id")?.as_str()?.to_owned();
+    let models = config
+        .get("options")?
+        .as_array()?
+        .iter()
+        .filter_map(|option| {
+            let id = option.get("value")?.as_str()?.to_owned();
+            let label = option
+                .get("name")
+                .or_else(|| option.get("label"))
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_owned();
+            Some(Mode { id, label })
+        })
+        .collect::<Vec<_>>();
+    (!models.is_empty()).then(|| {
+        let current = config
+            .get("currentValue")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        (config_id, models, current)
+    })
+}
+
 /// Normalize terminal lifecycle updates emitted by ACP-compatible bridges and
 /// native stream adapters. Protocols have used both snake_case update names
 /// and a nested `terminal` object, so accept either without leaking that
@@ -3400,7 +3472,7 @@ mod tests {
     use super::{
         AcpAdapter, AdapterHost, AgentAdapter, AgyAdapter, MAX_ACP_LINE_BYTES, MAX_FILE_READ_BYTES,
         RelayHost, ScriptedAdapter, parse_acp_notification, parse_agy_line, parse_command_line,
-        prompt_content_blocks, read_bounded_line,
+        parse_model_config, prompt_content_blocks, read_bounded_line,
     };
     #[cfg(target_os = "linux")]
     use super::{isolate_process_group, terminate_child};
@@ -4126,6 +4198,24 @@ mod tests {
             }
         );
 
+        let models = parse_acp_notification(
+            3,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"smart","options":[{"value":"fast","name":"Fast"},{"value":"smart","name":"Smart"}]}]}}}"#,
+        )
+        .expect("valid ACP")
+        .expect("models event");
+        assert!(matches!(
+            models,
+            AgentEvent::ModelsReplaced { slot: 3, models, current_model, .. }
+                if models.len() == 2 && current_model.as_deref() == Some("smart")
+        ));
+        assert_eq!(
+            parse_model_config(&serde_json::json!({
+                "configOptions": [{"id": "model", "category": "model", "type": "select", "options": [{"name": "missing value"}]}]
+            })),
+            None
+        );
+
         let user = parse_acp_notification(
             3,
             r#"{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"context"}}}}"#,
@@ -4426,6 +4516,29 @@ mod tests {
             adapter.next_event().await,
             Some(Ok(AgentEvent::Ready { capabilities, .. })) if !capabilities.supports_modes
         ));
+        adapter.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn acp_models_are_discovered_live_and_changed_through_session_config() {
+        let script = r#"read _; echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{}}}'; read _; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session-1","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"fast","options":[{"value":"fast","name":"Fast"},{"value":"smart","name":"Smart"}]}]}}'; read request; case "$request" in *session/set_config_option*\"value\":\"smart\"*) echo '{"jsonrpc":"2.0","id":3,"result":{}}';; *) echo '{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"wrong model request"}}';; esac"#;
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut adapter = AcpAdapter::new(0, cwd, "sh", vec!["-c".into(), script.into()]);
+        adapter.start().await.expect("initialize");
+        assert!(adapter.capabilities().supports_models);
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::ModelsReplaced { config_id, models, current_model, .. }))
+                if config_id == "model"
+                    && models == [Mode { id: "fast".into(), label: "Fast".into() }, Mode { id: "smart".into(), label: "Smart".into() }]
+                    && current_model.as_deref() == Some("fast")
+        ));
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Ready { capabilities, .. })) if capabilities.supports_models
+        ));
+        adapter.set_model("smart".into()).await.expect("set model");
+        assert!(adapter.set_model("invented".into()).await.is_err());
         adapter.stop().await.expect("stop");
     }
 
@@ -5026,11 +5139,7 @@ mod tests {
                 .1
                 .contains("CodeSwarm roster (ordered)")
         );
-        assert!(
-            relay.dispatches()[0]
-                .1
-                .contains("1. Claude — you, session owner")
-        );
+        assert!(relay.dispatches()[0].1.contains("1. Claude — you"));
         assert!(relay.dispatches()[0].1.contains("2. Codex"));
         assert!(relay.dispatches()[1].1.contains(STOP_TOKEN));
         assert!(relay.dispatches()[0].1.contains("Do not use"));
@@ -5410,6 +5519,7 @@ mod tests {
             None,
         );
         let mut relay = RelayHost::new(vec![first, second], 4).expect("relay");
+        relay.set_roster_names(vec!["First".into(), "Second".into()]);
         relay.set_roster_identities(vec!["owner.example".into(), "peer.example".into()]);
         relay.set_roster_launch_specs(vec![
             ("custom".into(), "owner".into()),
@@ -5441,24 +5551,20 @@ mod tests {
             vec![0, 1, 2]
         );
         assert_eq!(
-            relay.session_metadata().get("roster"),
-            Some(&serde_json::json!([
-                "owner.example",
-                "peer.example",
-                "reviewer.example"
-            ]))
+            relay
+                .session_metadata()
+                .get("agents")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(3)
         );
         relay.drop_agent(1).await.expect("drop middle peer");
         let metadata = relay.session_metadata();
         assert_eq!(
-            metadata.get("roster"),
-            Some(&serde_json::json!(["owner.example", "reviewer.example"]))
-        );
-        assert_eq!(
-            metadata.get("roster_launch_specs"),
+            metadata.get("agents"),
             Some(&serde_json::json!([
-                {"protocol": "custom", "command": "owner"},
-                {"protocol": "custom", "command": "reviewer --acp"}
+                {"name": "First", "identity": "owner.example", "protocol": "custom", "command": "owner", "supports_load_session": false},
+                {"name": "Reviewer", "identity": "reviewer.example", "protocol": "custom", "command": "reviewer --acp", "supports_load_session": false}
             ]))
         );
         assert!(
@@ -5471,7 +5577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_host_persists_python_compatible_runtime_metadata() {
+    async fn relay_host_persists_coordinator_owned_runtime_metadata() {
         let path = unique_test_path("codeswarm-session-metadata", "json");
         let metadata_store = codeswarm_core::persistence::SessionMetadataStore::open(&path);
         let writer = metadata_store.buffered().expect("metadata writer");
@@ -5486,79 +5592,29 @@ mod tests {
         let mut relay = RelayHost::new(vec![first, second], 4).expect("relay");
         relay.set_roster_names(vec!["Claude".into(), "Codex".into()]);
         relay.set_roster_identities(vec!["claude.ai".into(), "openai.com".into()]);
+        relay.set_roster_launch_specs(vec![
+            ("custom".into(), "claude".into()),
+            ("custom".into(), "codex".into()),
+        ]);
         relay.set_session_metadata_writer(writer);
         relay.start().await.expect("start");
-        relay.drop_agent(1).await.expect("drop peer");
+        relay.drop_agent(0).await.expect("drop first agent");
         relay.stop().await.expect("stop");
 
         let loaded = metadata_store
             .read()
             .expect("read metadata")
             .expect("metadata snapshot");
+        assert_eq!(loaded.get("title"), Some(&serde_json::json!("CodeSwarm")));
         assert_eq!(
-            loaded.get("roster"),
-            Some(&serde_json::json!(["claude.ai"]))
+            loaded.get("agents"),
+            Some(&serde_json::json!([{
+                "name": "Codex", "identity": "openai.com", "protocol": "custom",
+                "command": "codex", "supports_load_session": false
+            }]))
         );
-        let agent_data = loaded.get("agent_data").expect("owner metadata");
-        assert_eq!(agent_data["identity"], "claude.ai");
-        assert_eq!(agent_data["protocol"], "custom");
-        assert_eq!(loaded.get("agent"), Some(&serde_json::json!("Claude")));
-        assert_eq!(loaded.get("title"), Some(&serde_json::json!("Claude")));
-        assert_eq!(loaded.get("protocol"), Some(&serde_json::json!("custom")));
-        assert_eq!(
-            loaded.get("agent_supports_load_session"),
-            Some(&serde_json::json!(false))
-        );
+        assert!(loaded.get("owner").is_none());
         let _ = std::fs::remove_file(path);
-    }
-
-    #[tokio::test]
-    async fn relay_host_promotes_peer_without_restarting_or_leaking_slot_identity() {
-        let former_owner = AdapterHost::new(
-            Box::new(ScriptedAdapter::new(
-                0,
-                AgentCapabilities::default(),
-                [AgentEvent::TurnComplete { slot: 0 }],
-            )),
-            None,
-        );
-        let replacement = AdapterHost::new(
-            Box::new(ScriptedAdapter::new(
-                1,
-                AgentCapabilities::default(),
-                [
-                    AgentEvent::Text {
-                        slot: 1,
-                        text: "promoted response".into(),
-                    },
-                    AgentEvent::TurnComplete { slot: 1 },
-                ],
-            )),
-            None,
-        );
-        let mut relay = RelayHost::new(vec![former_owner, replacement], 4).expect("relay");
-        relay.set_roster_names(vec!["Owner".into(), "Reviewer".into()]);
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let captured = std::sync::Arc::clone(&events);
-        relay.set_event_sink(move |event| captured.lock().expect("lock").push(event));
-        relay.start().await.expect("start");
-
-        relay.promote_owner(1).await.expect("promote peer");
-        assert_eq!(relay.relay().active_slots().collect::<Vec<_>>(), vec![0]);
-        assert!(matches!(
-            relay.run_turn("task", 0).await.expect("promoted turn"),
-            RelayDecision::Dispatch { slot: 0, .. }
-        ));
-        let events = events.lock().expect("lock");
-        let text = events
-            .iter()
-            .filter_map(|event| match event {
-                AgentEvent::Text { slot: 0, text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<String>();
-        assert_eq!(text, "promoted response");
-        assert!(relay.dispatches()[0].1.contains("You are Reviewer"));
     }
 
     #[tokio::test]
@@ -5593,12 +5649,15 @@ mod tests {
         );
         let mut relay = RelayHost::new(vec![first, second], 4).expect("relay");
         relay.set_roster_names(vec!["Owner".into(), "Peer".into()]);
+        relay.set_roster_identities(vec!["first.example".into(), "second.example".into()]);
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = std::sync::Arc::clone(&events);
         relay.set_event_sink(move |event| captured.lock().expect("lock").push(event));
         relay.start().await.expect("start");
 
         relay.swap_agents(0, 1).expect("swap peers");
+        assert_eq!(relay.active_slot_for_identity("first.example"), Some(1));
+        assert_eq!(relay.active_slot_for_identity("second.example"), Some(0));
         relay.run_turn("task", 0).await.expect("swapped turn");
         let events = events.lock().expect("events");
         assert!(events.iter().any(|event| {
@@ -5608,7 +5667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_host_persists_owner_and_active_roster_metadata_off_thread() {
+    async fn relay_host_persists_all_active_agent_metadata_off_thread() {
         let path = unique_test_path("codeswarm-session-metadata", "json");
         let first = AdapterHost::new(
             Box::new(ScriptedAdapter::new(
@@ -5629,6 +5688,10 @@ mod tests {
         let mut relay = RelayHost::new(vec![first, second], 4).expect("relay");
         relay.set_roster_names(vec!["Claude".into(), "Codex".into()]);
         relay.set_roster_identities(vec!["claude.com".into(), "openai.com".into()]);
+        relay.set_roster_launch_specs(vec![
+            ("custom".into(), "claude".into()),
+            ("custom".into(), "codex".into()),
+        ]);
         let writer = SessionMetadataStore::open(&path)
             .buffered()
             .expect("metadata writer");
@@ -5639,16 +5702,13 @@ mod tests {
             .read()
             .expect("read metadata")
             .expect("metadata snapshot");
-        assert_eq!(
-            loaded.get("roster"),
-            Some(&serde_json::json!(["claude.com", "openai.com"]))
-        );
-        assert_eq!(
-            loaded
-                .get("agent_data")
-                .and_then(|value| value.get("identity")),
-            Some(&serde_json::json!("claude.com"))
-        );
+        let agents = loaded
+            .get("agents")
+            .and_then(|value| value.as_array())
+            .expect("agents");
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0]["identity"], "claude.com");
+        assert_eq!(agents[1]["identity"], "openai.com");
         let _ = std::fs::remove_file(path);
     }
 

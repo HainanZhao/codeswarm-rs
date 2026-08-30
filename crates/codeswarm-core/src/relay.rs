@@ -33,8 +33,8 @@ pub enum QueuedKind {
 
 /// How a multi-agent session chooses its next non-direct recipient.
 ///
-/// `Roster` is the normal sequential ring. `Pair` keeps the owner and the
-/// first selected reviewer in a tight review loop, which is useful when a
+/// `Roster` is the normal sequential ring. `Pair` keeps the first two active
+/// agents in a tight review loop, which is useful when a
 /// larger saved roster is available but the user wants focused two-agent
 /// collaboration. `Manual` never advances on its own after the first turn;
 /// every subsequent turn must be explicitly targeted or queued by the user.
@@ -147,65 +147,15 @@ impl Relay {
     }
 
     pub fn drop_agent(&mut self, slot: RosterSlot) -> Result<(), &'static str> {
-        if slot == 0 {
-            return Err("owner cannot be dropped");
+        if !self.active.get(slot).copied().ok_or("slot out of range")? {
+            return Ok(());
+        }
+        if self.active_slots().count() == 1 {
+            return Err("last active agent cannot be dropped");
         }
         self.tombstone(slot)?;
         self.direct.retain(|queued| queued.slot != slot);
         self.steering.retain(|queued| queued.slot != slot);
-        Ok(())
-    }
-
-    /// Promote an active peer into the owner slot while preserving the
-    /// causal relay state. The former owner remains in its original slot but
-    /// is tombstoned, matching the Python coordinator's stable-slot model.
-    pub fn promote_owner(&mut self, slot: RosterSlot) -> Result<(), &'static str> {
-        if slot == 0 {
-            return Ok(());
-        }
-        if !self.active.get(slot).copied().ok_or("slot out of range")? {
-            return Err("replacement owner is not active");
-        }
-
-        // Queue and cursor targets identify adapters, so follow both agents
-        // across the slot exchange. The old owner may already be tombstoned
-        // after a crash; slot zero is made active for its replacement.
-        fn swap_targets(queue: &mut VecDeque<QueuedPrompt>, first: usize, second: usize) {
-            for queued in queue {
-                if queued.slot == first {
-                    queued.slot = second;
-                } else if queued.slot == second {
-                    queued.slot = first;
-                }
-            }
-        }
-        swap_targets(&mut self.direct, 0, slot);
-        swap_targets(&mut self.steering, 0, slot);
-        if self.last_active == 0 {
-            self.last_active = slot;
-        } else if self.last_active == slot {
-            self.last_active = 0;
-        }
-        if self.next == Some(0) {
-            self.next = Some(slot);
-        } else if self.next == Some(slot) {
-            self.next = Some(0);
-        }
-        if self.previous_slot == Some(0) {
-            self.previous_slot = Some(slot);
-        } else if self.previous_slot == Some(slot) {
-            self.previous_slot = Some(0);
-        }
-        if self.pair_partner == Some(slot) {
-            self.pair_partner = Some(0);
-        } else if self.pair_partner == Some(0) {
-            self.pair_partner = Some(slot);
-        }
-
-        self.context.swap_agents(0, slot);
-        self.context.rewind(0);
-        self.active[0] = true;
-        self.active[slot] = false;
         Ok(())
     }
 
@@ -433,27 +383,29 @@ impl Relay {
                 .filter(|slot| self.active[*slot])
                 .unwrap_or_else(|| self.first_active_from(first)),
             CollaborationStrategy::Pair => {
-                // Pair mode always includes the owner. The first selected
-                // non-owner becomes the reviewer; when the owner is selected
-                // first, choose the next active roster member.
+                let primary = self.first_active_from(0);
                 let partner = if let Some(partner) = self.pair_partner {
-                    partner
-                } else {
-                    let partner = if first != 0 && self.active.get(first).copied().unwrap_or(false)
-                    {
-                        first
+                    if self.active.get(partner).copied().unwrap_or(false) && partner != primary {
+                        partner
                     } else {
-                        self.first_active_from(1)
-                    };
+                        let partner = self.next_active(primary);
+                        self.pair_partner = Some(partner);
+                        partner
+                    }
+                } else {
+                    let partner =
+                        if first != primary && self.active.get(first).copied().unwrap_or(false) {
+                            first
+                        } else {
+                            self.next_active(primary)
+                        };
                     self.pair_partner = Some(partner);
                     partner
                 };
                 match self.previous_slot {
-                    Some(previous) if previous == 0 && self.active[partner] => partner,
-                    Some(previous) if previous == partner && self.active[0] => 0,
-                    Some(previous) if previous == 0 || previous == partner => {
-                        self.first_active_from(0)
-                    }
+                    Some(previous) if previous == primary && self.active[partner] => partner,
+                    Some(previous) if previous == partner && self.active[primary] => primary,
+                    Some(previous) if previous == primary || previous == partner => primary,
                     _ => self.first_active_from(first),
                 }
             }
@@ -523,7 +475,7 @@ mod tests {
         ));
         relay.finish(1, false, false);
 
-        // The next user prompt targets the owner, which differs from the
+        // The next user prompt targets the first agent, which differs from the
         // previous reviewer. It is still the first response to a human turn,
         // so it must not receive reviewer stop permission.
         assert!(relay.enqueue_human("new task", Some(0)));
@@ -538,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_work_has_priority_and_owner_is_not_droppable() {
+    fn direct_work_has_priority_and_any_agent_except_the_last_can_be_dropped() {
         let mut relay = Relay::new(3, 10);
         relay.enqueue_human("ordinary", Some(1));
         assert_eq!(relay.enqueue_direct(2, "private"), Ok(true));
@@ -550,7 +502,13 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(relay.drop_agent(0), Err("owner cannot be dropped"));
+        assert_eq!(relay.drop_agent(0), Ok(()));
+        assert_eq!(relay.active_slots().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(relay.drop_agent(1), Ok(()));
+        assert_eq!(
+            relay.drop_agent(2),
+            Err("last active agent cannot be dropped")
+        );
     }
 
     #[test]
@@ -603,43 +561,16 @@ mod tests {
     }
 
     #[test]
-    fn owner_promotion_follows_targets_and_replays_context_to_replacement() {
-        let mut relay = Relay::new(3, 10);
-        relay.set_shared_task("shared");
-        relay.record_public("owner", "context");
-        relay.mark_context_seen(0);
-        assert_eq!(relay.unseen_context(0), "");
-        assert!(relay.enqueue_direct(0, "old owner work").expect("queue"));
-        assert!(relay.enqueue_direct(1, "replacement work").expect("queue"));
-        assert!(matches!(
-            relay.begin("task", 0),
-            RelayDecision::Dispatch { slot: 0, .. }
-        ));
-        relay.finish(0, false, false);
-
-        relay.promote_owner(1).expect("promote active peer");
-        assert_eq!(relay.active_slots().collect::<Vec<_>>(), vec![0, 2]);
-        // Work follows its adapter: the replacement's queue target now names
-        // slot zero, while the former owner's target is tombstoned at one.
-        assert!(matches!(
-            relay.begin("", 0),
-            RelayDecision::Dispatch { slot: 0, direct: true, prompt, .. }
-                if prompt == "replacement work"
-        ));
-        assert_eq!(relay.unseen_context(0), "owner:\ncontext");
-    }
-
-    #[test]
     fn live_slot_swap_follows_queued_targets_and_runtime_cursors() {
         let mut relay = Relay::new(3, 10);
-        relay.record_public("Agent 0", "owner work");
+        relay.record_public("Agent 0", "first work");
         relay.mark_context_seen(0);
         assert!(matches!(
             relay.begin("task", 0),
             RelayDecision::Dispatch { slot: 0, .. }
         ));
         relay.finish(0, false, false);
-        relay.enqueue_human("to owner", Some(0));
+        relay.enqueue_human("to first", Some(0));
         relay.enqueue_direct(2, "to third").expect("queue direct");
 
         relay.swap_agents(0, 2).expect("swap live slots");
@@ -653,9 +584,9 @@ mod tests {
         assert!(matches!(
             relay.begin("", 0),
             RelayDecision::Dispatch { slot: 2, direct: false, prompt, .. }
-                if prompt == "to owner"
+                if prompt == "to first"
         ));
-        assert_eq!(relay.unseen_context(0), "Agent 0:\nowner work");
+        assert_eq!(relay.unseen_context(0), "Agent 0:\nfirst work");
     }
 
     #[test]
@@ -682,7 +613,7 @@ mod tests {
     #[test]
     fn a_healthy_peer_continues_after_the_other_slot_is_tombstoned() {
         let mut relay = Relay::new(2, 10);
-        relay.tombstone(0).expect("owner failure");
+        relay.tombstone(0).expect("first agent failure");
         assert!(matches!(
             relay.begin("continue", 0),
             RelayDecision::Dispatch {
@@ -713,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn pair_strategy_alternates_owner_and_selected_reviewer() {
+    fn pair_strategy_alternates_the_first_two_active_agents() {
         let mut relay = Relay::new(4, 10);
         relay.set_strategy(CollaborationStrategy::Pair);
         assert!(matches!(
@@ -729,6 +660,13 @@ mod tests {
         assert!(matches!(
             relay.begin("next", 2),
             RelayDecision::Dispatch { slot: 2, .. }
+        ));
+
+        relay.drop_agent(0).expect("remove first agent");
+        relay.finish(2, false, false);
+        assert!(matches!(
+            relay.begin("after removal", 2),
+            RelayDecision::Dispatch { slot: 1, .. }
         ));
     }
 }

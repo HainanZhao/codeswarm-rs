@@ -91,21 +91,9 @@ Inside the conversation prompt:
 - `/config` opens settings, including the
   catalog-backed roster editor (Enter toggles, Alt+↑/↓ reorders, Ctrl+S saves
   and applies idle-session changes when possible).
-- `/agents` opens the roster section in settings without stopping the session.
-- `/add AGENT`, `/add agy:COMMAND`, or `/add acp:COMMAND` starts a new peer in
-  the live roster.
 - `/export` writes the retained conversation to Markdown.
-- `/diff split|unified` switches the lazy diff view.
-- `/mode` and `/mode chat` select or show the current mode state.
-- `/collab roster|manual|pair` selects collaboration routing.
 - `/cancel` cancels active work and reports when nothing is running.
 - `/reload` retries the most recently crashed agent in its roster slot.
-- `/drop` removes the most recently crashed peer; `/drop SLOT` removes a
-  peer by zero-based roster slot (the owner is protected).
-- `/promote SLOT` transfers ownership to an active peer without restarting
-  it; the former owner remains in its stable slot and is tombstoned.
-- `/swap A B` reorders two active roster slots without restarting their
-  adapters; queued work and response colors follow the agents.
 - `/to SLOT` selects any active roster slot for the next message.
 - `/clear` clears the local transcript; `/close` exits the session.
 

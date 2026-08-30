@@ -11,14 +11,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Bundled catalog entries for Qwen Code (`qwen --acp`) and OpenCode
   (`opencode acp`), both launched through the ACP mode built into each CLI.
+- Typing `/` now opens a compact, filtering command palette with concise
+  descriptions; Tab continues to cycle matching local and agent commands.
+- Live ACP model choices are read from each agent's advertised session config
+  and can be changed per agent from configuration.
 
 ### Changed
 
 - Relicensed CodeSwarm under the MIT License.
 - The footer now exposes compact `Roster`/`Manual`/`Pair` collaboration and
   `Auto` permission controls. Both open configuration when clicked.
-- Saving roster changes hot-adds, drops, promotes, and reorders live agents,
+- Saving roster changes hot-adds, drops, and reorders live agents,
   including sessions that started with one agent.
+- Session persistence is now coordinator-owned: an ordered `agents` list
+  stores each adapter's own resumable handle. The owner/promotion schema and
+  its legacy parsing have been removed for the 0.7 fresh start.
+- Duplicate slash commands for configuration-backed actions and close aliases
+  have been removed; `/config` is the single settings entry point.
 - Independent roster adapters initialize concurrently to reduce first-message
   latency while relay turns remain strictly sequential.
 - Ordinary tool and terminal lifecycle rows stay out of the conversation;
@@ -28,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reordering selected live agents swaps their slots without restarting either
+  process; dropped agents no longer cause visible duplicate-name suffixes.
 - `Alt+↑/↓` roster reordering now handles both native Alt-key events and the
   split `Esc`+arrow sequence emitted by tmux/terminal combinations; `Shift`
   arrows and `[` / `]` provide terminal-independent fallbacks.

@@ -25,7 +25,7 @@ pub mod resources;
 pub mod settings;
 pub mod trace;
 
-/// Stable roster position; slot zero is always the owner.
+/// Stable roster position in the coordinator-managed agent list.
 pub type RosterSlot = usize;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -41,6 +41,8 @@ pub struct AgentCapabilities {
     pub supports_permissions: bool,
     pub supports_terminals: bool,
     pub supports_session_load: bool,
+    #[serde(default)]
+    pub supports_models: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -115,9 +117,6 @@ pub enum RosterUpdate {
     Dropped {
         slot: RosterSlot,
     },
-    Promoted {
-        from: RosterSlot,
-    },
     Swapped {
         first: RosterSlot,
         second: RosterSlot,
@@ -145,6 +144,16 @@ pub enum AgentEvent {
     ModeUpdated {
         slot: RosterSlot,
         current_mode: String,
+    },
+    ModelsReplaced {
+        slot: RosterSlot,
+        config_id: String,
+        models: Vec<Mode>,
+        current_model: Option<String>,
+    },
+    ModelUpdated {
+        slot: RosterSlot,
+        current_model: String,
     },
     UserText {
         slot: RosterSlot,
@@ -202,6 +211,10 @@ pub struct AgentSlot {
     pub modes: Vec<Mode>,
     pub current_mode: Option<String>,
     #[serde(default)]
+    pub models: Vec<Mode>,
+    #[serde(default)]
+    pub current_model: Option<String>,
+    #[serde(default)]
     pub commands: Vec<AgentCommand>,
     #[serde(default)]
     pub usage: Option<UsageUpdate>,
@@ -214,6 +227,8 @@ impl Default for AgentSlot {
             capabilities: AgentCapabilities::default(),
             modes: Vec::new(),
             current_mode: None,
+            models: Vec::new(),
+            current_model: None,
             commands: Vec::new(),
             usage: None,
         }
@@ -271,6 +286,28 @@ pub fn reduce(state: &mut SessionState, event: AgentEvent) -> Vec<Effect> {
         AgentEvent::ModeUpdated { slot, current_mode } => {
             if let Some(agent) = state.slots.get_mut(slot) {
                 agent.current_mode = Some(current_mode);
+            }
+            vec![Effect::Render]
+        }
+        AgentEvent::ModelsReplaced {
+            slot,
+            models,
+            current_model,
+            ..
+        } => {
+            if let Some(agent) = state.slots.get_mut(slot) {
+                agent.models = models;
+                agent.current_model =
+                    current_model.filter(|id| agent.models.iter().any(|model| model.id == *id));
+            }
+            vec![Effect::Render]
+        }
+        AgentEvent::ModelUpdated {
+            slot,
+            current_model,
+        } => {
+            if let Some(agent) = state.slots.get_mut(slot) {
+                agent.current_model = Some(current_model);
             }
             vec![Effect::Render]
         }

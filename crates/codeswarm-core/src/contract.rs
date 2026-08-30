@@ -40,6 +40,7 @@ pub fn normalize_capabilities(value: &Value) -> AgentCapabilities {
                 "loadSession",
             ],
         ),
+        supports_models: bool_field(object, &["supports_models", "supportsModels", "models"]),
     }
 }
 

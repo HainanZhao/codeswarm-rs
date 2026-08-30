@@ -11,10 +11,10 @@ name = "codeswarm"
 path = "src/main.rs"
 
 [dependencies]
-codeswarm-adapters = { version = "=0.6.44", path = "../codeswarm-adapters" }
-codeswarm-core = { version = "=0.6.44", path = "../codeswarm-core" }
-codeswarm-transcript = { version = "=0.6.44", path = "../codeswarm-transcript" }
-codeswarm-tui = { version = "=0.6.44", path = "../codeswarm-tui" }
+codeswarm-adapters = { version = "=0.7.0", path = "../codeswarm-adapters" }
+codeswarm-core = { version = "=0.7.0", path = "../codeswarm-core" }
+codeswarm-transcript = { version = "=0.7.0", path = "../codeswarm-transcript" }
+codeswarm-tui = { version = "=0.7.0", path = "../codeswarm-tui" }
 crossterm.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
