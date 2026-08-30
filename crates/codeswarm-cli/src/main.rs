@@ -136,8 +136,22 @@ impl ConfigInputDecoder {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Some(ConfigKey::Save)
             }
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => Some(ConfigKey::MoveUp),
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => Some(ConfigKey::MoveDown),
+            KeyCode::Up
+                if key.modifiers.intersects(
+                    KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+                ) =>
+            {
+                Some(ConfigKey::MoveUp)
+            }
+            KeyCode::Down
+                if key.modifiers.intersects(
+                    KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+                ) =>
+            {
+                Some(ConfigKey::MoveDown)
+            }
+            KeyCode::Char('[') => Some(ConfigKey::MoveUp),
+            KeyCode::Char(']') => Some(ConfigKey::MoveDown),
             KeyCode::Up => Some(ConfigKey::Up),
             KeyCode::Down => Some(ConfigKey::Down),
             KeyCode::Enter => Some(ConfigKey::Confirm),
@@ -4033,6 +4047,18 @@ mod tests {
         assert_eq!(
             decoder.decode(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), now),
             Some(ConfigKey::MoveUp)
+        );
+        assert_eq!(
+            decoder.decode(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT), now),
+            Some(ConfigKey::MoveDown)
+        );
+        assert_eq!(
+            decoder.decode(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE), now),
+            Some(ConfigKey::MoveUp)
+        );
+        assert_eq!(
+            decoder.decode(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), now),
+            Some(ConfigKey::MoveDown)
         );
         let mut decoder = ConfigInputDecoder::new(Duration::from_millis(650));
         assert_eq!(

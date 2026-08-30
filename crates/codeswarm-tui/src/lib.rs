@@ -3678,7 +3678,7 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
             if app.blink_title { "On" } else { "Off" },
             true,
         ),
-        ("Roster", "Enter toggles agents", false),
+        ("Roster", "Enter toggle · Alt/Shift+↑/↓ or [ ] order", false),
     ];
     let total_rows = rows.len().saturating_add(app.config_agents.len());
     let mut lines = Vec::with_capacity(total_rows + 3);
@@ -3776,7 +3776,7 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
     let actions = if compact {
         " Ctrl+S Save · Esc Discard"
     } else {
-        " Ctrl+S Save · Esc Discard · Enter Change · ↑/↓ Navigate · Alt+↑/↓ Reorder"
+        " Ctrl+S Save · Esc Discard · Enter Change · ↑/↓ Navigate · Alt/Shift+↑/↓ or [ ] Order"
     };
     lines.push(Line::styled(
         format!("{actions}  ({}/{})", app.config_selected + 1, total_rows),
