@@ -2928,6 +2928,7 @@ fn run_terminal(
                         }
                     }
                     Err(error) => {
+                        let error_text = error.to_string();
                         if let Some(log) = &event_log {
                             let _ = log.flush();
                         }
@@ -2936,9 +2937,13 @@ fn run_terminal(
                         pending_permission = None;
                         app.clear_terminal_alerts();
                         mode_sync_in_flight = None;
-                        if app.failed_agent().is_none() {
+                        let cancelled = error_text.to_ascii_lowercase().contains("cancelled");
+                        if cancelled {
+                            app.finish_turn_cancellation();
+                        }
+                        if !cancelled && app.failed_agent().is_none() {
                             let active_agent = app.active_agent.clone();
-                            app.set_header(active_agent, format!("error: {error}"));
+                            app.set_header(active_agent, format!("error: {error_text}"));
                         }
                     }
                 }
@@ -2959,6 +2964,9 @@ fn run_terminal(
                 execute!(terminal.backend_mut(), SetTitle(terminal_title.as_str()))?;
                 last_terminal_title = terminal_title;
             }
+        }
+        if app.take_full_repaint_request() {
+            terminal.clear()?;
         }
         let frame_area = terminal.draw(|frame| render(frame, app))?.area;
         if !event::poll(Duration::from_millis(50))? {
@@ -3326,6 +3334,7 @@ fn run_terminal(
                                     }
                                     LocalCommand::Cancel => {
                                         if turn_active {
+                                            app.request_turn_cancellation();
                                             if let Some(controls) = &controls {
                                                 let _ = controls.send(AdapterControl::Cancel);
                                             }
@@ -3520,6 +3529,7 @@ fn run_terminal(
                             return Ok(());
                         }
                         if let Some(controls) = &controls {
+                            app.request_turn_cancellation();
                             let _ = controls.send(AdapterControl::Cancel);
                         }
                         cancel_requested_at = Some(Instant::now());

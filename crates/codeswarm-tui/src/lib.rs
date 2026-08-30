@@ -815,6 +815,7 @@ pub struct App {
     config_roster_dirty: bool,
     config_snapshot: Option<ConfigSnapshot>,
     config_collaboration_pending: bool,
+    full_repaint_requested: bool,
     prompt_editor: PromptEditor,
     agent_names: BTreeMap<usize, String>,
     agent_identities: BTreeMap<usize, String>,
@@ -824,6 +825,7 @@ pub struct App {
     agent_usage: BTreeMap<usize, UsageUpdate>,
     agent_turn_started: BTreeMap<usize, Instant>,
     agent_tool_calls: BTreeMap<usize, BTreeSet<String>>,
+    cancelling_agents: BTreeSet<usize>,
     failed_agent: Option<usize>,
     queued_prompts: VecDeque<QueuedPrompt>,
     next_queue_id: u64,
@@ -891,6 +893,7 @@ impl Default for App {
             config_roster_dirty: false,
             config_snapshot: None,
             config_collaboration_pending: false,
+            full_repaint_requested: false,
             prompt_editor: PromptEditor::default(),
             agent_names: BTreeMap::new(),
             agent_identities: BTreeMap::new(),
@@ -900,6 +903,7 @@ impl Default for App {
             agent_usage: BTreeMap::new(),
             agent_turn_started: BTreeMap::new(),
             agent_tool_calls: BTreeMap::new(),
+            cancelling_agents: BTreeSet::new(),
             failed_agent: None,
             queued_prompts: VecDeque::new(),
             next_queue_id: 0,
@@ -1307,6 +1311,7 @@ impl App {
         match key {
             ConfigKey::Cancel => {
                 self.config_visible = false;
+                self.full_repaint_requested = true;
                 if let Some(snapshot) = self.config_snapshot.take() {
                     self.follow_tail = snapshot.follow_tail;
                     self.collapse_details = snapshot.collapse_details;
@@ -1332,6 +1337,7 @@ impl App {
             }
             ConfigKey::Save => {
                 self.config_visible = false;
+                self.full_repaint_requested = true;
                 self.config_collaboration_pending = self
                     .config_snapshot
                     .as_ref()
@@ -1838,9 +1844,25 @@ impl App {
 
     fn mark_agent_turn_started(&mut self, slot: usize) {
         self.next_agent = Some(slot);
+        self.cancelling_agents.remove(&slot);
         self.agent_turn_started
             .entry(slot)
             .or_insert_with(Instant::now);
+    }
+
+    pub fn request_turn_cancellation(&mut self) {
+        self.cancelling_agents
+            .extend(self.agent_turn_started.keys().copied());
+        self.status = "cancelling".into();
+    }
+
+    pub fn finish_turn_cancellation(&mut self) {
+        for slot in std::mem::take(&mut self.cancelling_agents) {
+            self.agent_turn_started.remove(&slot);
+            self.agent_tool_calls.remove(&slot);
+            self.agent_states.insert(slot, "ready".into());
+        }
+        self.status = "cancelled".into();
     }
 
     pub fn record_human_message(&mut self, prompt: &str, direct: bool) {
@@ -2599,6 +2621,7 @@ impl App {
                 self.agent_states.insert(*slot, "working".into());
             }
             AgentEvent::TurnComplete { slot } => {
+                self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.agent_tool_calls.remove(slot);
                 self.streaming_blocks
@@ -2625,6 +2648,7 @@ impl App {
                 started,
                 detail,
             } => {
+                self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.agent_tool_calls.remove(slot);
                 self.streaming_blocks
@@ -2762,6 +2786,10 @@ impl App {
 
     pub fn keyboard_help_visible(&self) -> bool {
         self.keyboard_help
+    }
+
+    pub fn take_full_repaint_request(&mut self) -> bool {
+        std::mem::take(&mut self.full_repaint_requested)
     }
 
     /// Return the available transcript viewport height for a terminal of
@@ -3212,11 +3240,14 @@ fn footer_agent_label(app: &App, slot: usize, active_count: usize) -> String {
     } else {
         ""
     };
-    let timer = app
-        .agent_turn_started
-        .get(&slot)
-        .map(|started| format!(" · {}", format_turn_elapsed(*started)))
-        .unwrap_or_default();
+    let timer = if app.cancelling_agents.contains(&slot) {
+        " · cancelling".to_owned()
+    } else {
+        app.agent_turn_started
+            .get(&slot)
+            .map(|started| format!(" · {}", format_turn_elapsed(*started)))
+            .unwrap_or_default()
+    };
     let tools = app
         .agent_tool_calls
         .get(&slot)
@@ -3224,6 +3255,11 @@ fn footer_agent_label(app: &App, slot: usize, active_count: usize) -> String {
         .filter(|count| *count > 0)
         .map(|count| format!(" · {count} {}", if count == 1 { "tool" } else { "tools" }))
         .unwrap_or_default();
+    let tools = if app.cancelling_agents.contains(&slot) {
+        String::new()
+    } else {
+        tools
+    };
     format!("{arrow}{marker} {}{timer}{tools}", app.agent_name(slot))
 }
 
@@ -5370,6 +5406,28 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_replaces_and_then_clears_the_footer_timer() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Codex");
+        app.apply_event(&codeswarm_core::AgentEvent::Thought {
+            slot: 0,
+            text: "working".into(),
+        });
+        assert!(footer_agent_label(&app, 0, 1).contains("· 0:00"));
+
+        app.request_turn_cancellation();
+        let cancelling = footer_agent_label(&app, 0, 1);
+        assert!(cancelling.contains("· cancelling"));
+        assert!(!cancelling.contains("0:00"));
+
+        app.finish_turn_cancellation();
+        let cancelled = footer_agent_label(&app, 0, 1);
+        assert!(!cancelled.contains("cancelling"));
+        assert!(!cancelled.contains("0:00"));
+        assert_eq!(app.status, "cancelled");
+    }
+
+    #[test]
     fn footer_geometry_uses_terminal_cell_width_for_unicode_names() {
         assert_eq!(cell_width("智能体"), 6);
         assert_eq!(compact_cell_label("智能体", 5), "智能…");
@@ -5653,6 +5711,33 @@ mod tests {
         assert_eq!(app.mode(), "Auto pilot");
         assert_eq!(app.collaboration(), "Roster relay");
         assert!(app.follow_tail);
+    }
+
+    #[test]
+    fn closing_config_requests_a_clean_prompt_repaint() {
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::default();
+        app.prompt_editor.set_text("draft text");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw baseline");
+        let baseline = terminal.backend().buffer().clone();
+
+        app.handle_local_command("/config");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw config");
+        assert_eq!(
+            app.handle_config_key(ConfigKey::Cancel),
+            ConfigAction::Cancel
+        );
+        assert!(app.take_full_repaint_request());
+        terminal.clear().expect("clear stale modal cells");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("redraw prompt");
+        assert_eq!(terminal.backend().buffer(), &baseline);
     }
 
     #[test]

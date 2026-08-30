@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Closing configuration forces a clean terminal repaint so modal glyphs do
+  not leak into the prompt editor.
+- Cancelling a turn replaces its footer timer with `cancelling` and clears the
+  timer when the adapter confirms cancellation.
 - The prompt editor no longer underlines the cursor line.
 
 ## [0.6.43] - 2026-08-29
