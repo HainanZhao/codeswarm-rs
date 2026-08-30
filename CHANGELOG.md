@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Alt+↑/↓` roster reordering now handles both native Alt-key events and the
+  split `Esc`+arrow sequence emitted by tmux/terminal combinations.
 - Closing configuration forces a clean terminal repaint so modal glyphs do
   not leak into the prompt editor.
 - Cancelling a turn replaces its footer timer with `cancelling` and clears the

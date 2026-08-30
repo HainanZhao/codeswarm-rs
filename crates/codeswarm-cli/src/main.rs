@@ -30,7 +30,7 @@ use crossterm::{
     cursor::Show,
     event::{
         self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{
@@ -100,6 +100,55 @@ fn restore_mouse_after_selection_window(
     execute!(output, EnableMouseCapture)?;
     *deadline = None;
     Ok(true)
+}
+
+#[derive(Debug, Default)]
+struct ConfigInputDecoder {
+    escape_at: Option<Instant>,
+}
+
+impl ConfigInputDecoder {
+    fn decode(&mut self, key: KeyEvent, now: Instant) -> Option<ConfigKey> {
+        if let Some(escape_at) = self.escape_at.take()
+            && now.saturating_duration_since(escape_at) <= Duration::from_millis(150)
+        {
+            return match key.code {
+                KeyCode::Up => Some(ConfigKey::MoveUp),
+                KeyCode::Down => Some(ConfigKey::MoveDown),
+                _ => Some(ConfigKey::Cancel),
+            };
+        }
+        match key.code {
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(ConfigKey::Save)
+            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => Some(ConfigKey::MoveUp),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => Some(ConfigKey::MoveDown),
+            KeyCode::Up => Some(ConfigKey::Up),
+            KeyCode::Down => Some(ConfigKey::Down),
+            KeyCode::Enter => Some(ConfigKey::Confirm),
+            KeyCode::Esc => {
+                self.escape_at = Some(now);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn take_expired_escape(&mut self, now: Instant) -> bool {
+        if self.escape_at.is_some_and(|escape_at| {
+            now.saturating_duration_since(escape_at) > Duration::from_millis(150)
+        }) {
+            self.escape_at = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset(&mut self) {
+        self.escape_at = None;
+    }
 }
 
 /// Own terminal modes from setup through teardown. Drop is the last line of
@@ -2735,6 +2784,7 @@ fn run_terminal(
     let mut pending_owner: Option<String> = None;
     let mut pending_owner_requested = false;
     let mut config_reconcile_pending = false;
+    let mut config_input = ConfigInputDecoder::default();
     let mut selection_until: Option<Instant> = None;
     let mut turn_active = false;
     let mut cancel_requested_at: Option<Instant> = None;
@@ -2742,6 +2792,13 @@ fn run_terminal(
     let mut last_terminal_title = String::new();
     let manage_terminal_title = terminal_capture_enabled();
     loop {
+        if app.config_visible() && config_input.take_expired_escape(Instant::now()) {
+            let _ = app.handle_config_key(ConfigKey::Cancel);
+            continue;
+        }
+        if !app.config_visible() {
+            config_input.reset();
+        }
         if restore_mouse_after_selection_window(
             terminal.backend_mut(),
             &mut selection_until,
@@ -3022,22 +3079,7 @@ fn run_terminal(
                     continue;
                 }
                 if app.config_visible() {
-                    let config_key = match key.code {
-                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            Some(ConfigKey::Save)
-                        }
-                        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
-                            Some(ConfigKey::MoveUp)
-                        }
-                        KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                            Some(ConfigKey::MoveDown)
-                        }
-                        KeyCode::Up => Some(ConfigKey::Up),
-                        KeyCode::Down => Some(ConfigKey::Down),
-                        KeyCode::Enter => Some(ConfigKey::Confirm),
-                        KeyCode::Esc => Some(ConfigKey::Cancel),
-                        _ => None,
-                    };
+                    let config_key = config_input.decode(key, Instant::now());
                     if let Some(config_key) = config_key {
                         if config_key == ConfigKey::Save
                             && app.config_roster_dirty()
@@ -3815,15 +3857,16 @@ fn notify_permission_request(agent: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterControl, AgentSpec, Launch, apply_mouse_scroll, apply_navigation_scroll,
-        apply_notification_preferences, bare_launch_from_settings, consume_one_shot_route,
-        dispatch_permission_action, dispatch_queued_prompt, interaction_height,
-        load_prompt_history_from, load_session_metadata_candidates, mouse_scroll_delta,
-        normalize_arguments, normalize_selected_slot, parse_launch, prepare_launch_arguments,
-        program_available, project_dir_argument, project_prompt_history_path,
-        reconcile_config_roster, restore_mouse_after_selection_window, resume_launch_from_metadata,
-        run_relay_sequence_with_controls, sanitize_direct_event, session_metadata_path_for,
-        standalone_session_metadata, terminal_capture_enabled_for, validate_project_directory,
+        AdapterControl, AgentSpec, ConfigInputDecoder, Launch, apply_mouse_scroll,
+        apply_navigation_scroll, apply_notification_preferences, bare_launch_from_settings,
+        consume_one_shot_route, dispatch_permission_action, dispatch_queued_prompt,
+        interaction_height, load_prompt_history_from, load_session_metadata_candidates,
+        mouse_scroll_delta, normalize_arguments, normalize_selected_slot, parse_launch,
+        prepare_launch_arguments, program_available, project_dir_argument,
+        project_prompt_history_path, reconcile_config_roster, restore_mouse_after_selection_window,
+        resume_launch_from_metadata, run_relay_sequence_with_controls, sanitize_direct_event,
+        session_metadata_path_for, standalone_session_metadata, terminal_capture_enabled_for,
+        validate_project_directory,
     };
     use async_trait::async_trait;
     use codeswarm_adapters::{
@@ -3831,8 +3874,8 @@ mod tests {
     };
     use codeswarm_core::persistence::{SessionMetadata, SessionMetadataStore};
     use codeswarm_core::{AgentCapabilities, AgentEvent, PermissionAnswer};
-    use codeswarm_tui::{App, PermissionAction, QueuedPrompt, StoreAgent};
-    use crossterm::event::{KeyCode, MouseEventKind};
+    use codeswarm_tui::{App, ConfigKey, PermissionAction, QueuedPrompt, StoreAgent};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
     use std::ffi::OsStr;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -3962,6 +4005,34 @@ mod tests {
         );
         assert!(untouched.is_empty());
         assert!(future.is_some());
+    }
+
+    #[test]
+    fn config_decoder_supports_native_and_escape_prefixed_alt_arrows() {
+        let now = Instant::now();
+        let mut decoder = ConfigInputDecoder::default();
+        assert_eq!(
+            decoder.decode(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT), now),
+            Some(ConfigKey::MoveUp)
+        );
+        assert_eq!(
+            decoder.decode(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), now),
+            None
+        );
+        assert_eq!(
+            decoder.decode(
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                now + Duration::from_millis(20),
+            ),
+            Some(ConfigKey::MoveDown)
+        );
+        assert!(!decoder.take_expired_escape(now + Duration::from_millis(20)));
+
+        assert_eq!(
+            decoder.decode(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), now),
+            None
+        );
+        assert!(decoder.take_expired_escape(now + Duration::from_millis(200)));
     }
 
     #[test]
@@ -4594,6 +4665,45 @@ mod tests {
         assert!(matches!(
             receiver.try_recv(),
             Ok(AdapterControl::Add { identity, .. }) if identity == "qwen.ai"
+        ));
+    }
+
+    #[test]
+    fn config_order_drives_live_roster_and_pair_peer_order() {
+        let mut app = codeswarm_tui::App::default();
+        for (slot, name, identity) in [
+            (0, "Codex", "openai.com"),
+            (1, "Qwen", "qwen.ai"),
+            (2, "Gemini", "google.com"),
+        ] {
+            app.set_agent_name(slot, name);
+            app.set_agent_identity(slot, identity);
+        }
+        app.set_config_agents(
+            [
+                ("Codex", "openai.com"),
+                ("Gemini", "google.com"),
+                ("Qwen", "qwen.ai"),
+            ]
+            .into_iter()
+            .map(|(name, identity)| StoreAgent {
+                identity: identity.into(),
+                name: name.into(),
+                adapter: "ACP".into(),
+                command: format!("{} --acp", name.to_ascii_lowercase()),
+                available: true,
+                selected: true,
+            })
+            .collect(),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut pending_owner = None;
+        assert!(
+            !reconcile_config_roster(&mut app, &sender, &mut pending_owner).expect("reconcile")
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AdapterControl::Swap(1, 2))
         ));
     }
 
