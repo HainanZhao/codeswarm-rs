@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-08-31
+
+### Changed
+
+- Rolling thought previews now use up to two natural lines, while short
+  thoughts remain one line.
+- The transcript scrollbar now appears only when content exceeds the viewport.
+- Tool calls now appear beneath their agent's conversation header with a
+  two-line collapsed preview and `Ctrl+O` expansion; tool counts no longer
+  crowd the footer.
+
+### Fixed
+
+- Live tool replacements preserve their original header timestamp and a
+  user's expanded state, and generic ACP tool activity is no longer discarded.
+
 ## [0.7.2] - 2026-08-30
 
 ### Added

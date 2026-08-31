@@ -61,7 +61,9 @@ bounded to preserve tmux responsiveness.
 - `Tab` completes a slash command; `F1` or `?` toggles help.
 - `Tab` also completes bounded workspace paths after `@`.
 - `Ctrl+O` expands or collapses the latest tool or thought detail. Collapsed
-  details keep a one-line preview of their first content line.
+  thoughts and tool calls keep a natural preview of up to two lines; other
+  details keep a one-line preview. Tool activity appears directly beneath its
+  agent's conversation header rather than in the footer.
 - `Ctrl+Enter` sends to the selected roster agent.
 - `Ctrl+C` cancels active work; while idle it exits.
 - `Esc` closes the active picker, help, permission, or settings surface.

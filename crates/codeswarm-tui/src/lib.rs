@@ -849,7 +849,6 @@ pub struct App {
     agent_commands: BTreeMap<usize, Vec<AgentCommand>>,
     agent_usage: BTreeMap<usize, UsageUpdate>,
     agent_turn_started: BTreeMap<usize, Instant>,
-    agent_tool_calls: BTreeMap<usize, BTreeSet<String>>,
     cancelling_agents: BTreeSet<usize>,
     failed_agent: Option<usize>,
     queued_prompts: VecDeque<QueuedPrompt>,
@@ -931,7 +930,6 @@ impl Default for App {
             agent_commands: BTreeMap::new(),
             agent_usage: BTreeMap::new(),
             agent_turn_started: BTreeMap::new(),
-            agent_tool_calls: BTreeMap::new(),
             cancelling_agents: BTreeSet::new(),
             failed_agent: None,
             queued_prompts: VecDeque::new(),
@@ -1757,7 +1755,6 @@ impl App {
         self.agent_commands.remove(&slot);
         self.agent_usage.remove(&slot);
         self.agent_turn_started.remove(&slot);
-        self.agent_tool_calls.remove(&slot);
         if self.next_agent == Some(slot) {
             self.next_agent = self.next_roster_slot_after(slot);
         }
@@ -1817,7 +1814,6 @@ impl App {
     pub fn finish_turn_cancellation(&mut self) {
         for slot in std::mem::take(&mut self.cancelling_agents) {
             self.agent_turn_started.remove(&slot);
-            self.agent_tool_calls.remove(&slot);
             self.agent_states.insert(slot, "ready".into());
         }
         self.status = "cancelled".into();
@@ -1915,7 +1911,6 @@ impl App {
     pub fn mark_agent_reloaded(&mut self, slot: usize) {
         self.failed_agent = None;
         self.agent_turn_started.remove(&slot);
-        self.agent_tool_calls.remove(&slot);
         self.agent_states.insert(slot, "starting".into());
         self.status = "reloading agent".into();
     }
@@ -1930,7 +1925,6 @@ impl App {
         self.agent_commands.remove(&slot);
         self.agent_usage.remove(&slot);
         self.agent_turn_started.remove(&slot);
-        self.agent_tool_calls.remove(&slot);
         if self.next_agent == Some(slot) {
             self.next_agent = self.next_roster_slot_after(slot);
         }
@@ -2016,14 +2010,6 @@ impl App {
         }
         if let Some(second_timer) = second_timer {
             self.agent_turn_started.insert(first, second_timer);
-        }
-        let first_tools = self.agent_tool_calls.remove(&first);
-        let second_tools = self.agent_tool_calls.remove(&second);
-        if let Some(first_tools) = first_tools {
-            self.agent_tool_calls.insert(second, first_tools);
-        }
-        if let Some(second_tools) = second_tools {
-            self.agent_tool_calls.insert(first, second_tools);
         }
         self.refresh_prompt_completions();
         if self.failed_agent == Some(first) {
@@ -2610,18 +2596,6 @@ impl App {
                     self.status = "waiting".into();
                     return;
                 }
-                let generic_lifecycle = update.title.trim().eq_ignore_ascii_case("tool call")
-                    && update
-                        .detail
-                        .as_deref()
-                        .is_none_or(|detail| detail.trim().is_empty());
-                if generic_lifecycle {
-                    return;
-                }
-                self.agent_tool_calls
-                    .entry(*slot)
-                    .or_default()
-                    .insert(update.id.clone());
                 let state = match update.status {
                     ToolStatus::Pending => "pending",
                     ToolStatus::Running => "running",
@@ -2635,20 +2609,21 @@ impl App {
                     .map_or(codeswarm_transcript::BlockKind::Tool, |_| {
                         codeswarm_transcript::BlockKind::Diff
                     });
+                let key = (*slot, update.id.clone());
+                let prefix = self
+                    .tool_blocks
+                    .get(&key)
+                    .and_then(|id| self.transcript.source(*id))
+                    .and_then(attributed_message_prefix)
+                    .unwrap_or_else(|| agent_message_prefix(&self.agent_name(*slot)));
                 let source = update.detail.as_deref().map_or_else(
-                    || format!("{}: {} · {state}", self.agent_name(*slot), update.title),
-                    |detail| {
-                        format!(
-                            "{}: {} · {state}\n{detail}",
-                            self.agent_name(*slot),
-                            update.title
-                        )
-                    },
+                    || format!("{prefix}{} · {state}", update.title),
+                    |detail| format!("{prefix}{} · {state}\n{detail}", update.title),
                 );
-                let collapsed = if kind == codeswarm_transcript::BlockKind::Tool {
+                let initially_collapsed = if kind == codeswarm_transcript::BlockKind::Tool {
                     // Normal tool calls always enter the transcript as a
-                    // one-line status. Ctrl+O is the only path that opens the
-                    // retained output; failures must not expand themselves.
+                    // compact two-line preview. Ctrl+O is the only path that
+                    // opens retained output; failures must not self-expand.
                     true
                 } else {
                     match self.tool_expand_policy {
@@ -2659,23 +2634,25 @@ impl App {
                         }
                     }
                 };
-                let key = (*slot, update.id.clone());
                 let id = if let Some(id) = self.tool_blocks.get(&key).copied() {
+                    let collapsed = if self.transcript.is_collapsed(id) == Some(false) {
+                        false
+                    } else {
+                        initially_collapsed
+                    };
                     if self.transcript.replace(id, kind, source.clone(), collapsed) {
                         id
                     } else {
-                        let id = self.transcript.append(kind, source, collapsed);
+                        let id = self.transcript.append(kind, source, initially_collapsed);
                         self.tool_blocks.insert(key, id);
                         id
                     }
                 } else {
-                    let id = self.transcript.append(kind, source, collapsed);
+                    let id = self.transcript.append(kind, source, initially_collapsed);
                     self.tool_blocks.insert(key, id);
                     id
                 };
-                if kind == codeswarm_transcript::BlockKind::Diff {
-                    self.focused_detail = Some(id);
-                }
+                self.focused_detail = Some(id);
             }
             AgentEvent::Permission { slot, request } => {
                 self.mark_agent_turn_started(*slot);
@@ -2707,13 +2684,12 @@ impl App {
                     }
                 };
                 self.transcript
-                    .append(codeswarm_transcript::BlockKind::Tool, text, true);
+                    .append(codeswarm_transcript::BlockKind::Terminal, text, true);
                 self.agent_states.insert(*slot, "working".into());
             }
             AgentEvent::TurnComplete { slot } => {
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
-                self.agent_tool_calls.remove(slot);
                 self.streaming_blocks
                     .remove(&(*slot, codeswarm_transcript::BlockKind::Agent));
                 self.streaming_blocks
@@ -2740,7 +2716,6 @@ impl App {
             } => {
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
-                self.agent_tool_calls.remove(slot);
                 self.streaming_blocks
                     .remove(&(*slot, codeswarm_transcript::BlockKind::Agent));
                 self.streaming_blocks
@@ -2770,24 +2745,33 @@ impl App {
     }
 
     pub fn scroll_by(&mut self, delta: isize, width: usize, height: usize) {
+        let (content_width, _) = self.transcript_layout(width, height);
         let max_scroll = self
             .transcript
-            .row_count(self.transcript_content_width(width))
+            .row_count(content_width)
             .saturating_sub(height);
         self.scroll_y = self.scroll_y.saturating_add_signed(delta).min(max_scroll);
         self.follow_tail = self.scroll_y == max_scroll;
     }
 
     pub fn follow_tail(&mut self, width: usize, height: usize) {
+        let (content_width, _) = self.transcript_layout(width, height);
         self.scroll_y = self
             .transcript
-            .row_count(self.transcript_content_width(width))
+            .row_count(content_width)
             .saturating_sub(height);
         self.follow_tail = true;
     }
 
-    fn transcript_content_width(&self, outer_width: usize) -> usize {
-        outer_width.saturating_sub(usize::from(self.show_scrollbar))
+    fn transcript_layout(&mut self, outer_width: usize, height: usize) -> (usize, bool) {
+        let scrollbar_visible = self.show_scrollbar
+            && outer_width > 0
+            && height > 0
+            && self.transcript.row_count(outer_width) > height;
+        (
+            outer_width.saturating_sub(usize::from(scrollbar_visible)),
+            scrollbar_visible,
+        )
     }
 
     pub fn toggle_focused_detail(&mut self) -> Option<bool> {
@@ -3076,16 +3060,24 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Constraint::Length(status_height as u16),
     ])
     .split(area);
-    let content_width = app.transcript_content_width(usize::from(rows[0].width));
     let content_height = usize::from(rows[0].height);
+    let (content_width, scrollbar_visible) =
+        app.transcript_layout(usize::from(rows[0].width), content_height);
     if app.follow_tail {
         app.follow_tail(rows[0].width as usize, content_height);
     }
     let visible = app
         .transcript
         .viewport(content_width, app.scroll_y, content_height, 0);
-    render_transcript(frame.buffer_mut(), rows[0], visible, app, app.diff_split);
-    if app.show_scrollbar {
+    render_transcript(
+        frame.buffer_mut(),
+        rows[0],
+        visible,
+        app,
+        app.diff_split,
+        scrollbar_visible,
+    );
+    if scrollbar_visible {
         render_scrollbar(
             frame.buffer_mut(),
             rows[0],
@@ -3136,6 +3128,12 @@ fn cell_width(value: &str) -> usize {
 fn agent_message_prefix(name: &str) -> String {
     let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     format!("{name}: [{:02}:{:02}] ", now.hour(), now.minute())
+}
+
+fn attributed_message_prefix(source: &str) -> Option<String> {
+    let (speaker, body) = source.split_once(": ")?;
+    let end = body.find("] ").filter(|_| body.starts_with('['))?;
+    Some(format!("{speaker}: {}", &body[..end + 2]))
 }
 
 fn footer_mode_label(app: &App) -> String {
@@ -3368,19 +3366,7 @@ fn footer_agent_label(app: &App, slot: usize, active_count: usize) -> String {
             .map(|started| format!(" · {}", format_turn_elapsed(*started)))
             .unwrap_or_default()
     };
-    let tools = app
-        .agent_tool_calls
-        .get(&slot)
-        .map(BTreeSet::len)
-        .filter(|count| *count > 0)
-        .map(|count| format!(" · {count} {}", if count == 1 { "tool" } else { "tools" }))
-        .unwrap_or_default();
-    let tools = if app.cancelling_agents.contains(&slot) {
-        String::new()
-    } else {
-        tools
-    };
-    format!("{arrow}{marker} {}{timer}{tools}", app.agent_name(slot))
+    format!("{arrow}{marker} {}{timer}", app.agent_name(slot))
 }
 
 fn footer_agent_spans(app: &App) -> Vec<Span<'static>> {
@@ -3611,8 +3597,9 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
             area.width,
             area.height.saturating_sub(bottom_height),
         );
-        let width = transcript_area.width as usize;
         let height = usize::from(transcript_area.height);
+        let (width, scrollbar_visible) =
+            app.transcript_layout(usize::from(transcript_area.width), height);
         if app.follow_tail {
             app.follow_tail(transcript_area.width as usize, height);
         }
@@ -3623,7 +3610,18 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
             visible,
             app,
             app.diff_split,
+            scrollbar_visible,
         );
+        if scrollbar_visible {
+            render_scrollbar(
+                frame.buffer_mut(),
+                transcript_area,
+                app.scroll_y,
+                height,
+                &mut app.transcript,
+                width,
+            );
+        }
     }
 
     if area.height > 1 {
@@ -3732,6 +3730,9 @@ fn render_scrollbar(
         return;
     }
     let total = transcript.row_count(content_width);
+    if total <= viewport_height {
+        return;
+    }
     let thumb_height = (track_height.saturating_mul(track_height) / total.max(1))
         .max(1)
         .min(track_height);
@@ -4260,6 +4261,7 @@ fn render_transcript(
     rows: Vec<RenderRow>,
     app: &App,
     diff_split: bool,
+    scrollbar_visible: bool,
 ) {
     // Keep the initial workspace quiet. The prompt and status ribbon already
     // explain how to begin; rendering an empty bordered panel only consumes
@@ -4282,13 +4284,18 @@ fn render_transcript(
         let focused_detail = app
             .focused_detail
             .filter(|id| app.transcript.is_collapsed(*id) == Some(true));
-        let row_width = usize::from(area.width).saturating_sub(usize::from(app.show_scrollbar));
-        rows.into_iter()
-            .map(|mut row| {
-                if focused_detail == Some(row.block_id)
+        let focused_hint_row = focused_detail.and_then(|id| {
+            rows.iter().rposition(|row| {
+                row.block_id == id
                     && !(row.first_in_block && row.kind == codeswarm_transcript::BlockKind::Agent)
                     && !row.text.is_empty()
-                {
+            })
+        });
+        let row_width = usize::from(area.width).saturating_sub(usize::from(scrollbar_visible));
+        rows.into_iter()
+            .enumerate()
+            .map(|(row_index, mut row)| {
+                if focused_hint_row == Some(row_index) {
                     row.text = actionable_detail_preview(&row.text, row_width.saturating_sub(2));
                 }
                 if row.first_in_block {
@@ -4300,6 +4307,7 @@ fn render_transcript(
                         codeswarm_transcript::BlockKind::Agent => "● ",
                         codeswarm_transcript::BlockKind::Thought => "… ",
                         codeswarm_transcript::BlockKind::Tool => "◆ ",
+                        codeswarm_transcript::BlockKind::Terminal => "◆ ",
                         codeswarm_transcript::BlockKind::Diff => "± ",
                         codeswarm_transcript::BlockKind::Notice => "· ",
                     }
@@ -4438,6 +4446,7 @@ fn block_style(kind: codeswarm_transcript::BlockKind) -> Style {
         codeswarm_transcript::BlockKind::Agent => Style::default().fg(PRIMARY_TEXT),
         codeswarm_transcript::BlockKind::Thought => Style::default().fg(THOUGHT_TEXT).italic(),
         codeswarm_transcript::BlockKind::Tool => Style::default().fg(Color::Gray),
+        codeswarm_transcript::BlockKind::Terminal => Style::default().fg(Color::Gray),
         codeswarm_transcript::BlockKind::Diff => Style::default().fg(Color::Magenta),
         codeswarm_transcript::BlockKind::Notice => Style::default().fg(THOUGHT_TEXT),
     }
@@ -4445,7 +4454,9 @@ fn block_style(kind: codeswarm_transcript::BlockKind) -> Style {
 
 fn marker_style(kind: codeswarm_transcript::BlockKind, text: &str) -> Style {
     match kind {
-        codeswarm_transcript::BlockKind::Tool => Style::default().fg(Color::Yellow).bold(),
+        codeswarm_transcript::BlockKind::Tool | codeswarm_transcript::BlockKind::Terminal => {
+            Style::default().fg(Color::Yellow).bold()
+        }
         codeswarm_transcript::BlockKind::Notice => Style::default().fg(ACCENT).bold(),
         _ => row_style(kind, text).bold(),
     }
@@ -4709,6 +4720,7 @@ mod tests {
     use ratatui::{
         Terminal,
         backend::TestBackend,
+        buffer::Buffer,
         layout::Rect,
         style::{Color, Modifier, Style},
     };
@@ -4718,10 +4730,10 @@ mod tests {
         ACCENT, AGENT_COLORS, App, CONFIG_SETTING_COUNT, ConfigAction, ConfigKey, FooterAction,
         LocalCommand, PANEL_BG, PRIMARY_TEXT, PathPickerAction, PermissionAction, PermissionKey,
         PromptAction, PromptEditor, STATUS_BG, StoreAction, StoreAgent, StoreKey, THOUGHT_TEXT,
-        TRANSCRIPT_BG, agent_header_color, agent_slot_color, block_style, cell_width,
-        compact_cell_label, compact_workspace_path, file_reference_spans, footer_agent_label,
-        format_turn_elapsed, markdown_spans, markdown_style, marker_style, render, row_style,
-        selected_style,
+        TRANSCRIPT_BG, agent_header_color, agent_slot_color, attributed_message_prefix,
+        block_style, cell_width, compact_cell_label, compact_workspace_path, file_reference_spans,
+        footer_agent_label, format_turn_elapsed, markdown_spans, markdown_style, marker_style,
+        render, row_style, selected_style,
     };
 
     fn key(key: Key) -> Input {
@@ -4772,6 +4784,7 @@ mod tests {
         assert_eq!(block_style(BlockKind::Human).fg, Some(ACCENT));
         assert_eq!(block_style(BlockKind::Thought).fg, Some(THOUGHT_TEXT));
         assert_eq!(block_style(BlockKind::Tool).fg, Some(Color::Gray));
+        assert_eq!(block_style(BlockKind::Terminal).fg, Some(Color::Gray));
         assert_eq!(block_style(BlockKind::Notice).fg, Some(THOUGHT_TEXT));
         assert_eq!(marker_style(BlockKind::Tool, "Run").fg, Some(Color::Yellow));
         assert_eq!(marker_style(BlockKind::Notice, "Wait").fg, Some(ACCENT));
@@ -5477,13 +5490,13 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_tools_render_no_conversation_lines() {
+    fn terminal_lifecycle_renders_no_conversation_lines() {
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
-        app.transcript.append(BlockKind::Tool, "Read", true);
-        app.transcript.append(BlockKind::Tool, "Search", true);
-        app.transcript.append(BlockKind::Tool, "Run", true);
+        app.transcript.append(BlockKind::Terminal, "created", true);
+        app.transcript.append(BlockKind::Terminal, "output", true);
+        app.transcript.append(BlockKind::Terminal, "exited", true);
 
         terminal
             .draw(|frame| render(frame, &mut app))
@@ -5497,8 +5510,8 @@ mod tests {
             .collect::<String>();
 
         assert!(!rendered.contains("◆"), "rendered={rendered:?}");
-        assert!(!rendered.contains("Read"), "rendered={rendered:?}");
-        assert!(app.export_markdown().contains("## Tool\n\nRead"));
+        assert!(!rendered.contains("created"), "rendered={rendered:?}");
+        assert!(app.export_markdown().contains("## Terminal\n\ncreated"));
     }
 
     #[test]
@@ -5706,7 +5719,13 @@ mod tests {
                 detail: None,
             },
         });
-        assert_eq!(app.transcript.len(), blocks_before_wait);
+        assert_eq!(app.transcript.len(), blocks_before_wait + 1);
+        assert!(
+            app.transcript
+                .viewport(80, 0, 4, 0)
+                .iter()
+                .any(|row| row.text.contains("Tool · Tool call · completed"))
+        );
         assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
 
         for (id, title) in [("read", "Read files"), ("search", "Search code")] {
@@ -5720,7 +5739,8 @@ mod tests {
                 },
             });
         }
-        assert!(footer_agent_label(&app, 0, 1).contains("· 2 tools"));
+        assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
+        assert!(app.transcript.row_count(80) > 0);
 
         app.apply_event(&codeswarm_core::AgentEvent::TurnComplete { slot: 0 });
         assert!(!footer_agent_label(&app, 0, 1).contains("1:05"));
@@ -6345,6 +6365,45 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_renders_only_when_the_transcript_overflows() {
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::default();
+        app.transcript
+            .append(BlockKind::Human, "You: short message", false);
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw short transcript");
+        let content_height = app.content_height(12);
+        let right_edge = |buffer: &Buffer| {
+            (0..content_height)
+                .map(|row| buffer[(49, row as u16)].symbol())
+                .collect::<String>()
+        };
+        let short_edge = right_edge(terminal.backend().buffer());
+        assert!(!short_edge.contains('█'), "right edge={short_edge:?}");
+        assert!(!short_edge.contains('│'), "right edge={short_edge:?}");
+
+        app.transcript.append(
+            BlockKind::Agent,
+            (0..300)
+                .map(|index| format!("word{index}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            false,
+        );
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw overflowing transcript");
+        let overflowing_edge = right_edge(terminal.backend().buffer());
+        assert!(
+            overflowing_edge.contains('█') || overflowing_edge.contains('│'),
+            "right edge={overflowing_edge:?}"
+        );
+    }
+
+    #[test]
     fn sound_preference_is_separate_from_completion_notifications() {
         let mut app = App::default();
         assert!(app.sounds_enabled());
@@ -6362,7 +6421,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_expand_policy_never_makes_tool_activity_multiline() {
+    fn ordinary_tool_activity_starts_collapsed_for_every_expand_policy() {
         let tool = |status| codeswarm_core::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_core::ToolUpdate {
@@ -6375,20 +6434,20 @@ mod tests {
 
         let mut app = App::default();
         app.apply_event(&tool(codeswarm_core::ToolStatus::Completed));
-        assert_eq!(app.transcript.row_count(80), 0);
+        assert_eq!(app.transcript.row_count(80), 3);
         let mut failed = App::default();
         failed.apply_event(&tool(codeswarm_core::ToolStatus::Failed));
-        assert_eq!(failed.transcript.row_count(80), 0);
+        assert_eq!(failed.transcript.row_count(80), 3);
 
         let mut always = App::default();
         always.set_tool_expand_policy("always");
         always.apply_event(&tool(codeswarm_core::ToolStatus::Completed));
-        assert_eq!(always.transcript.row_count(80), 0);
+        assert_eq!(always.transcript.row_count(80), 3);
 
         let mut never = App::default();
         never.set_tool_expand_policy("never");
         never.apply_event(&tool(codeswarm_core::ToolStatus::Failed));
-        assert_eq!(never.transcript.row_count(80), 0);
+        assert_eq!(never.transcript.row_count(80), 3);
     }
 
     #[test]
@@ -6795,7 +6854,7 @@ mod tests {
             true,
         );
         app.transcript
-            .append(BlockKind::Tool, "Codex: Wait · completed", true);
+            .append(BlockKind::Terminal, "Codex: Wait · completed", true);
         app.transcript.append(
             BlockKind::Agent,
             "Codex: [12:06] Hello from the agent",
@@ -6908,7 +6967,96 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_tool_details_are_export_only() {
+    fn tool_call_renders_below_header_with_two_line_preview_and_one_hint() {
+        let backend = TestBackend::new(72, 12);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::default();
+        app.set_agent_name(0, "Antigravity");
+        app.apply_event(&codeswarm_core::AgentEvent::Tool {
+            slot: 0,
+            update: codeswarm_core::ToolUpdate {
+                id: "read".into(),
+                title: "Read files".into(),
+                status: codeswarm_core::ToolStatus::Running,
+                detail: Some("first output line\nsecond output line\nthird output line".into()),
+            },
+        });
+
+        let preview = app.transcript.viewport(72, 0, 10, 0);
+        assert_eq!(preview.len(), 3);
+        assert_eq!(preview[0].kind, BlockKind::Agent);
+        assert_eq!(preview[1].kind, BlockKind::Tool);
+        assert_eq!(preview[2].kind, BlockKind::Tool);
+        assert!(preview[1].text.starts_with("Tool · Read files · running"));
+        assert!(preview[2].text.ends_with('…'));
+        assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw collapsed tool");
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(72)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        let header_row = rows
+            .iter()
+            .position(|row| row.contains("● Antigravity"))
+            .expect("agent header");
+        let tool_row = rows
+            .iter()
+            .position(|row| row.contains("Tool · Read files · running"))
+            .expect("tool preview");
+        assert_eq!(tool_row, header_row + 1);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.contains("Ctrl+O open"))
+                .count(),
+            1
+        );
+
+        app.apply_event(&codeswarm_core::AgentEvent::Tool {
+            slot: 0,
+            update: codeswarm_core::ToolUpdate {
+                id: "read".into(),
+                title: "Read files".into(),
+                status: codeswarm_core::ToolStatus::Completed,
+                detail: Some("updated output\nsecond line\nthird line".into()),
+            },
+        });
+        assert_eq!(app.transcript.len(), 1);
+        assert!(
+            app.transcript
+                .viewport(72, 0, 10, 0)
+                .iter()
+                .any(|row| row.text.contains("Read files · completed"))
+        );
+        assert_eq!(app.toggle_focused_detail(), Some(false));
+        assert!(app.transcript.row_count(72) > 3);
+        let tool_id = app.focused_detail.expect("focused tool");
+        let original_prefix =
+            attributed_message_prefix(app.transcript.source(tool_id).expect("tool source"))
+                .expect("tool attribution");
+        app.apply_event(&codeswarm_core::AgentEvent::Tool {
+            slot: 0,
+            update: codeswarm_core::ToolUpdate {
+                id: "read".into(),
+                title: "Read files".into(),
+                status: codeswarm_core::ToolStatus::Completed,
+                detail: Some("final output\nsecond line\nthird line".into()),
+            },
+        });
+        assert_eq!(app.transcript.is_collapsed(tool_id), Some(false));
+        assert_eq!(
+            attributed_message_prefix(app.transcript.source(tool_id).expect("updated source")),
+            Some(original_prefix)
+        );
+    }
+
+    #[test]
+    fn ordinary_tool_details_render_collapsed_and_expand_with_ctrl_o() {
         let mut app = App::default();
         app.apply_event(&codeswarm_core::AgentEvent::Tool {
             slot: 0,
@@ -6919,8 +7067,9 @@ mod tests {
                 detail: Some("large output\nsecond line".into()),
             },
         });
-        assert_eq!(app.transcript.row_count(80), 0);
-        assert_eq!(app.toggle_focused_detail(), None);
+        assert_eq!(app.transcript.row_count(80), 3);
+        assert_eq!(app.toggle_focused_detail(), Some(false));
+        assert!(app.transcript.row_count(80) > 3);
         assert!(app.export_markdown().contains("large output\nsecond line"));
     }
 
@@ -6937,9 +7086,10 @@ mod tests {
             },
         });
         let rows = app.transcript.viewport(80, 0, 4, 0);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].kind, BlockKind::Diff);
-        assert!(rows[0].text.contains("Diff"));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, BlockKind::Agent);
+        assert_eq!(rows[1].kind, BlockKind::Diff);
+        assert!(rows[1].text.contains("Diff"));
         assert_eq!(app.toggle_focused_detail(), Some(false));
         assert!(app.transcript.row_count(80) > 1);
         app.set_diff_split(true);
