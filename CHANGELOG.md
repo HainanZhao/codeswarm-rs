@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-31
+
+### Changed
+
+- Restored solid composer rules with a quieter dark-gray color.
+
 ## [0.8.0] - 2026-08-31
 
 ### Changed
@@ -23,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renders one acknowledgment instead of adding a duplicate fallback emoji.
 - Token-only reviewer stops now emit their visible acknowledgment before the
   terminal turn-complete event, so the footer timer does not restart.
-- The composer now uses light dashed rules instead of solid border lines.
+- The composer now uses subtle dark-gray solid rules instead of high-contrast
+  or dotted border lines.
 
 ## [0.7.4] - 2026-08-31
 

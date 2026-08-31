@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Widget},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Widget},
 };
 pub use tui_textarea::{Input, Key};
 use tui_textarea::{TextArea, WrapMode};
@@ -41,6 +41,7 @@ const PRIMARY_TEXT: Color = Color::Reset;
 const THOUGHT_TEXT: Color = Color::Rgb(142, 142, 147);
 const ACCENT: Color = Color::Rgb(36, 184, 176);
 const SEPARATOR: Color = Color::Gray;
+const PROMPT_RULE: Color = Color::DarkGray;
 
 fn selected_style() -> Style {
     Style::default()
@@ -355,9 +356,8 @@ impl Default for PromptEditor {
         textarea.set_block(
             Block::default()
                 .borders(Borders::TOP)
-                .border_type(BorderType::LightTripleDashed)
                 .padding(Padding::left(1))
-                .border_style(Style::default().fg(SEPARATOR)),
+                .border_style(Style::default().fg(PROMPT_RULE)),
         );
         textarea.set_style(Style::default().fg(PRIMARY_TEXT).bg(PANEL_BG));
         textarea.set_cursor_style(selected_style());
@@ -3531,8 +3531,8 @@ fn render_prompt_separator(buffer: &mut Buffer, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    Paragraph::new("┄".repeat(area.width as usize))
-        .style(Style::default().fg(SEPARATOR).bg(TRANSCRIPT_BG))
+    Paragraph::new("─".repeat(area.width as usize))
+        .style(Style::default().fg(PROMPT_RULE).bg(TRANSCRIPT_BG))
         .render(area, buffer);
 }
 
@@ -4732,12 +4732,13 @@ mod tests {
 
     use super::{
         ACCENT, AGENT_COLORS, App, CONFIG_SETTING_COUNT, ConfigAction, ConfigKey, FooterAction,
-        LocalCommand, PANEL_BG, PRIMARY_TEXT, PathPickerAction, PermissionAction, PermissionKey,
-        PromptAction, PromptEditor, STATUS_BG, StoreAction, StoreAgent, StoreKey, THOUGHT_TEXT,
-        TRANSCRIPT_BG, agent_header_color, agent_slot_color, attributed_message_prefix,
-        block_style, cell_width, compact_cell_label, compact_workspace_path, file_reference_spans,
-        footer_agent_label, format_turn_elapsed, markdown_spans, markdown_style, marker_style,
-        render, render_prompt_separator, row_style, selected_style,
+        LocalCommand, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PathPickerAction, PermissionAction,
+        PermissionKey, PromptAction, PromptEditor, STATUS_BG, StoreAction, StoreAgent, StoreKey,
+        THOUGHT_TEXT, TRANSCRIPT_BG, agent_header_color, agent_slot_color,
+        attributed_message_prefix, block_style, cell_width, compact_cell_label,
+        compact_workspace_path, file_reference_spans, footer_agent_label, format_turn_elapsed,
+        markdown_spans, markdown_style, marker_style, render, render_prompt_separator, row_style,
+        selected_style,
     };
 
     fn key(key: Key) -> Input {
@@ -4912,7 +4913,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains("Prompt"), "rendered={rendered:?}");
-        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "┄");
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "─");
+        assert_eq!(terminal.backend().buffer()[(0, 0)].fg, PROMPT_RULE);
         assert!(rendered.contains("review"));
         assert!(rendered.contains("these changes"));
         let buffer = terminal.backend().buffer();
@@ -4928,7 +4930,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_separator_uses_a_light_dashed_rule() {
+    fn prompt_separator_uses_a_subtle_solid_rule() {
         let backend = TestBackend::new(12, 1);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         terminal
@@ -4943,7 +4945,7 @@ mod tests {
                 .buffer()
                 .content()
                 .iter()
-                .all(|cell| cell.symbol() == "┄")
+                .all(|cell| cell.symbol() == "─" && cell.fg == PROMPT_RULE)
         );
     }
 
@@ -5646,7 +5648,7 @@ mod tests {
         assert!(footer.contains("Roster"), "footer={footer:?}");
         assert!(footer.contains("Auto"), "footer={footer:?}");
         assert!(!footer.contains("Auto pilot"), "footer={footer:?}");
-        assert!(rows[rows.len() - 2].chars().all(|char| char == '┄'));
+        assert!(rows[rows.len() - 2].chars().all(|char| char == '─'));
         assert!(
             rows[rows.len() - 3].contains("How can I help you today?"),
             "rows={rows:?}"
@@ -7417,7 +7419,7 @@ mod tests {
             .filter(|y| {
                 row(&terminal, *y)
                     .chars()
-                    .filter(|char| *char == '┄')
+                    .filter(|char| *char == '─')
                     .count()
                     > 70
             })
@@ -7434,7 +7436,7 @@ mod tests {
                 .collect::<String>()
                 .contains("Prompt")
         );
-        assert!(row(&terminal, rules[1]).chars().all(|char| char == '┄'));
+        assert!(row(&terminal, rules[1]).chars().all(|char| char == '─'));
         assert!(row(&terminal, prompt_y - 1).trim().is_empty());
 
         app.apply_event(&codeswarm_adapters::AgentEvent::Ready {
