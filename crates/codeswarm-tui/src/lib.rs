@@ -10,8 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use codeswarm_core::{AgentCommand, AgentEvent, TerminalEvent, ToolStatus, UsageUpdate};
-use codeswarm_transcript::{RenderRow, Transcript};
+use crate::transcript::{RenderRow, Transcript};
+use codeswarm_adapters::{AgentCommand, AgentEvent, TerminalEvent, ToolStatus, UsageUpdate};
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -844,8 +844,8 @@ pub struct App {
     agent_names: BTreeMap<usize, String>,
     agent_identities: BTreeMap<usize, String>,
     agent_states: BTreeMap<usize, String>,
-    agent_modes: BTreeMap<usize, (Vec<codeswarm_core::Mode>, Option<String>)>,
-    agent_models: BTreeMap<usize, (String, Vec<codeswarm_core::Mode>, Option<String>)>,
+    agent_modes: BTreeMap<usize, (Vec<codeswarm_adapters::Mode>, Option<String>)>,
+    agent_models: BTreeMap<usize, (String, Vec<codeswarm_adapters::Mode>, Option<String>)>,
     pending_model_changes: BTreeMap<String, String>,
     agent_commands: BTreeMap<usize, Vec<AgentCommand>>,
     agent_usage: BTreeMap<usize, UsageUpdate>,
@@ -856,7 +856,7 @@ pub struct App {
     next_queue_id: u64,
     selected_queue: Option<usize>,
     keyboard_help: bool,
-    streaming_blocks: BTreeMap<(usize, codeswarm_transcript::BlockKind), u64>,
+    streaming_blocks: BTreeMap<(usize, crate::transcript::BlockKind), u64>,
     /// Active tool-call IDs are stable across ACP lifecycle updates. Keep the
     /// corresponding transcript block so updates replace the preview in
     /// place instead of adding an unbounded card for every status change.
@@ -1680,7 +1680,7 @@ impl App {
         if states.is_empty() {
             return None;
         }
-        codeswarm_core::policy::shared_current_mode(&states).map(|mode| mode.id)
+        codeswarm_adapters::policy::shared_current_mode(&states).map(|mode| mode.id)
     }
 
     pub fn take_requested_mode(&mut self) -> Option<String> {
@@ -1696,7 +1696,7 @@ impl App {
         self.mode_policy = normalized_mode(&self.mode).map(|mode| mode.0.to_owned());
     }
 
-    pub fn mode_options(&self) -> Vec<codeswarm_core::Mode> {
+    pub fn mode_options(&self) -> Vec<codeswarm_adapters::Mode> {
         if self.active_roster_slots().into_iter().any(|slot| {
             self.agent_states
                 .get(&slot)
@@ -1715,7 +1715,7 @@ impl App {
             .map(|(_, modes)| modes)
             .map(|(modes, _)| modes.clone())
             .collect::<Vec<_>>();
-        codeswarm_core::policy::shared_modes(&sets)
+        codeswarm_adapters::policy::shared_modes(&sets)
     }
 
     pub fn set_collaboration(&mut self, collaboration: impl Into<String>) {
@@ -1827,7 +1827,7 @@ impl App {
     pub fn record_human_message(&mut self, prompt: &str, direct: bool) {
         let prefix = if direct { "You → direct: " } else { "You: " };
         self.transcript.append(
-            codeswarm_transcript::BlockKind::Human,
+            crate::transcript::BlockKind::Human,
             format!("{prefix}{prompt}"),
             false,
         );
@@ -2450,7 +2450,7 @@ impl App {
     pub fn apply_event(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::RosterUpdated { update } => match update {
-                codeswarm_core::RosterUpdate::Added {
+                codeswarm_adapters::RosterUpdate::Added {
                     slot,
                     name,
                     identity,
@@ -2459,17 +2459,17 @@ impl App {
                     self.set_agent_identity(*slot, identity.clone());
                     self.status = format!("agent {slot} added");
                 }
-                codeswarm_core::RosterUpdate::Reloaded { slot } => {
+                codeswarm_adapters::RosterUpdate::Reloaded { slot } => {
                     self.mark_agent_reloaded(*slot);
                 }
-                codeswarm_core::RosterUpdate::Dropped { slot } => {
+                codeswarm_adapters::RosterUpdate::Dropped { slot } => {
                     self.mark_agent_dropped(*slot);
                 }
-                codeswarm_core::RosterUpdate::Swapped { first, second } => {
+                codeswarm_adapters::RosterUpdate::Swapped { first, second } => {
                     self.swap_agents(*first, *second);
                     self.status = format!("agents {first} and {second} swapped");
                 }
-                codeswarm_core::RosterUpdate::Rejected { action, detail } => {
+                codeswarm_adapters::RosterUpdate::Rejected { action, detail } => {
                     self.status = format!("unable to {action}: {detail}");
                 }
             },
@@ -2532,10 +2532,10 @@ impl App {
             }
             AgentEvent::UserText { slot, text } => {
                 self.mark_agent_turn_started(*slot);
-                let key = (*slot, codeswarm_transcript::BlockKind::Human);
+                let key = (*slot, crate::transcript::BlockKind::Human);
                 let block = self.streaming_blocks.get(&key).copied().unwrap_or_else(|| {
                     let id = self.transcript.append(
-                        codeswarm_transcript::BlockKind::Human,
+                        crate::transcript::BlockKind::Human,
                         format!("{}: ", self.agent_name(*slot)),
                         false,
                     );
@@ -2555,10 +2555,10 @@ impl App {
             }
             AgentEvent::Text { slot, text } => {
                 self.mark_agent_turn_started(*slot);
-                let key = (*slot, codeswarm_transcript::BlockKind::Agent);
+                let key = (*slot, crate::transcript::BlockKind::Agent);
                 let block = self.streaming_blocks.get(&key).copied().unwrap_or_else(|| {
                     let id = self.transcript.append(
-                        codeswarm_transcript::BlockKind::Agent,
+                        crate::transcript::BlockKind::Agent,
                         agent_message_prefix(&self.agent_name(*slot)),
                         false,
                     );
@@ -2572,10 +2572,10 @@ impl App {
             }
             AgentEvent::Thought { slot, text } => {
                 self.mark_agent_turn_started(*slot);
-                let key = (*slot, codeswarm_transcript::BlockKind::Thought);
+                let key = (*slot, crate::transcript::BlockKind::Thought);
                 let id = self.streaming_blocks.get(&key).copied().unwrap_or_else(|| {
                     let id = self.transcript.append(
-                        codeswarm_transcript::BlockKind::Thought,
+                        crate::transcript::BlockKind::Thought,
                         agent_message_prefix(&self.agent_name(*slot)),
                         !self.show_thoughts,
                     );
@@ -2611,8 +2611,8 @@ impl App {
                     .detail
                     .as_deref()
                     .filter(|detail| looks_like_unified_diff(detail))
-                    .map_or(codeswarm_transcript::BlockKind::Tool, |_| {
-                        codeswarm_transcript::BlockKind::Diff
+                    .map_or(crate::transcript::BlockKind::Tool, |_| {
+                        crate::transcript::BlockKind::Diff
                     });
                 let key = (*slot, update.id.clone());
                 let prefix = self
@@ -2625,7 +2625,7 @@ impl App {
                     || format!("{prefix}{} · {state}", update.title),
                     |detail| format!("{prefix}{} · {state}\n{detail}", update.title),
                 );
-                let initially_collapsed = if kind == codeswarm_transcript::BlockKind::Tool {
+                let initially_collapsed = if kind == crate::transcript::BlockKind::Tool {
                     // Normal tool calls always enter the transcript as a
                     // compact two-line preview. Ctrl+O is the only path that
                     // opens retained output; failures must not self-expand.
@@ -2689,20 +2689,20 @@ impl App {
                     }
                 };
                 self.transcript
-                    .append(codeswarm_transcript::BlockKind::Terminal, text, true);
+                    .append(crate::transcript::BlockKind::Terminal, text, true);
                 self.agent_states.insert(*slot, "working".into());
             }
             AgentEvent::TurnComplete { slot } => {
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.streaming_blocks
-                    .remove(&(*slot, codeswarm_transcript::BlockKind::Agent));
+                    .remove(&(*slot, crate::transcript::BlockKind::Agent));
                 self.streaming_blocks
-                    .remove(&(*slot, codeswarm_transcript::BlockKind::Thought));
+                    .remove(&(*slot, crate::transcript::BlockKind::Thought));
                 self.tool_blocks
                     .retain(|(tool_slot, _), _| tool_slot != slot);
                 self.streaming_blocks
-                    .remove(&(*slot, codeswarm_transcript::BlockKind::Human));
+                    .remove(&(*slot, crate::transcript::BlockKind::Human));
                 if self
                     .permission
                     .as_ref()
@@ -2722,11 +2722,11 @@ impl App {
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.streaming_blocks
-                    .remove(&(*slot, codeswarm_transcript::BlockKind::Agent));
+                    .remove(&(*slot, crate::transcript::BlockKind::Agent));
                 self.streaming_blocks
-                    .remove(&(*slot, codeswarm_transcript::BlockKind::Thought));
+                    .remove(&(*slot, crate::transcript::BlockKind::Thought));
                 self.streaming_blocks
-                    .remove(&(*slot, codeswarm_transcript::BlockKind::Human));
+                    .remove(&(*slot, crate::transcript::BlockKind::Human));
                 if self
                     .permission
                     .as_ref()
@@ -4277,7 +4277,7 @@ fn render_transcript(
     if diff_split
         && rows
             .iter()
-            .any(|row| row.kind == codeswarm_transcript::BlockKind::Diff)
+            .any(|row| row.kind == crate::transcript::BlockKind::Diff)
     {
         render_split_diff(buffer, area, rows);
         return;
@@ -4292,7 +4292,7 @@ fn render_transcript(
         let focused_hint_row = focused_detail.and_then(|id| {
             rows.iter().rposition(|row| {
                 row.block_id == id
-                    && !(row.first_in_block && row.kind == codeswarm_transcript::BlockKind::Agent)
+                    && !(row.first_in_block && row.kind == crate::transcript::BlockKind::Agent)
                     && !row.text.is_empty()
             })
         });
@@ -4308,21 +4308,20 @@ fn render_transcript(
                 }
                 let marker = if row.first_in_block {
                     match row.kind {
-                        codeswarm_transcript::BlockKind::Human => "› ",
-                        codeswarm_transcript::BlockKind::Agent => "● ",
-                        codeswarm_transcript::BlockKind::Thought => "… ",
-                        codeswarm_transcript::BlockKind::Tool => "◆ ",
-                        codeswarm_transcript::BlockKind::Terminal => "◆ ",
-                        codeswarm_transcript::BlockKind::Diff => "± ",
-                        codeswarm_transcript::BlockKind::Notice => "· ",
+                        crate::transcript::BlockKind::Human => "› ",
+                        crate::transcript::BlockKind::Agent => "● ",
+                        crate::transcript::BlockKind::Thought => "… ",
+                        crate::transcript::BlockKind::Tool => "◆ ",
+                        crate::transcript::BlockKind::Terminal => "◆ ",
+                        crate::transcript::BlockKind::Diff => "± ",
+                        crate::transcript::BlockKind::Notice => "· ",
                     }
                 } else {
                     "  "
                 };
                 if matches!(
                     row.kind,
-                    codeswarm_transcript::BlockKind::Agent
-                        | codeswarm_transcript::BlockKind::Thought
+                    crate::transcript::BlockKind::Agent | crate::transcript::BlockKind::Thought
                 ) && row.first_in_block
                     && let Some((speaker, body)) = row.text.split_once(": ")
                 {
@@ -4366,7 +4365,7 @@ fn render_split_diff(buffer: &mut Buffer, area: Rect, rows: Vec<RenderRow>) {
     let mut left = Vec::new();
     let mut right = Vec::new();
     for row in rows {
-        if row.kind != codeswarm_transcript::BlockKind::Diff {
+        if row.kind != crate::transcript::BlockKind::Diff {
             let line = Line::styled(row.text, markdown_style(row.kind, ""));
             left.push(line.clone());
             right.push(line);
@@ -4443,32 +4442,32 @@ fn agent_color_for_slot(app: &App, slot: usize, name: &str) -> Color {
     }
 }
 
-fn block_style(kind: codeswarm_transcript::BlockKind) -> Style {
+fn block_style(kind: crate::transcript::BlockKind) -> Style {
     match kind {
-        codeswarm_transcript::BlockKind::Human => {
+        crate::transcript::BlockKind::Human => {
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
         }
-        codeswarm_transcript::BlockKind::Agent => Style::default().fg(PRIMARY_TEXT),
-        codeswarm_transcript::BlockKind::Thought => Style::default().fg(THOUGHT_TEXT).italic(),
-        codeswarm_transcript::BlockKind::Tool => Style::default().fg(Color::Gray),
-        codeswarm_transcript::BlockKind::Terminal => Style::default().fg(Color::Gray),
-        codeswarm_transcript::BlockKind::Diff => Style::default().fg(Color::Magenta),
-        codeswarm_transcript::BlockKind::Notice => Style::default().fg(THOUGHT_TEXT),
+        crate::transcript::BlockKind::Agent => Style::default().fg(PRIMARY_TEXT),
+        crate::transcript::BlockKind::Thought => Style::default().fg(THOUGHT_TEXT).italic(),
+        crate::transcript::BlockKind::Tool => Style::default().fg(Color::Gray),
+        crate::transcript::BlockKind::Terminal => Style::default().fg(Color::Gray),
+        crate::transcript::BlockKind::Diff => Style::default().fg(Color::Magenta),
+        crate::transcript::BlockKind::Notice => Style::default().fg(THOUGHT_TEXT),
     }
 }
 
-fn marker_style(kind: codeswarm_transcript::BlockKind, text: &str) -> Style {
+fn marker_style(kind: crate::transcript::BlockKind, text: &str) -> Style {
     match kind {
-        codeswarm_transcript::BlockKind::Tool | codeswarm_transcript::BlockKind::Terminal => {
+        crate::transcript::BlockKind::Tool | crate::transcript::BlockKind::Terminal => {
             Style::default().fg(Color::Yellow).bold()
         }
-        codeswarm_transcript::BlockKind::Notice => Style::default().fg(ACCENT).bold(),
+        crate::transcript::BlockKind::Notice => Style::default().fg(ACCENT).bold(),
         _ => row_style(kind, text).bold(),
     }
 }
 
-fn row_style(kind: codeswarm_transcript::BlockKind, text: &str) -> Style {
-    if kind != codeswarm_transcript::BlockKind::Diff {
+fn row_style(kind: crate::transcript::BlockKind, text: &str) -> Style {
+    if kind != crate::transcript::BlockKind::Diff {
         return block_style(kind);
     }
     if text.starts_with('+') && !text.starts_with("+++") {
@@ -4482,7 +4481,7 @@ fn row_style(kind: codeswarm_transcript::BlockKind, text: &str) -> Style {
     }
 }
 
-fn markdown_style(kind: codeswarm_transcript::BlockKind, text: &str) -> Style {
+fn markdown_style(kind: crate::transcript::BlockKind, text: &str) -> Style {
     let base = block_style(kind);
     let trimmed = text.trim();
     if trimmed.starts_with('#') {
@@ -4499,7 +4498,7 @@ fn markdown_style(kind: codeswarm_transcript::BlockKind, text: &str) -> Style {
 }
 
 fn markdown_spans(
-    kind: codeswarm_transcript::BlockKind,
+    kind: crate::transcript::BlockKind,
     text: &str,
     in_code: &mut bool,
 ) -> Vec<Span<'static>> {
@@ -4721,7 +4720,7 @@ fn looks_like_unified_diff(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use codeswarm_transcript::BlockKind;
+    use crate::transcript::BlockKind;
     use ratatui::{
         Terminal,
         backend::TestBackend,
@@ -5022,9 +5021,9 @@ mod tests {
             ..App::default()
         };
         app.queue_prompt("a queued request", Some(1), false);
-        app.apply_event(&codeswarm_core::AgentEvent::Permission {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Permission {
             slot: 0,
-            request: codeswarm_core::PermissionRequest {
+            request: codeswarm_adapters::PermissionRequest {
                 id: "narrow-permission".into(),
                 title: "Allow this operation?".into(),
                 options: vec!["Allow".into(), "Deny".into(), "Always".into()],
@@ -5054,9 +5053,9 @@ mod tests {
             ..App::default()
         };
         app.queue_prompt("queued request", Some(1), false);
-        app.apply_event(&codeswarm_core::AgentEvent::Permission {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Permission {
             slot: 0,
-            request: codeswarm_core::PermissionRequest {
+            request: codeswarm_adapters::PermissionRequest {
                 id: "permission".into(),
                 title: "Allow operation?".into(),
                 options: vec!["Allow".into(), "Deny".into()],
@@ -5142,9 +5141,9 @@ mod tests {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Terminal {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Terminal {
             slot: 0,
-            event: codeswarm_core::TerminalEvent::Output {
+            event: codeswarm_adapters::TerminalEvent::Output {
                 id: "local-shell".into(),
                 text: "shell-ok".into(),
             },
@@ -5320,9 +5319,9 @@ mod tests {
     fn advertised_agent_commands_extend_prompt_completion_without_noise() {
         let mut app = App::default();
         app.set_prompt_completions(["/help"]);
-        app.apply_event(&codeswarm_core::AgentEvent::CommandsReplaced {
+        app.apply_event(&codeswarm_adapters::AgentEvent::CommandsReplaced {
             slot: 0,
-            commands: vec![codeswarm_core::AgentCommand {
+            commands: vec![codeswarm_adapters::AgentCommand {
                 name: "review".into(),
             }],
         });
@@ -5346,9 +5345,9 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("terminal");
         let mut app = App::default();
         app.set_agent_name(0, "Claude");
-        app.apply_event(&codeswarm_core::AgentEvent::UsageUpdated {
+        app.apply_event(&codeswarm_adapters::AgentEvent::UsageUpdated {
             slot: 0,
-            usage: codeswarm_core::UsageUpdate {
+            usage: codeswarm_adapters::UsageUpdate {
                 used: 4_200,
                 size: 128_000,
             },
@@ -5373,15 +5372,15 @@ mod tests {
         let mut app = App::default();
         app.set_agent_name(0, "Agent");
         app.set_prompt_completions(["/help"]);
-        app.apply_event(&codeswarm_core::AgentEvent::CommandsReplaced {
+        app.apply_event(&codeswarm_adapters::AgentEvent::CommandsReplaced {
             slot: 0,
-            commands: vec![codeswarm_core::AgentCommand {
+            commands: vec![codeswarm_adapters::AgentCommand {
                 name: "review".into(),
             }],
         });
-        app.apply_event(&codeswarm_core::AgentEvent::UsageUpdated {
+        app.apply_event(&codeswarm_adapters::AgentEvent::UsageUpdated {
             slot: 0,
-            usage: codeswarm_core::UsageUpdate { used: 1, size: 2 },
+            usage: codeswarm_adapters::UsageUpdate { used: 1, size: 2 },
         });
         assert!(app.agent_usage(0).is_some());
         app.mark_agent_dropped(0);
@@ -5393,11 +5392,11 @@ mod tests {
     fn streamed_user_message_chunks_share_one_transcript_block() {
         let mut app = App::default();
         app.set_agent_name(0, "ACP");
-        app.apply_event(&codeswarm_core::AgentEvent::UserText {
+        app.apply_event(&codeswarm_adapters::AgentEvent::UserText {
             slot: 0,
             text: "first ".into(),
         });
-        app.apply_event(&codeswarm_core::AgentEvent::UserText {
+        app.apply_event(&codeswarm_adapters::AgentEvent::UserText {
             slot: 0,
             text: "second".into(),
         });
@@ -5677,18 +5676,18 @@ mod tests {
         app.set_agent_name(1, "Codex");
         assert_eq!(app.next_agent_slot(), Some(0));
         assert!(footer_agent_label(&app, 0, 2).contains("◌ Claude"));
-        app.apply_event(&codeswarm_core::AgentEvent::Ready {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Ready {
             slot: 0,
-            capabilities: codeswarm_core::AgentCapabilities::default(),
+            capabilities: codeswarm_adapters::AgentCapabilities::default(),
         });
         assert!(footer_agent_label(&app, 0, 2).contains("○ Claude"));
         assert!(footer_agent_label(&app, 0, 2).starts_with("→ "));
 
-        app.apply_event(&codeswarm_core::AgentEvent::TurnComplete { slot: 0 });
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
         assert_eq!(app.next_agent_slot(), Some(1));
         assert!(footer_agent_label(&app, 1, 2).starts_with("→ "));
 
-        app.apply_event(&codeswarm_core::AgentEvent::TurnComplete { slot: 1 });
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 1 });
         assert_eq!(app.next_agent_slot(), Some(0));
         assert!(footer_agent_label(&app, 0, 2).starts_with("→ "));
 
@@ -5703,7 +5702,7 @@ mod tests {
         let mut app = App::default();
         app.set_agent_name(0, "Codex");
         app.set_agent_name(1, "Qwen");
-        app.apply_event(&codeswarm_core::AgentEvent::TurnStarted { slot: 0 });
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnStarted { slot: 0 });
         assert_eq!(app.transcript.len(), 0);
         assert_eq!(
             app.agent_states.get(&0).map(String::as_str),
@@ -5718,12 +5717,12 @@ mod tests {
         let blocks_before_wait = app.transcript.len();
 
         for status in [
-            codeswarm_core::ToolStatus::Running,
-            codeswarm_core::ToolStatus::Completed,
+            codeswarm_adapters::ToolStatus::Running,
+            codeswarm_adapters::ToolStatus::Completed,
         ] {
-            app.apply_event(&codeswarm_core::AgentEvent::Tool {
+            app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
                 slot: 0,
-                update: codeswarm_core::ToolUpdate {
+                update: codeswarm_adapters::ToolUpdate {
                     id: "wait".into(),
                     title: "Wait".into(),
                     status,
@@ -5735,12 +5734,12 @@ mod tests {
         assert!(footer_agent_label(&app, 0, 1).contains("· 1:05"));
         assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
 
-        app.apply_event(&codeswarm_core::AgentEvent::Tool {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
-            update: codeswarm_core::ToolUpdate {
+            update: codeswarm_adapters::ToolUpdate {
                 id: "generic".into(),
                 title: "Tool call".into(),
-                status: codeswarm_core::ToolStatus::Completed,
+                status: codeswarm_adapters::ToolStatus::Completed,
                 detail: None,
             },
         });
@@ -5754,12 +5753,12 @@ mod tests {
         assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
 
         for (id, title) in [("read", "Read files"), ("search", "Search code")] {
-            app.apply_event(&codeswarm_core::AgentEvent::Tool {
+            app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
                 slot: 0,
-                update: codeswarm_core::ToolUpdate {
+                update: codeswarm_adapters::ToolUpdate {
                     id: id.into(),
                     title: title.into(),
-                    status: codeswarm_core::ToolStatus::Completed,
+                    status: codeswarm_adapters::ToolStatus::Completed,
                     detail: Some("done".into()),
                 },
             });
@@ -5767,7 +5766,7 @@ mod tests {
         assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
         assert!(app.transcript.row_count(80) > 0);
 
-        app.apply_event(&codeswarm_core::AgentEvent::TurnComplete { slot: 0 });
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
         assert!(!footer_agent_label(&app, 0, 1).contains("1:05"));
         assert!(!footer_agent_label(&app, 0, 1).contains("tools"));
         assert!(!app.agent_turn_started.contains_key(&0));
@@ -5777,7 +5776,7 @@ mod tests {
     fn cancellation_replaces_and_then_clears_the_footer_timer() {
         let mut app = App::default();
         app.set_agent_name(0, "Codex");
-        app.apply_event(&codeswarm_core::AgentEvent::Thought {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
             slot: 0,
             text: "working".into(),
         });
@@ -5816,7 +5815,7 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Failed {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Failed {
             slot: 0,
             started: true,
             detail: "connection lost".into(),
@@ -5839,9 +5838,9 @@ mod tests {
     fn ready_event_preserves_human_readable_agent_name() {
         let mut app = App::default();
         app.set_agent_name(0, "Codex");
-        app.apply_event(&codeswarm_core::AgentEvent::Ready {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Ready {
             slot: 0,
-            capabilities: codeswarm_core::AgentCapabilities::default(),
+            capabilities: codeswarm_adapters::AgentCapabilities::default(),
         });
         assert_eq!(app.active_agent, "Codex");
     }
@@ -5911,7 +5910,7 @@ mod tests {
         let mut app = App::default();
         app.set_agent_name(0, "Codex");
         app.set_agent_name(1, "Gemini");
-        app.apply_event(&codeswarm_core::AgentEvent::Text {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
             slot: 1,
             text: "review".into(),
         });
@@ -6053,14 +6052,14 @@ mod tests {
     #[test]
     fn advertised_mode_catalog_drives_the_config_mode_cycle() {
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::ModesReplaced {
+        app.apply_event(&codeswarm_adapters::AgentEvent::ModesReplaced {
             slot: 0,
             modes: vec![
-                codeswarm_core::Mode {
+                codeswarm_adapters::Mode {
                     id: "plan".into(),
                     label: "Plan".into(),
                 },
-                codeswarm_core::Mode {
+                codeswarm_adapters::Mode {
                     id: "full-access".into(),
                     label: "Auto pilot".into(),
                 },
@@ -6141,15 +6140,15 @@ mod tests {
             available: true,
             selected: true,
         }]);
-        app.apply_event(&codeswarm_core::AgentEvent::ModelsReplaced {
+        app.apply_event(&codeswarm_adapters::AgentEvent::ModelsReplaced {
             slot: 0,
             config_id: "model".into(),
             models: vec![
-                codeswarm_core::Mode {
+                codeswarm_adapters::Mode {
                     id: "fast".into(),
                     label: "Fast".into(),
                 },
-                codeswarm_core::Mode {
+                codeswarm_adapters::Mode {
                     id: "smart".into(),
                     label: "Smart".into(),
                 },
@@ -6359,17 +6358,17 @@ mod tests {
         );
         assert!(app.thoughts_enabled());
         assert!(app.tools_expanded());
-        app.apply_event(&codeswarm_core::AgentEvent::Thought {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
             slot: 0,
             text: "thinking".into(),
         });
         assert!(app.transcript.row_count(80) > 0);
-        app.apply_event(&codeswarm_core::AgentEvent::Tool {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
-            update: codeswarm_core::ToolUpdate {
+            update: codeswarm_adapters::ToolUpdate {
                 id: "tool".into(),
                 title: "Run".into(),
-                status: codeswarm_core::ToolStatus::Completed,
+                status: codeswarm_adapters::ToolStatus::Completed,
                 detail: Some("detail".into()),
             },
         });
@@ -6449,9 +6448,9 @@ mod tests {
 
     #[test]
     fn ordinary_tool_activity_starts_collapsed_for_every_expand_policy() {
-        let tool = |status| codeswarm_core::AgentEvent::Tool {
+        let tool = |status| codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
-            update: codeswarm_core::ToolUpdate {
+            update: codeswarm_adapters::ToolUpdate {
                 id: "tool".into(),
                 title: "Run".into(),
                 status,
@@ -6460,20 +6459,20 @@ mod tests {
         };
 
         let mut app = App::default();
-        app.apply_event(&tool(codeswarm_core::ToolStatus::Completed));
+        app.apply_event(&tool(codeswarm_adapters::ToolStatus::Completed));
         assert_eq!(app.transcript.row_count(80), 3);
         let mut failed = App::default();
-        failed.apply_event(&tool(codeswarm_core::ToolStatus::Failed));
+        failed.apply_event(&tool(codeswarm_adapters::ToolStatus::Failed));
         assert_eq!(failed.transcript.row_count(80), 3);
 
         let mut always = App::default();
         always.set_tool_expand_policy("always");
-        always.apply_event(&tool(codeswarm_core::ToolStatus::Completed));
+        always.apply_event(&tool(codeswarm_adapters::ToolStatus::Completed));
         assert_eq!(always.transcript.row_count(80), 3);
 
         let mut never = App::default();
         never.set_tool_expand_policy("never");
-        never.apply_event(&tool(codeswarm_core::ToolStatus::Failed));
+        never.apply_event(&tool(codeswarm_adapters::ToolStatus::Failed));
         assert_eq!(never.transcript.row_count(80), 3);
     }
 
@@ -6493,7 +6492,7 @@ mod tests {
     #[test]
     fn clear_command_resets_streaming_detail_state() {
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Text {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
             slot: 0,
             text: "in progress".into(),
         });
@@ -6503,7 +6502,7 @@ mod tests {
             Some(LocalCommand::Handled)
         );
         assert!(app.transcript.is_empty());
-        app.apply_event(&codeswarm_core::AgentEvent::Text {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
             slot: 0,
             text: "fresh".into(),
         });
@@ -6835,11 +6834,11 @@ mod tests {
     #[test]
     fn streamed_chunks_keep_one_slack_style_timestamp() {
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Text {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
             slot: 0,
             text: "first ".into(),
         });
-        app.apply_event(&codeswarm_core::AgentEvent::Text {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
             slot: 0,
             text: "second".into(),
         });
@@ -6859,8 +6858,8 @@ mod tests {
                 .all(|(index, byte)| index == 2 || byte.is_ascii_digit())
         );
         assert_eq!(rows[1].text, "first second");
-        app.apply_event(&codeswarm_core::AgentEvent::TurnComplete { slot: 0 });
-        app.apply_event(&codeswarm_core::AgentEvent::Text {
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
             slot: 0,
             text: "next turn".into(),
         });
@@ -6953,11 +6952,11 @@ mod tests {
     #[test]
     fn streamed_thought_chunks_extend_one_collapsed_detail() {
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Thought {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
             slot: 0,
             text: "first ".into(),
         });
-        app.apply_event(&codeswarm_core::AgentEvent::Thought {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
             slot: 0,
             text: "second".into(),
         });
@@ -6985,8 +6984,8 @@ mod tests {
             rendered.contains("Thought · 2 words"),
             "rendered={rendered:?}"
         );
-        app.apply_event(&codeswarm_core::AgentEvent::TurnComplete { slot: 0 });
-        app.apply_event(&codeswarm_core::AgentEvent::Thought {
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
+        app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
             slot: 0,
             text: "new turn".into(),
         });
@@ -6999,12 +6998,12 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
         app.set_agent_name(0, "Antigravity");
-        app.apply_event(&codeswarm_core::AgentEvent::Tool {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
-            update: codeswarm_core::ToolUpdate {
+            update: codeswarm_adapters::ToolUpdate {
                 id: "read".into(),
                 title: "Read files".into(),
-                status: codeswarm_core::ToolStatus::Running,
+                status: codeswarm_adapters::ToolStatus::Running,
                 detail: Some("first output line\nsecond output line\nthird output line".into()),
             },
         });
@@ -7044,12 +7043,12 @@ mod tests {
             1
         );
 
-        app.apply_event(&codeswarm_core::AgentEvent::Tool {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
-            update: codeswarm_core::ToolUpdate {
+            update: codeswarm_adapters::ToolUpdate {
                 id: "read".into(),
                 title: "Read files".into(),
-                status: codeswarm_core::ToolStatus::Completed,
+                status: codeswarm_adapters::ToolStatus::Completed,
                 detail: Some("updated output\nsecond line\nthird line".into()),
             },
         });
@@ -7066,12 +7065,12 @@ mod tests {
         let original_prefix =
             attributed_message_prefix(app.transcript.source(tool_id).expect("tool source"))
                 .expect("tool attribution");
-        app.apply_event(&codeswarm_core::AgentEvent::Tool {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
-            update: codeswarm_core::ToolUpdate {
+            update: codeswarm_adapters::ToolUpdate {
                 id: "read".into(),
                 title: "Read files".into(),
-                status: codeswarm_core::ToolStatus::Completed,
+                status: codeswarm_adapters::ToolStatus::Completed,
                 detail: Some("final output\nsecond line\nthird line".into()),
             },
         });
@@ -7085,12 +7084,12 @@ mod tests {
     #[test]
     fn ordinary_tool_details_render_collapsed_and_expand_with_ctrl_o() {
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Tool {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
-            update: codeswarm_core::ToolUpdate {
+            update: codeswarm_adapters::ToolUpdate {
                 id: "tool-1".into(),
                 title: "Run tests".into(),
-                status: codeswarm_core::ToolStatus::Completed,
+                status: codeswarm_adapters::ToolStatus::Completed,
                 detail: Some("large output\nsecond line".into()),
             },
         });
@@ -7103,12 +7102,12 @@ mod tests {
     #[test]
     fn tool_diff_payload_is_retained_and_classified_lazily() {
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Tool {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
-            update: codeswarm_core::ToolUpdate {
+            update: codeswarm_adapters::ToolUpdate {
                 id: "patch".into(),
                 title: "Apply patch".into(),
-                status: codeswarm_core::ToolStatus::Completed,
+                status: codeswarm_adapters::ToolStatus::Completed,
                 detail: Some("--- a/file.rs\n+++ b/file.rs\n@@ -1 +1 @@\n-old\n+new".into()),
             },
         });
@@ -7139,9 +7138,9 @@ mod tests {
     #[test]
     fn permission_selection_returns_stable_request_identity() {
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Permission {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Permission {
             slot: 2,
-            request: codeswarm_core::PermissionRequest {
+            request: codeswarm_adapters::PermissionRequest {
                 id: "permission-7".into(),
                 title: "Write to the workspace".into(),
                 options: vec!["Allow once".into(), "Always allow".into(), "Deny".into()],
@@ -7174,9 +7173,9 @@ mod tests {
     #[test]
     fn replacement_permission_resets_focus_and_cancel_clears_it() {
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Permission {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Permission {
             slot: 0,
-            request: codeswarm_core::PermissionRequest {
+            request: codeswarm_adapters::PermissionRequest {
                 id: "first".into(),
                 title: "First".into(),
                 options: vec!["one".into(), "two".into()],
@@ -7187,9 +7186,9 @@ mod tests {
             app.handle_permission_key(PermissionKey::Down),
             PermissionAction::SelectionChanged { index: 1 }
         );
-        app.apply_event(&codeswarm_core::AgentEvent::Permission {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Permission {
             slot: 1,
-            request: codeswarm_core::PermissionRequest {
+            request: codeswarm_adapters::PermissionRequest {
                 id: "replacement".into(),
                 title: "Replacement".into(),
                 options: vec!["only choice".into()],
@@ -7217,9 +7216,9 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Permission {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Permission {
             slot: 0,
-            request: codeswarm_core::PermissionRequest {
+            request: codeswarm_adapters::PermissionRequest {
                 id: "permission-1".into(),
                 title: "Run this command?".into(),
                 options: vec!["Allow".into(), "Deny".into()],
@@ -7244,9 +7243,9 @@ mod tests {
     #[test]
     fn permission_without_options_cannot_be_confirmed() {
         let mut app = App::default();
-        app.apply_event(&codeswarm_core::AgentEvent::Permission {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Permission {
             slot: 0,
-            request: codeswarm_core::PermissionRequest {
+            request: codeswarm_adapters::PermissionRequest {
                 id: "empty".into(),
                 title: "No choices".into(),
                 options: Vec::new(),
@@ -7438,9 +7437,9 @@ mod tests {
         assert!(row(&terminal, rules[1]).chars().all(|char| char == '┄'));
         assert!(row(&terminal, prompt_y - 1).trim().is_empty());
 
-        app.apply_event(&codeswarm_core::AgentEvent::Ready {
+        app.apply_event(&codeswarm_adapters::AgentEvent::Ready {
             slot: 0,
-            capabilities: codeswarm_core::AgentCapabilities::default(),
+            capabilities: codeswarm_adapters::AgentCapabilities::default(),
         });
         terminal
             .draw(|frame| render(frame, &mut app))

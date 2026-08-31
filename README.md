@@ -5,6 +5,10 @@ Rust application built around Ratatui, with ACP and native adapter support,
 sequential relay turns, lazy transcript details, and a full-screen terminal
 interface. It collects no telemetry.
 
+`codeswarm-adapters` is also published as a reusable Rust library for
+applications that need CodeSwarm's normalized agent events, ACP/native
+adapters, and sequential relay host without the terminal UI.
+
 ## Install
 
 Install the published binary with Cargo:
@@ -133,7 +137,7 @@ make verify
 ```
 
 This runs formatting, workspace tests, Clippy, a locked release build, and
-workspace package archive validation.
+package archive validation.
 
 ## License
 

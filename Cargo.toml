@@ -1,15 +1,9 @@
 [workspace]
-members = [
-    "crates/codeswarm-adapters",
-    "crates/codeswarm-cli",
-    "crates/codeswarm-core",
-    "crates/codeswarm-transcript",
-    "crates/codeswarm-tui",
-]
+members = [".", "crates/codeswarm-adapters"]
 resolver = "2"
 
 [workspace.package]
-version = "0.7.5"
+version = "0.8.0"
 edition = "2024"
 license = "MIT"
 authors = ["CodeSwarm contributors"]
@@ -32,6 +26,37 @@ futures = "0.3.31"
 nix = { version = "0.29.0", features = ["process", "signal"] }
 ratatui = "0.30.0"
 time = { version = "0.3.55", features = ["local-offset"] }
+tui-textarea-2 = { version = "0.13.2", default-features = false, features = ["ratatui", "crossterm"] }
+
+[package]
+name = "codeswarm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description.workspace = true
+exclude = [".venv/**", "crates/codeswarm-adapters/**"]
+
+[[bin]]
+name = "codeswarm"
+path = "crates/codeswarm-cli/src/main.rs"
+
+[dependencies]
+codeswarm-adapters = { version = "=0.8.0", path = "crates/codeswarm-adapters" }
+crossterm.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+time.workspace = true
+tokio.workspace = true
+tui-textarea-2.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+
+[lints]
+workspace = true
 
 [profile.release]
 codegen-units = 1

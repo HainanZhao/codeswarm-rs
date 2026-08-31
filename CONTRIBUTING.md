@@ -1,6 +1,7 @@
 # Contributing to CodeSwarm
 
-CodeSwarm is a Rust workspace. Cargo is the canonical build, test, lint, and
+CodeSwarm is a two-package Rust workspace: the reusable `codeswarm-adapters`
+library and the `codeswarm` application. Cargo is the canonical build, test, lint, and
 package tool; no interpreter or generated dependency environment is required.
 
 ## Verification
@@ -12,7 +13,7 @@ make verify
 ```
 
 This runs `cargo fmt`, all workspace tests, Clippy with warnings denied, a
-locked release build, and workspace package archive validation.
+locked release build, and package archive validation for both packages.
 
 For UI, adapter, or CLI changes, add a regression at the integration boundary
 that failed. Use Ratatui's `TestBackend` for deterministic rendering. Keep

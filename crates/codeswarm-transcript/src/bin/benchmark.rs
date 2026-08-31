@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use codeswarm_transcript::{BlockKind, Transcript, fixtures};
+use codeswarm::transcript::{BlockKind, Transcript, fixtures};
 
 fn main() {
     let mut single = Transcript::default();

@@ -4,7 +4,7 @@
 
 use std::env;
 
-use codeswarm_core::{contract::replay_trace, persistence::VersionedEventLog};
+use codeswarm_adapters::{contract::replay_trace, persistence::VersionedEventLog};
 
 fn main() {
     if let Err(error) = run() {
@@ -48,7 +48,7 @@ fn run() -> Result<(), String> {
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use codeswarm_core::{AgentEvent, persistence::VersionedEventLog};
+    use codeswarm_adapters::{AgentEvent, persistence::VersionedEventLog};
 
     #[test]
     fn replay_command_input_is_deterministic() {
@@ -66,9 +66,9 @@ mod tests {
         })
         .expect("append");
         let events = log.read().expect("read");
-        let first = serde_json::to_string(&codeswarm_core::contract::replay_trace(1, &events))
+        let first = serde_json::to_string(&codeswarm_adapters::contract::replay_trace(1, &events))
             .expect("serialize");
-        let second = serde_json::to_string(&codeswarm_core::contract::replay_trace(1, &events))
+        let second = serde_json::to_string(&codeswarm_adapters::contract::replay_trace(1, &events))
             .expect("serialize");
         assert_eq!(first, second);
         std::fs::remove_file(path).expect("cleanup");

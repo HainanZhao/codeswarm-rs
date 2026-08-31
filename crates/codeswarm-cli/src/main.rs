@@ -8,24 +8,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use codeswarm_adapters::{
-    AcpAdapter, AdapterError, AdapterHost, AdapterResult, AgentAdapter, AgyAdapter, RelayHost,
-    RelayPermissionAnswer, parse_command_line,
-};
-use codeswarm_core::PermissionAnswer;
-use codeswarm_core::agents::{AdapterKind, AgentDefinition, catalog_from_settings};
-use codeswarm_core::history;
-use codeswarm_core::launcher::{LaunchDecision, launch_decision, parse_saved_roster};
-use codeswarm_core::persistence::{SessionMetadata, SessionMetadataStore};
-use codeswarm_core::relay::{CollaborationStrategy, RelayDecision};
-use codeswarm_core::settings;
-use codeswarm_core::{AgentEvent, BufferedEventLog, EventLog};
-use codeswarm_transcript::{BlockKind, fixtures};
-use codeswarm_tui::{
+use codeswarm::transcript::{BlockKind, fixtures};
+use codeswarm::tui::{
     App, ConfigAction, ConfigKey, FooterAction, Input, Key as TuiKey, LocalCommand,
     PermissionAction, PermissionKey, PromptAction, QueuedPrompt, StoreAction, StoreAgent, StoreKey,
     render,
 };
+use codeswarm_adapters::PermissionAnswer;
+use codeswarm_adapters::agents::{AdapterKind, AgentDefinition, catalog_from_settings};
+use codeswarm_adapters::history;
+use codeswarm_adapters::launcher::{LaunchDecision, launch_decision, parse_saved_roster};
+use codeswarm_adapters::persistence::{SessionMetadata, SessionMetadataStore};
+use codeswarm_adapters::relay::{CollaborationStrategy, RelayDecision};
+use codeswarm_adapters::settings;
+use codeswarm_adapters::{
+    AcpAdapter, AdapterError, AdapterHost, AdapterResult, AgentAdapter, AgyAdapter, RelayHost,
+    RelayPermissionAnswer, parse_command_line,
+};
+use codeswarm_adapters::{AgentEvent, BufferedEventLog, EventLog};
 use crossterm::{
     cursor::Show,
     event::{
@@ -1103,7 +1103,7 @@ fn standalone_session_metadata(
 }
 
 fn queue_standalone_metadata(
-    writer: Option<&codeswarm_core::persistence::BufferedSessionMetadataStore>,
+    writer: Option<&codeswarm_adapters::persistence::BufferedSessionMetadataStore>,
     cwd: &Path,
     name: &str,
     identity: &str,
@@ -1125,7 +1125,7 @@ fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std:
     let catalog = catalog_from_settings(&settings);
     let saved_roster = parse_saved_roster(&settings);
     let has_saved_roster = !saved_roster.is_empty();
-    let mut launchable_catalog = codeswarm_core::agents::active_catalog(catalog);
+    let mut launchable_catalog = codeswarm_adapters::agents::active_catalog(catalog);
     launchable_catalog.sort_by_key(|agent| {
         saved_roster
             .iter()
@@ -1437,7 +1437,7 @@ fn load_config_agents(app: &mut App) {
         .into_iter()
         .filter_map(|slot| app.agent_identity(slot).map(str::to_owned))
         .collect::<Vec<_>>();
-    let mut catalog = codeswarm_core::agents::active_catalog(catalog_from_settings(&settings));
+    let mut catalog = codeswarm_adapters::agents::active_catalog(catalog_from_settings(&settings));
     catalog.sort_by_key(|agent| {
         saved
             .iter()
@@ -1885,7 +1885,7 @@ fn sanitize_direct_event(event: AgentEvent, response_tail: &mut String) -> Vec<A
     match event {
         AgentEvent::Text { slot, text } => {
             response_tail.push_str(&text);
-            let token = codeswarm_core::relay::STOP_TOKEN;
+            let token = codeswarm_adapters::relay::STOP_TOKEN;
             let keep = token.len().saturating_sub(1);
             loop {
                 if let Some(index) = response_tail.find(token) {
@@ -1911,7 +1911,8 @@ fn sanitize_direct_event(event: AgentEvent, response_tail: &mut String) -> Vec<A
             }
         }
         AgentEvent::TurnComplete { slot } => {
-            let text = std::mem::take(response_tail).replace(codeswarm_core::relay::STOP_TOKEN, "");
+            let text =
+                std::mem::take(response_tail).replace(codeswarm_adapters::relay::STOP_TOKEN, "");
             if !text.is_empty() {
                 visible.push(AgentEvent::Text { slot, text });
             }
@@ -1989,7 +1990,7 @@ fn run_agy_task(
         }
         if adapter.capabilities().supports_modes
             && let Err(error) = adapter
-                .set_mode(codeswarm_core::policy::DEFAULT_POLICY_ID.into())
+                .set_mode(codeswarm_adapters::policy::DEFAULT_POLICY_ID.into())
                 .await
         {
             let _ = sender.send(Err(error));
@@ -2185,7 +2186,7 @@ fn run_acp_task(
         }
         if adapter.capabilities().supports_modes
             && let Err(error) = adapter
-                .set_mode(codeswarm_core::policy::DEFAULT_POLICY_ID.into())
+                .set_mode(codeswarm_adapters::policy::DEFAULT_POLICY_ID.into())
                 .await
         {
             let _ = sender.send(Err(error));
@@ -2669,7 +2670,7 @@ fn run_relay_task(
                 Some(AdapterControl::Reload(slot)) => {
                     if let Err(error) = relay.reload(slot).await {
                         let _ = sender.send(Ok(AgentEvent::RosterUpdated {
-                            update: codeswarm_core::RosterUpdate::Rejected {
+                            update: codeswarm_adapters::RosterUpdate::Rejected {
                                 action: format!("reload agent {slot}"),
                                 detail: error.to_string(),
                             },
@@ -2679,7 +2680,7 @@ fn run_relay_task(
                 Some(AdapterControl::Drop(slot)) => {
                     if let Err(error) = relay.drop_agent(slot).await {
                         let _ = sender.send(Ok(AgentEvent::RosterUpdated {
-                            update: codeswarm_core::RosterUpdate::Rejected {
+                            update: codeswarm_adapters::RosterUpdate::Rejected {
                                 action: format!("drop agent {slot}"),
                                 detail: error.to_string(),
                             },
@@ -2689,7 +2690,7 @@ fn run_relay_task(
                 Some(AdapterControl::Swap(first, second)) => {
                     if let Err(error) = relay.swap_agents(first, second) {
                         let _ = sender.send(Ok(AgentEvent::RosterUpdated {
-                            update: codeswarm_core::RosterUpdate::Rejected {
+                            update: codeswarm_adapters::RosterUpdate::Rejected {
                                 action: format!("swap agents {first} and {second}"),
                                 detail: error.to_string(),
                             },
@@ -2731,7 +2732,7 @@ fn run_relay_task(
                                 .await
                             {
                                 let _ = sender.send(Ok(AgentEvent::RosterUpdated {
-                                    update: codeswarm_core::RosterUpdate::Rejected {
+                                    update: codeswarm_adapters::RosterUpdate::Rejected {
                                         action: "add agent".into(),
                                         detail: error.to_string(),
                                     },
@@ -2740,7 +2741,7 @@ fn run_relay_task(
                         }
                         Err(error) => {
                             let _ = sender.send(Ok(AgentEvent::RosterUpdated {
-                                update: codeswarm_core::RosterUpdate::Rejected {
+                                update: codeswarm_adapters::RosterUpdate::Rejected {
                                     action: "add agent".into(),
                                     detail: error.to_string(),
                                 },
@@ -2825,10 +2826,11 @@ fn run_terminal(
                     Ok(event) => {
                         match &event {
                             AgentEvent::RosterUpdated { update } => match update {
-                                codeswarm_core::RosterUpdate::Added { slot, identity, .. }
-                                    if pending_first.as_ref().is_some_and(|first| {
-                                        first.eq_ignore_ascii_case(identity)
-                                    }) =>
+                                codeswarm_adapters::RosterUpdate::Added {
+                                    slot, identity, ..
+                                } if pending_first
+                                    .as_ref()
+                                    .is_some_and(|first| first.eq_ignore_ascii_case(identity)) =>
                                 {
                                     let first_live =
                                         app.active_roster_slots().first().copied().unwrap_or(0);
@@ -2842,7 +2844,7 @@ fn run_terminal(
                                                 .into();
                                     }
                                 }
-                                codeswarm_core::RosterUpdate::Swapped { first, second } => {
+                                codeswarm_adapters::RosterUpdate::Swapped { first, second } => {
                                     pending_first = None;
                                     if selected_slot == Some(*first) {
                                         selected_slot = Some(*second);
@@ -2850,7 +2852,7 @@ fn run_terminal(
                                         selected_slot = Some(*first);
                                     }
                                 }
-                                codeswarm_core::RosterUpdate::Rejected { .. } => {
+                                codeswarm_adapters::RosterUpdate::Rejected { .. } => {
                                     config_reconcile_pending = false;
                                     pending_first = None;
                                 }
@@ -3741,12 +3743,12 @@ mod tests {
         standalone_session_metadata, terminal_capture_enabled_for, validate_project_directory,
     };
     use async_trait::async_trait;
+    use codeswarm::tui::{App, ConfigKey, PermissionAction, QueuedPrompt, StoreAgent};
+    use codeswarm_adapters::persistence::{SessionMetadata, SessionMetadataStore};
     use codeswarm_adapters::{
         AdapterHost, AdapterResult, AgentAdapter, RelayHost, ScriptedAdapter,
     };
-    use codeswarm_core::persistence::{SessionMetadata, SessionMetadataStore};
-    use codeswarm_core::{AgentCapabilities, AgentEvent, PermissionAnswer};
-    use codeswarm_tui::{App, ConfigKey, PermissionAction, QueuedPrompt, StoreAgent};
+    use codeswarm_adapters::{AgentCapabilities, AgentEvent, PermissionAnswer};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
     use std::ffi::OsStr;
     use std::path::PathBuf;
@@ -3932,7 +3934,7 @@ mod tests {
     fn wheel_event_moves_the_real_transcript_viewport() {
         let mut app = App::default();
         app.transcript.append(
-            codeswarm_transcript::BlockKind::Agent,
+            codeswarm::transcript::BlockKind::Agent,
             (0..300)
                 .map(|index| format!("word{index}"))
                 .collect::<Vec<_>>()
@@ -3959,7 +3961,7 @@ mod tests {
     fn arrow_fallback_moves_the_real_transcript_viewport() {
         let mut app = App::default();
         app.transcript.append(
-            codeswarm_transcript::BlockKind::Agent,
+            codeswarm::transcript::BlockKind::Agent,
             (0..300)
                 .map(|index| format!("word{index}"))
                 .collect::<Vec<_>>()
@@ -4023,7 +4025,7 @@ mod tests {
 
     #[test]
     fn dropped_routing_target_falls_back_and_roster_override_is_one_shot() {
-        let mut app = codeswarm_tui::App::default();
+        let mut app = codeswarm::tui::App::default();
         app.set_agent_name(0, "Owner");
         app.set_agent_name(1, "Peer");
         app.mark_agent_dropped(1);
@@ -4222,13 +4224,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let current = root.join("new/prompt_history.jsonl");
         let legacy = root.join("old/prompt_history.jsonl");
-        codeswarm_core::history::append(&legacy, "first").expect("legacy first");
-        codeswarm_core::history::append(&legacy, "second").expect("legacy second");
+        codeswarm_adapters::history::append(&legacy, "first").expect("legacy first");
+        codeswarm_adapters::history::append(&legacy, "second").expect("legacy second");
         assert_eq!(
             load_prompt_history_from(&current, &legacy),
             ["first", "second"]
         );
-        codeswarm_core::history::append(&current, "third").expect("new prompt");
+        codeswarm_adapters::history::append(&current, "third").expect("new prompt");
         assert_eq!(
             load_prompt_history_from(&current, &legacy),
             ["first", "second", "third"]
@@ -4372,8 +4374,8 @@ mod tests {
                 "session_id": "session-42"
             }]),
         );
-        codeswarm_core::persistence::SessionMetadataStore::open(&metadata_path)
-            .write(&codeswarm_core::persistence::SessionMetadata::new(data))
+        codeswarm_adapters::persistence::SessionMetadataStore::open(&metadata_path)
+            .write(&codeswarm_adapters::persistence::SessionMetadata::new(data))
             .expect("write metadata");
         assert_eq!(
             super::load_agent_session_id_from(&metadata_path, &root, "openai.com"),
@@ -4446,7 +4448,7 @@ mod tests {
 
     #[test]
     fn catalog_native_launch_preserves_full_access_startup_argument() {
-        let catalog = codeswarm_core::agents::default_catalog();
+        let catalog = codeswarm_adapters::agents::default_catalog();
         let antigravity = catalog
             .iter()
             .find(|agent| agent.identity == "antigravity.google.com")
@@ -4459,7 +4461,7 @@ mod tests {
 
     #[test]
     fn config_roster_reconciliation_swaps_selected_live_first_agent() {
-        let mut app = codeswarm_tui::App::default();
+        let mut app = codeswarm::tui::App::default();
         app.set_agent_name(0, "Claude");
         app.set_agent_name(1, "Codex");
         app.set_agent_identity(0, "anthropic.com");
@@ -4487,7 +4489,7 @@ mod tests {
 
     #[test]
     fn config_roster_reconciliation_uses_identity_for_duplicate_names() {
-        let mut app = codeswarm_tui::App::default();
+        let mut app = codeswarm::tui::App::default();
         app.set_agent_name(0, "Reviewer");
         app.set_agent_identity(0, "first.example");
         app.set_agent_name(1, "Reviewer");
@@ -4523,7 +4525,7 @@ mod tests {
 
     #[test]
     fn reordering_live_first_agent_swaps_without_recreating_either_agent() {
-        let mut app = codeswarm_tui::App::default();
+        let mut app = codeswarm::tui::App::default();
         app.set_agent_name(0, "Codex");
         app.set_agent_identity(0, "openai.com");
         app.set_agent_name(1, "Qwen");
@@ -4557,7 +4559,7 @@ mod tests {
         ));
 
         app.apply_event(&AgentEvent::RosterUpdated {
-            update: codeswarm_core::RosterUpdate::Swapped {
+            update: codeswarm_adapters::RosterUpdate::Swapped {
                 first: 0,
                 second: 1,
             },
@@ -4571,7 +4573,7 @@ mod tests {
 
     #[test]
     fn config_roster_reconciliation_starts_a_new_first_agent_before_reorder() {
-        let mut app = codeswarm_tui::App::default();
+        let mut app = codeswarm::tui::App::default();
         app.set_agent_name(0, "Claude");
         app.set_agent_name(1, "Gemini");
         app.set_agent_identity(0, "anthropic.com");
@@ -4599,7 +4601,7 @@ mod tests {
 
     #[test]
     fn config_roster_reconciliation_hot_adds_to_a_single_agent_session() {
-        let mut app = codeswarm_tui::App::default();
+        let mut app = codeswarm::tui::App::default();
         app.set_agent_name(0, "Codex");
         app.set_agent_identity(0, "openai.com");
         app.set_config_agents(vec![
@@ -4633,7 +4635,7 @@ mod tests {
 
     #[test]
     fn config_order_drives_live_roster_and_pair_peer_order() {
-        let mut app = codeswarm_tui::App::default();
+        let mut app = codeswarm::tui::App::default();
         for (slot, name, identity) in [
             (0, "Codex", "openai.com"),
             (1, "Qwen", "qwen.ai"),
@@ -4758,7 +4760,7 @@ mod tests {
 
     #[test]
     fn notification_settings_load_with_python_and_rust_key_shapes() {
-        let mut app = codeswarm_tui::App::default();
+        let mut app = codeswarm::tui::App::default();
         apply_notification_preferences(
             &mut app,
             &serde_json::json!({"notifications": {"system": "always", "enabled": false}}),
@@ -5005,7 +5007,7 @@ mod tests {
                     [
                         AgentEvent::Text {
                             slot: 1,
-                            text: codeswarm_core::relay::STOP_TOKEN.into(),
+                            text: codeswarm_adapters::relay::STOP_TOKEN.into(),
                         },
                         AgentEvent::TurnComplete { slot: 1 },
                     ],
@@ -5038,7 +5040,7 @@ mod tests {
         );
         assert_eq!(
             relay.run_turn("", 0).await.expect("stopped batch"),
-            codeswarm_core::relay::RelayDecision::Complete
+            codeswarm_adapters::relay::RelayDecision::Complete
         );
     }
 
@@ -5056,7 +5058,7 @@ mod tests {
 
     #[test]
     fn standalone_stop_token_is_hidden_even_when_split_across_chunks() {
-        let token = codeswarm_core::relay::STOP_TOKEN;
+        let token = codeswarm_adapters::relay::STOP_TOKEN;
         let mut tail = String::new();
         let mut output = Vec::new();
         output.extend(sanitize_direct_event(

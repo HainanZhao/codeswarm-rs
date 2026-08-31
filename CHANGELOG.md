@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-31
+
+### Changed
+
+- Consolidated CodeSwarm into the `codeswarm` application package and the
+  reusable `codeswarm-adapters` library. Transcript and TUI implementation
+  modules are no longer independently published packages.
+
 ## [0.7.5] - 2026-08-31
 
 ### Fixed

@@ -1,19 +1,20 @@
 # Rust terminal architecture
 
-CodeSwarm is now a Rust-only Cargo workspace. The production entry point is
+CodeSwarm is now a two-package Rust Cargo workspace. The production entry point is
 `codeswarm`, backed by Ratatui and Crossterm.
 
-## Workspace boundaries
+## Package and module boundaries
 
-- `codeswarm-core` owns normalized events, relay scheduling, policies,
-  persistence, and adapter-independent contracts.
-- `codeswarm-adapters` owns ACP and native adapter implementations.
-- `codeswarm-transcript` owns logical blocks, Markdown export, wrapping, and
+- `codeswarm-adapters` is the reusable package for normalized events, relay
+  scheduling, policies, persistence, adapter-independent contracts, and ACP
+  and native adapter implementations.
+- The `codeswarm` application package keeps `transcript` as an internal module
+  for logical blocks, Markdown export, wrapping, and
   cached viewport rows.
-- `codeswarm-tui` owns prompt editing, config/help surfaces, permissions, and
+- Its internal `tui` module owns prompt editing, config/help surfaces, permissions, and
   low-churn rendering.
-- the `codeswarm` package owns process startup, terminal input, adapter lifecycle, and
-  command routing.
+- the `codeswarm` binary owns process startup, terminal input, adapter
+  lifecycle, and command routing.
 
 The renderer uses a guarded full-screen alternate screen. The transcript path
 is viewport-bounded: long streamed responses do not cause a full-history
