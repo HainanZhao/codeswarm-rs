@@ -1450,7 +1450,7 @@ impl RelayHost {
         self.dispatches.push((*slot, prompt));
         let mut response = String::new();
         let mut emitted_text = 0usize;
-        loop {
+        let completion_event = loop {
             if self.cancel_requested.swap(false, Ordering::AcqRel) {
                 if let Err(error) = cancel_with_timeout(host).await {
                     report_relay_failure(
@@ -1542,11 +1542,8 @@ impl RelayHost {
                             text: visible_response[visible_start..].to_owned(),
                         });
                     }
-                    if let Some(sink) = &self.event_sink {
-                        sink(update.event.clone());
-                    }
                     self.cancel_requested.store(false, Ordering::Release);
-                    break;
+                    break update.event.clone();
                 }
                 AgentEvent::Failed {
                     started, detail, ..
@@ -1582,11 +1579,12 @@ impl RelayHost {
             } else if let Some(sink) = &self.event_sink {
                 sink(update.event.clone());
             }
-        }
+        };
         let (response, requested_stop) = strip_stop_token(&response);
         let response = response.replace(STOP_TOKEN, "");
         let accepted_stop = requested_stop && *can_stop;
-        let response = if accepted_stop && response.is_empty() {
+        let needs_stop_acknowledgment = accepted_stop && response.is_empty();
+        let response = if needs_stop_acknowledgment {
             DEFAULT_STOP_ACKNOWLEDGMENT.to_owned()
         } else {
             response
@@ -1595,14 +1593,14 @@ impl RelayHost {
         // UI still needs the documented visible acknowledgement. Streamed
         // text is normally emitted above; this synthetic acknowledgement is
         // the one case where there was no visible adapter chunk to forward.
-        if accepted_stop
-            && response == DEFAULT_STOP_ACKNOWLEDGMENT
-            && let Some(sink) = &self.event_sink
-        {
+        if needs_stop_acknowledgment && let Some(sink) = &self.event_sink {
             sink(AgentEvent::Text {
                 slot: *slot,
                 text: response.clone(),
             });
+        }
+        if let Some(sink) = &self.event_sink {
+            sink(completion_event);
         }
         if !*direct && !response.is_empty() {
             self.relay
@@ -5358,6 +5356,72 @@ mod tests {
             AgentEvent::Text { text, .. } => !text.contains(STOP_TOKEN),
             _ => true,
         }));
+        let acknowledgment = captured
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::Text { slot: 1, text } if text == DEFAULT_STOP_ACKNOWLEDGMENT
+                )
+            })
+            .expect("visible acknowledgment");
+        let completion = captured
+            .iter()
+            .position(|event| matches!(event, AgentEvent::TurnComplete { slot: 1 }))
+            .expect("reviewer completion");
+        assert!(acknowledgment < completion);
+    }
+
+    #[tokio::test]
+    async fn explicit_reviewer_acknowledgment_is_not_duplicated_at_stop() {
+        let first = ScriptedAdapter::new(
+            0,
+            AgentCapabilities::default(),
+            [
+                AgentEvent::Text {
+                    slot: 0,
+                    text: "done".into(),
+                },
+                AgentEvent::TurnComplete { slot: 0 },
+            ],
+        );
+        let reviewer = ScriptedAdapter::new(
+            1,
+            AgentCapabilities::default(),
+            [
+                AgentEvent::Text {
+                    slot: 1,
+                    text: format!("{DEFAULT_STOP_ACKNOWLEDGMENT}\n{STOP_TOKEN}"),
+                },
+                AgentEvent::TurnComplete { slot: 1 },
+            ],
+        );
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&events);
+        let mut relay = RelayHost::new(
+            vec![
+                AdapterHost::new(Box::new(first), None),
+                AdapterHost::new(Box::new(reviewer), None),
+            ],
+            4,
+        )
+        .expect("relay");
+        relay.set_event_sink(move |event| captured.lock().expect("lock").push(event));
+        relay.start().await.expect("start");
+        relay.run_turn("task", 0).await.expect("first turn");
+        relay.run_turn("", 0).await.expect("review turn");
+
+        let visible = events
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Text { slot: 1, text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(visible.trim(), DEFAULT_STOP_ACKNOWLEDGMENT);
+        assert_eq!(visible.matches(DEFAULT_STOP_ACKNOWLEDGMENT).count(), 1);
     }
 
     #[tokio::test]
