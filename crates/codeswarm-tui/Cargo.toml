@@ -7,8 +7,8 @@ repository.workspace = true
 description.workspace = true
 
 [dependencies]
-codeswarm-core = { version = "=0.7.3", path = "../codeswarm-core" }
-codeswarm-transcript = { version = "=0.7.3", path = "../codeswarm-transcript" }
+codeswarm-core = { version = "=0.7.4", path = "../codeswarm-core" }
+codeswarm-transcript = { version = "=0.7.4", path = "../codeswarm-transcript" }
 ratatui.workspace = true
 time.workspace = true
 tui-textarea-2 = { version = "0.13.2", default-features = false, features = ["ratatui", "crossterm"] }

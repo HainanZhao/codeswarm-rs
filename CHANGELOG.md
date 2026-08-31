@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-08-31
+
+### Fixed
+
+- Standalone Gemini/ACP and Antigravity cancellations now always terminate the
+  visible turn, clear the footer timer and `cancelling` state, and discard any
+  buffered partial response before the next prompt.
+
 ## [0.7.3] - 2026-08-31
 
 ### Changed

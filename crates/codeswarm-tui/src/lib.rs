@@ -1811,6 +1811,10 @@ impl App {
         self.status = "cancelling".into();
     }
 
+    pub fn cancellation_pending(&self) -> bool {
+        !self.cancelling_agents.is_empty()
+    }
+
     pub fn finish_turn_cancellation(&mut self) {
         for slot in std::mem::take(&mut self.cancelling_agents) {
             self.agent_turn_started.remove(&slot);
@@ -5759,11 +5763,13 @@ mod tests {
         assert!(footer_agent_label(&app, 0, 1).contains("· 0:00"));
 
         app.request_turn_cancellation();
+        assert!(app.cancellation_pending());
         let cancelling = footer_agent_label(&app, 0, 1);
         assert!(cancelling.contains("· cancelling"));
         assert!(!cancelling.contains("0:00"));
 
         app.finish_turn_cancellation();
+        assert!(!app.cancellation_pending());
         let cancelled = footer_agent_label(&app, 0, 1);
         assert!(!cancelled.contains("cancelling"));
         assert!(!cancelled.contains("0:00"));

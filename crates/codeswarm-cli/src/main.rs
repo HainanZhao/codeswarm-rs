@@ -1922,6 +1922,33 @@ fn sanitize_direct_event(event: AgentEvent, response_tail: &mut String) -> Vec<A
     visible
 }
 
+async fn cancel_standalone_turn(
+    adapter: &mut dyn AgentAdapter,
+    sender: &Sender<AdapterResult<AgentEvent>>,
+    response_tail: &mut String,
+) {
+    // ACP and native adapters may consume their provider completion while
+    // waiting for cancellation to settle. Always publish one terminal result
+    // to the UI ourselves, and discard text held back by direct-turn token
+    // sanitization so it cannot leak into the next prompt.
+    response_tail.clear();
+    let result = match adapter.cancel().await {
+        Ok(true) => AdapterError::Transport("standalone turn cancelled".into()),
+        Ok(false) => AdapterError::Unsupported("adapter did not accept cancellation"),
+        Err(error) => error,
+    };
+    let _ = sender.send(Err(result));
+}
+
+fn finish_pending_cancellation(app: &mut App, error_text: &str) -> bool {
+    let cancelled =
+        app.cancellation_pending() || error_text.to_ascii_lowercase().contains("cancelled");
+    if cancelled {
+        app.finish_turn_cancellation();
+    }
+    cancelled
+}
+
 fn run_agy_task(
     sender: Sender<AdapterResult<AgentEvent>>,
     mut controls: tokio::sync::mpsc::UnboundedReceiver<AdapterControl>,
@@ -2032,9 +2059,7 @@ fn run_agy_task(
                         }
                     }
                     Some(AdapterControl::Cancel) => {
-                        if let Err(error) = adapter.cancel().await {
-                            let _ = sender.send(Err(error));
-                        }
+                        cancel_standalone_turn(&mut adapter, &sender, &mut response_tail).await;
                     }
                     Some(AdapterControl::Permission { request_id, answer, .. }) => {
                         if let Err(error) = adapter.answer_permission(request_id, answer).await {
@@ -2230,9 +2255,7 @@ fn run_acp_task(
                         }
                     }
                     Some(AdapterControl::Cancel) => {
-                        if let Err(error) = adapter.cancel().await {
-                            let _ = sender.send(Err(error));
-                        }
+                        cancel_standalone_turn(&mut adapter, &sender, &mut response_tail).await;
                     }
                     Some(AdapterControl::Permission { request_id, answer, .. }) => {
                         if let Err(error) = adapter.answer_permission(request_id, answer).await {
@@ -2976,10 +2999,7 @@ fn run_terminal(
                         pending_permission = None;
                         app.clear_terminal_alerts();
                         mode_sync_in_flight = None;
-                        let cancelled = error_text.to_ascii_lowercase().contains("cancelled");
-                        if cancelled {
-                            app.finish_turn_cancellation();
-                        }
+                        let cancelled = finish_pending_cancellation(app, &error_text);
                         if !cancelled && app.failed_agent().is_none() {
                             let active_agent = app.active_agent.clone();
                             app.set_header(active_agent, format!("error: {error_text}"));
@@ -3711,14 +3731,14 @@ mod tests {
     use super::{
         AdapterControl, AgentSpec, ConfigInputDecoder, Launch, apply_mouse_scroll,
         apply_navigation_scroll, apply_notification_preferences, bare_launch_from_settings,
-        consume_one_shot_route, dispatch_permission_action, dispatch_queued_prompt,
-        interaction_height, load_prompt_history_from, load_session_metadata_candidates,
-        mouse_scroll_delta, normalize_arguments, normalize_selected_slot, parse_launch,
-        prepare_launch_arguments, program_available, project_dir_argument,
-        project_prompt_history_path, reconcile_config_roster, restore_mouse_after_selection_window,
-        resume_launch_from_metadata, run_relay_sequence_with_controls, sanitize_direct_event,
-        session_metadata_path_for, standalone_session_metadata, terminal_capture_enabled_for,
-        validate_project_directory,
+        cancel_standalone_turn, consume_one_shot_route, dispatch_permission_action,
+        dispatch_queued_prompt, finish_pending_cancellation, interaction_height,
+        load_prompt_history_from, load_session_metadata_candidates, mouse_scroll_delta,
+        normalize_arguments, normalize_selected_slot, parse_launch, prepare_launch_arguments,
+        program_available, project_dir_argument, project_prompt_history_path,
+        reconcile_config_roster, restore_mouse_after_selection_window, resume_launch_from_metadata,
+        run_relay_sequence_with_controls, sanitize_direct_event, session_metadata_path_for,
+        standalone_session_metadata, terminal_capture_enabled_for, validate_project_directory,
     };
     use async_trait::async_trait;
     use codeswarm_adapters::{
@@ -4753,6 +4773,44 @@ mod tests {
         assert_eq!(app.notification_policy().as_str(), "blur");
         app.set_terminal_focused(false);
         assert!(app.should_notify_system());
+    }
+
+    #[tokio::test]
+    async fn standalone_cancel_reports_a_terminal_result_and_discards_buffered_text() {
+        let mut adapter = ScriptedAdapter::new(
+            0,
+            AgentCapabilities {
+                supports_cancel: true,
+                ..AgentCapabilities::default()
+            },
+            [AgentEvent::TurnComplete { slot: 0 }],
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut response_tail = "buffered response".to_owned();
+
+        cancel_standalone_turn(&mut adapter, &sender, &mut response_tail).await;
+
+        assert!(response_tail.is_empty());
+        assert!(matches!(
+            receiver.recv().expect("cancel result"),
+            Err(codeswarm_adapters::AdapterError::Transport(detail))
+                if detail == "standalone turn cancelled"
+        ));
+    }
+
+    #[test]
+    fn adapter_error_during_pending_cancel_clears_the_ui_timer() {
+        let mut app = App::default();
+        app.apply_event(&AgentEvent::TurnStarted { slot: 0 });
+        app.request_turn_cancellation();
+        assert!(app.cancellation_pending());
+
+        assert!(finish_pending_cancellation(
+            &mut app,
+            "adapter cancellation timed out"
+        ));
+        assert!(!app.cancellation_pending());
+        assert_eq!(app.status, "cancelled");
     }
 
     #[tokio::test]
