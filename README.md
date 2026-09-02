@@ -113,7 +113,7 @@ Inside the conversation prompt:
 
 - `/help` shows keyboard and command help.
 - `/config` opens settings, including the
-  slot-based roster editor (Enter adds/removes a slot, ←/→ selects that
+  slot-based roster editor (Space adds/removes a slot, ←/→ selects that
   running slot's model, Alt+↑/↓ reorders, Ctrl+S saves
   and applies idle-session changes when possible).
 - `/export` writes the retained conversation to Markdown.

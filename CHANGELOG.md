@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-09-02
+
+### Changed
+
+- Space toggles roster slots in the configuration screen; Enter remains the
+  control for changing ordinary settings.
+
+### Fixed
+
+- Model selections wait for the target slot to advertise model support,
+  unchanged selections are not resent, and an optional `set_model` rejection
+  stays in the status ribbon instead of flashing the first agent's footer.
+
 ## [0.8.5] - 2026-09-02
 
 ### Fixed

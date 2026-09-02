@@ -156,6 +156,7 @@ impl ConfigInputDecoder {
             KeyCode::Down => Some(ConfigKey::Down),
             KeyCode::Left => Some(ConfigKey::PreviousValue),
             KeyCode::Right => Some(ConfigKey::NextValue),
+            KeyCode::Char(' ') => Some(ConfigKey::ToggleSlot),
             KeyCode::Enter => Some(ConfigKey::Confirm),
             KeyCode::Esc => {
                 self.escape_at = Some(now);
@@ -2659,7 +2660,12 @@ fn run_relay_task(
             if let Some(model) = model
                 && let Err(error) = relay.set_model(slot, model).await
             {
-                let _ = sender.send(Err(error));
+                let _ = sender.send(Ok(AgentEvent::RosterUpdated {
+                    update: codeswarm_adapters::RosterUpdate::Rejected {
+                        action: format!("set model for agent {slot}"),
+                        detail: error.to_string(),
+                    },
+                }));
             }
         }
         let mut pending_commands = VecDeque::new();
@@ -2772,7 +2778,12 @@ fn run_relay_task(
                 }
                 Some(AdapterControl::SetModel { slot, model }) => {
                     if let Err(error) = relay.set_model(slot, model).await {
-                        let _ = sender.send(Err(error));
+                        let _ = sender.send(Ok(AgentEvent::RosterUpdated {
+                            update: codeswarm_adapters::RosterUpdate::Rejected {
+                                action: format!("set model for agent {slot}"),
+                                detail: error.to_string(),
+                            },
+                        }));
                     }
                 }
                 Some(AdapterControl::Reload(slot)) => {
@@ -3028,6 +3039,13 @@ fn run_terminal(
                             }
                         }
                         app.apply_event(&event);
+                        if matches!(&event, AgentEvent::ModelsReplaced { .. })
+                            && let Some(controls) = &controls
+                        {
+                            for (slot, model) in app.take_config_model_changes() {
+                                let _ = controls.send(AdapterControl::SetModel { slot, model });
+                            }
+                        }
                         if matches!(
                             &event,
                             AgentEvent::ModesReplaced { .. } | AgentEvent::ModeUpdated { .. }
@@ -3071,10 +3089,6 @@ fn run_terminal(
                                         Err(error) => {
                                             app.status = format!("unable to save roster: {error}");
                                         }
-                                    }
-                                    for (slot, model) in app.take_config_model_changes() {
-                                        let _ =
-                                            controls.send(AdapterControl::SetModel { slot, model });
                                     }
                                 }
                                 Ok(false) => {}
@@ -4044,6 +4058,10 @@ mod tests {
         assert_eq!(
             decoder.decode(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), now),
             Some(ConfigKey::NextValue)
+        );
+        assert_eq!(
+            decoder.decode(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), now),
+            Some(ConfigKey::ToggleSlot)
         );
         let mut decoder = ConfigInputDecoder::new(Duration::from_millis(650));
         assert_eq!(

@@ -113,6 +113,7 @@ pub enum ConfigKey {
     NextValue,
     MoveUp,
     MoveDown,
+    ToggleSlot,
     Confirm,
     Save,
     Cancel,
@@ -1102,7 +1103,11 @@ impl App {
             .filter(|agent| agent.selected)
             .enumerate()
             .filter_map(|(position, agent)| {
-                Some((*live_slots.get(position)?, agent.model.clone()?))
+                let slot = *live_slots.get(position)?;
+                let model = agent.model.clone()?;
+                let (_, _, current) = self.agent_models.get(&slot)?;
+                let current = current.as_ref();
+                (current != Some(&model)).then_some((slot, model))
             })
             .collect()
     }
@@ -1512,35 +1517,41 @@ impl App {
                 self.config_roster_dirty = true;
                 ConfigAction::Changed
             }
+            ConfigKey::ToggleSlot => {
+                if self.config_selected < CONFIG_SETTING_COUNT {
+                    return ConfigAction::Ignored;
+                }
+                let index = self.config_selected - CONFIG_SETTING_COUNT;
+                if let Some(agent) = self.config_agents.get(index).cloned() {
+                    if agent.selected {
+                        self.config_agents.remove(index);
+                        self.config_selected = self
+                            .config_selected
+                            .min(CONFIG_SETTING_COUNT + self.config_agents.len().saturating_sub(1));
+                    } else {
+                        let mut slot = agent.clone();
+                        slot.selected = true;
+                        slot.model = None;
+                        let insert_at = self
+                            .config_agents
+                            .iter()
+                            .position(|agent| !agent.selected)
+                            .unwrap_or(self.config_agents.len());
+                        self.config_agents.insert(insert_at, slot);
+                        self.config_selected = CONFIG_SETTING_COUNT + insert_at;
+                    }
+                    self.config_roster_dirty = true;
+                    self.status = if agent.selected {
+                        format!("{} slot removed", agent.name)
+                    } else {
+                        format!("{} slot added", agent.name)
+                    };
+                }
+                ConfigAction::Changed
+            }
             ConfigKey::Confirm => {
                 if self.config_selected >= CONFIG_SETTING_COUNT {
-                    let index = self.config_selected - CONFIG_SETTING_COUNT;
-                    if let Some(agent) = self.config_agents.get(index).cloned() {
-                        if agent.selected {
-                            self.config_agents.remove(index);
-                            self.config_selected = self.config_selected.min(
-                                CONFIG_SETTING_COUNT + self.config_agents.len().saturating_sub(1),
-                            );
-                        } else {
-                            let mut slot = agent.clone();
-                            slot.selected = true;
-                            slot.model = None;
-                            let insert_at = self
-                                .config_agents
-                                .iter()
-                                .position(|agent| !agent.selected)
-                                .unwrap_or(self.config_agents.len());
-                            self.config_agents.insert(insert_at, slot);
-                            self.config_selected = CONFIG_SETTING_COUNT + insert_at;
-                        }
-                        self.config_roster_dirty = true;
-                        self.status = if agent.selected {
-                            format!("{} slot removed", agent.name)
-                        } else {
-                            format!("{} slot added", agent.name)
-                        };
-                    }
-                    return ConfigAction::Changed;
+                    return ConfigAction::Ignored;
                 }
                 match self.config_selected {
                     0 => self.follow_tail = !self.follow_tail,
@@ -4061,7 +4072,7 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
             if app.blink_title { "On" } else { "Off" },
             true,
         ),
-        ("Roster", "Enter toggle · Alt/Shift+↑/↓ or [ ] order", false),
+        ("Roster", "Space toggle · Alt/Shift+↑/↓ or [ ] order", false),
     ];
     let total_rows = rows.len().saturating_add(app.config_agents.len());
     let mut lines = Vec::with_capacity(total_rows + 3);
@@ -4180,7 +4191,7 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
     let actions = if compact {
         " Ctrl+S Save · Esc Discard"
     } else {
-        " Ctrl+S Save · Esc Discard · Enter Change · ↑/↓ Navigate · ←/→ Model · Alt/Shift+↑/↓ or [ ] Order"
+        " Ctrl+S Save · Esc Discard · Space Toggle · Enter Change · ↑/↓ Navigate · ←/→ Model · Alt/Shift+↑/↓ or [ ] Order"
     };
     lines.push(Line::styled(
         format!("{actions}  ({}/{})", app.config_selected + 1, total_rows),
@@ -6235,7 +6246,7 @@ mod tests {
             app.handle_config_key(ConfigKey::Down);
         }
         assert_eq!(
-            app.handle_config_key(ConfigKey::Confirm),
+            app.handle_config_key(ConfigKey::ToggleSlot),
             ConfigAction::Changed
         );
         assert_eq!(
@@ -6354,10 +6365,7 @@ mod tests {
             app.handle_config_key(ConfigKey::PreviousValue),
             ConfigAction::Changed
         );
-        assert_eq!(
-            app.take_config_model_changes(),
-            vec![(0, "sonnet".into()), (1, "sonnet".into())]
-        );
+        assert_eq!(app.take_config_model_changes(), vec![(1, "sonnet".into())]);
         assert_eq!(
             app.config_roster_slots()[1].model.as_deref(),
             Some("sonnet")
