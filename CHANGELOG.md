@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.10] - 2026-09-02
+
+### Changed
+
+- Collapsed thought streams use a fixed-width character window that slides
+  left as new text arrives. Collapsed tool calls use one row with the latest
+  tool title/status and newest output line, share the muted thought color, and
+  show the turn's cumulative tool-call count on completion. Full details
+  remain available through `Ctrl+O open`.
+
+### Fixed
+
+- Every fresh unaddressed question in Roster mode starts with the first active
+  slot, while input submitted during active work still returns to that agent
+  before the current review batch advances.
+
 ## [0.8.9] - 2026-09-02
 
 ### Changed

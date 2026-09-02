@@ -300,13 +300,13 @@ impl Transcript {
     }
 }
 
-/// Compact stand-in for a collapsed block. Thoughts and tools may use up to
-/// two rows; other details remain on one. Interaction hints are added by the
-/// TUI only to the detail row that its Ctrl+O binding currently targets.
+/// Compact stand-in for a collapsed block. Thoughts stay on one sliding row,
+/// tools may use two, and other details remain on one. Interaction hints are
+/// added by the TUI only to the detail row its Ctrl+O binding currently targets.
 fn collapsed_preview(block: &TranscriptBlock, width: usize) -> String {
     match block.kind {
         BlockKind::Thought => return collapsed_thought_preview(block, width),
-        BlockKind::Tool => return collapsed_activity_preview(block, width, "Tool", 2),
+        BlockKind::Tool => return collapsed_activity_preview(block, width, "Tool", 1),
         BlockKind::Diff => return collapsed_activity_preview(block, width, "Diff", 1),
         _ => {}
     }
@@ -324,7 +324,6 @@ fn attributed_message(source: &str) -> Option<(&str, &str, &str)> {
 }
 
 fn collapsed_thought_preview(block: &TranscriptBlock, width: usize) -> String {
-    const MAX_PREVIEW_LINES: usize = 2;
     let attribution = block.source.split_once(": ").and_then(|(speaker, body)| {
         let end = body.find("] ").filter(|_| body.starts_with('['))?;
         Some((speaker, &body[..=end], &body[end + 2..]))
@@ -338,27 +337,9 @@ fn collapsed_thought_preview(block: &TranscriptBlock, width: usize) -> String {
         });
     }
     let content_width = width.saturating_sub(prefix.chars().count()).max(1);
-    let rows = wrap(source, content_width);
-    let start = rows.len().saturating_sub(MAX_PREVIEW_LINES);
-    let mut visible = rows[start..].to_vec();
-    if start > 0
-        && let Some(first) = visible.first_mut()
-    {
-        *first = truncate_chars(&format!("…{first}"), content_width);
-    }
-    let continuation = " ".repeat(prefix.chars().count());
-    let preview = visible
-        .into_iter()
-        .enumerate()
-        .map(|(index, row)| {
-            if index == 0 {
-                format!("{prefix}{row}")
-            } else {
-                format!("{continuation}{row}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let content = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let visible = truncate_start_chars(&content, content_width);
+    let preview = format!("{prefix}{visible}");
     attribution.map_or(preview.clone(), |(speaker, timestamp, _)| {
         format!("{speaker}: {timestamp} {preview}")
     })
@@ -372,8 +353,8 @@ fn collapsed_activity_preview(
 ) -> String {
     let attribution = attributed_message(&block.source);
     let source = attribution.map_or_else(|| presentation_source(block), |(_, _, content)| content);
-    if label == "Tool" && source.lines().any(|line| line.starts_with('🔧')) {
-        let preview = rolling_tool_preview(source, width, max_lines);
+    if label == "Tool" {
+        let preview = rolling_tool_preview(source, width);
         return attribution.map_or(preview.clone(), |(speaker, timestamp, _)| {
             format!("{speaker}: [{timestamp}] {preview}")
         });
@@ -384,10 +365,9 @@ fn collapsed_activity_preview(
     })
 }
 
-/// Preserve one compact row per logical tool call. Full details stay in the
-/// source block for Ctrl+O, while the collapsed transcript rolls through only
-/// the newest calls instead of wrapping their output into the conversation.
-fn rolling_tool_preview(source: &str, width: usize, max_lines: usize) -> String {
+/// Show the newest tool call and its latest rendered output line in one row.
+/// Full details stay in the source block for Ctrl+O.
+fn rolling_tool_preview(source: &str, width: usize) -> String {
     let mut calls = Vec::new();
     let mut current = Vec::new();
     for line in source.lines() {
@@ -400,30 +380,38 @@ fn rolling_tool_preview(source: &str, width: usize, max_lines: usize) -> String 
         calls.push(current);
     }
 
-    calls
-        .into_iter()
-        .rev()
-        .take(max_lines)
+    let call = calls.last().cloned().unwrap_or_default();
+    let header = call.first().copied().unwrap_or("Tool").trim();
+    let detail = call
+        .iter()
+        .skip(1)
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .map(|call| {
-            let header = call.first().copied().unwrap_or_default().trim();
-            let detail = call
-                .iter()
-                .skip(1)
-                .map(|line| line.trim())
-                .find(|line| !line.is_empty())
-                .unwrap_or_default();
-            let summary = if detail.is_empty() {
-                header.to_owned()
-            } else {
-                format!("{header} · {detail}")
-            };
-            truncate_chars(&summary, width)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    if detail.is_empty() {
+        return truncate_chars(header, width);
+    }
+
+    let separator = " · ";
+    let header_budget = (width / 2).max(1);
+    let header = truncate_chars(header, header_budget);
+    let detail_width = width
+        .saturating_sub(header.chars().count() + separator.chars().count())
+        .max(1);
+    let detail_rows = wrap(&detail, detail_width);
+    let mut latest = detail_rows.last().cloned().unwrap_or_default();
+    if detail_rows.len() > 1
+        || call
+            .iter()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .count()
+            > 1
+    {
+        latest = truncate_chars(&format!("…{latest}"), detail_width);
+    }
+    truncate_chars(&format!("{header}{separator}{latest}"), width)
 }
 
 fn bounded_head_preview(label: &str, source: &str, width: usize, max_lines: usize) -> String {
@@ -485,6 +473,21 @@ fn truncate_chars(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+fn truncate_start_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let tail = text
+        .chars()
+        .skip(count.saturating_sub(max.saturating_sub(1)))
+        .collect::<String>();
+    format!("…{tail}")
 }
 
 fn label(kind: BlockKind) -> &'static str {
@@ -591,28 +594,29 @@ mod tests {
             fixtures::five_thousand_word_reply(),
             true,
         );
-        assert_eq!(transcript.row_count(80), 2);
+        assert_eq!(transcript.row_count(80), 1);
         assert!(transcript.set_collapsed(id, false));
         assert!(transcript.row_count(80) > 100);
     }
 
     #[test]
-    fn collapsed_detail_shows_the_latest_two_lines_without_ui_actions() {
+    fn collapsed_detail_shows_the_latest_line_without_ui_actions() {
         let mut transcript = Transcript::default();
         transcript.append(
             BlockKind::Thought,
             "cargo build --release\nwarning: unused variable `x`\nfinished",
             true,
         );
-        let rows = transcript.viewport(80, 0, 10, 0);
-        assert_eq!(rows.len(), 2);
-        assert!(rows[0].text.starts_with("Thought · …warning:"));
-        assert_eq!(rows[1].text.trim(), "finished");
+        let rows = transcript.viewport(40, 0, 10, 0);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].text.starts_with("Thought · …"));
+        assert!(rows[0].text.ends_with("finished"));
+        assert!(!rows[0].text.contains("cargo build"));
         assert!(rows.iter().all(|row| !row.text.contains("Ctrl+O")));
     }
 
     #[test]
-    fn collapsed_thought_preview_uses_at_most_two_rows_at_any_width() {
+    fn collapsed_thought_preview_uses_one_row_at_any_width() {
         let mut transcript = Transcript::default();
         transcript.append(
             BlockKind::Thought,
@@ -620,9 +624,9 @@ mod tests {
             true,
         );
         for width in [20usize, 40, 80, 120] {
-            assert!(transcript.row_count(width) <= 2);
+            assert_eq!(transcript.row_count(width), 1);
             let rows = transcript.viewport(width, 0, 10, 0);
-            assert!(rows.len() <= 2);
+            assert_eq!(rows.len(), 1);
             assert!(rows[0].text.chars().count() <= width, "overflow at {width}");
         }
     }
@@ -648,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_thought_rolls_over_to_the_latest_two_rendered_lines() {
+    fn collapsed_thought_rolls_over_to_the_latest_rendered_line() {
         let mut transcript = Transcript::default();
         let source = (0..100)
             .map(|index| format!("word{index}"))
@@ -682,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn attributed_long_thought_uses_one_header_and_two_preview_rows() {
+    fn attributed_long_thought_uses_one_header_and_one_preview_row() {
         let mut transcript = Transcript::default();
         let thought = (0..30)
             .map(|index| format!("word{index}"))
@@ -695,10 +699,10 @@ mod tests {
         );
 
         let rows = transcript.viewport(80, 0, 10, 0);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].text, "Codex: [12:05]");
         assert!(rows[1].text.starts_with("Thought · "));
-        assert!(rows[2].text.ends_with("word29"));
+        assert!(rows[1].text.ends_with("word29"));
     }
 
     #[test]
@@ -770,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_tool_uses_one_header_and_at_most_two_preview_rows() {
+    fn collapsed_tool_uses_one_header_and_one_sliding_preview_row() {
         let mut transcript = Transcript::default();
         transcript.append(
             BlockKind::Tool,
@@ -780,9 +784,9 @@ mod tests {
 
         let rows = transcript.viewport(48, 0, 10, 0);
         assert_eq!(rows[0].text, "Codex: [12:05]");
-        assert_eq!(rows.len(), 3);
-        assert!(rows[1].text.starts_with("Tool · Run tests · running"));
-        assert!(rows[2].text.ends_with('…'));
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].text.starts_with("Run tests · running · …"));
+        assert!(rows[1].text.ends_with("third output line"));
         assert!(rows[1..].iter().all(|row| row.kind == BlockKind::Tool));
     }
 

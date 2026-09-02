@@ -262,6 +262,9 @@ impl Drop for TerminalSession {
 #[derive(Debug)]
 enum AdapterControl {
     Prompt(String),
+    /// Untargeted human input submitted while a turn was active. Unlike a
+    /// fresh prompt, this returns to the agent that was working.
+    FollowUp(String),
     Queue {
         slot: usize,
         prompt: String,
@@ -304,7 +307,7 @@ fn control_for_queued(prompt: &QueuedPrompt) -> Option<AdapterControl> {
             slot,
             prompt: prompt.prompt.clone(),
         },
-        None => AdapterControl::Prompt(prompt.prompt.clone()),
+        None => AdapterControl::FollowUp(prompt.prompt.clone()),
     })
 }
 
@@ -2164,7 +2167,7 @@ fn run_agy_task(
                     None => break,
                 },
                 command = controls.recv() => match command {
-                    Some(AdapterControl::Prompt(prompt)) => {
+                    Some(AdapterControl::Prompt(prompt) | AdapterControl::FollowUp(prompt)) => {
                         if let Err(error) = adapter.send_prompt(prompt).await {
                             let _ = sender.send(Err(error));
                         } else {
@@ -2360,7 +2363,7 @@ fn run_acp_task(
                     None => break,
                 },
                 command = controls.recv() => match command {
-                    Some(AdapterControl::Prompt(prompt)) => {
+                    Some(AdapterControl::Prompt(prompt) | AdapterControl::FollowUp(prompt)) => {
                         if let Err(error) = adapter.send_prompt(prompt).await {
                             let _ = sender.send(Err(error));
                         } else {
@@ -2545,6 +2548,23 @@ async fn run_relay_sequence_with_controls(
     }
 }
 
+fn enqueue_fresh_roster_prompt(
+    relay: &mut RelayHost,
+    prompt: String,
+    fallback_first: usize,
+) -> Result<usize, AdapterError> {
+    let first = relay
+        .relay()
+        .active_slots()
+        .next()
+        .unwrap_or(fallback_first);
+    relay
+        .relay_mut()
+        .enqueue_human(prompt, Some(first))
+        .then_some(first)
+        .ok_or_else(|| AdapterError::Transport("unable to queue prompt for roster".into()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_relay_task(
     sender: Sender<AdapterResult<AgentEvent>>,
@@ -2697,13 +2717,36 @@ fn run_relay_task(
             };
             match command {
                 Some(AdapterControl::Prompt(prompt)) => {
-                    // No explicit target means the relay's live routing state
-                    // chooses the next recipient. Footer selections use Queue
-                    // and are consumed after one message.
+                    // Every fresh unaddressed human task begins with the first
+                    // active roster member. The ring cursor is batch-local.
+                    let selected = match enqueue_fresh_roster_prompt(&mut relay, prompt, first_slot)
+                    {
+                        Ok(selected) => selected,
+                        Err(error) => {
+                            let _ = sender.send(Err(error));
+                            continue;
+                        }
+                    };
+                    let (stopping, deferred) = run_relay_sequence_with_controls(
+                        &mut relay,
+                        &mut controls,
+                        &sender,
+                        "".into(),
+                        selected,
+                    )
+                    .await;
+                    pending_commands.extend(deferred);
+                    if stopping {
+                        break;
+                    }
+                }
+                Some(AdapterControl::FollowUp(prompt)) => {
+                    // Untagged input submitted during active work returns to
+                    // that same agent before the automatic ring advances.
                     let selected = relay.relay().active_slots().next().unwrap_or(first_slot);
                     if !relay.relay_mut().enqueue_human(prompt, None) {
                         let _ = sender.send(Err(AdapterError::Transport(
-                            "unable to queue prompt for roster".into(),
+                            "unable to queue follow-up for active agent".into(),
                         )));
                         continue;
                     }
@@ -3893,10 +3936,11 @@ mod tests {
         AdapterControl, AgentSpec, ConfigInputDecoder, Launch, MAX_EVENTS_PER_FRAME,
         apply_mouse_scroll, apply_navigation_scroll, apply_notification_preferences,
         bare_launch_from_settings, cancel_standalone_turn, consume_one_shot_route,
-        dispatch_permission_action, dispatch_queued_prompt, finish_pending_cancellation,
-        interaction_height, load_prompt_history_from, load_session_metadata_candidates,
-        mouse_scroll_delta, next_event_batch, normalize_arguments, normalize_selected_slot,
-        parse_launch, prepare_launch_arguments, program_available, project_dir_argument,
+        control_for_queued, dispatch_permission_action, dispatch_queued_prompt,
+        enqueue_fresh_roster_prompt, finish_pending_cancellation, interaction_height,
+        load_prompt_history_from, load_session_metadata_candidates, mouse_scroll_delta,
+        next_event_batch, normalize_arguments, normalize_selected_slot, parse_launch,
+        prepare_launch_arguments, program_available, project_dir_argument,
         project_prompt_history_path, reconcile_config_roster,
         rejection_interrupts_roster_reconcile, restore_mouse_after_selection_window,
         resume_launch_from_metadata, run_relay_sequence_with_controls, sanitize_direct_event,
@@ -5186,6 +5230,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn queued_untagged_input_remains_an_active_agent_follow_up() {
+        let prompt = QueuedPrompt {
+            id: 1,
+            prompt: "clarification".into(),
+            target: None,
+            direct: false,
+        };
+        assert!(matches!(
+            control_for_queued(&prompt),
+            Some(AdapterControl::FollowUp(text)) if text == "clarification"
+        ));
+    }
+
     #[tokio::test]
     async fn single_agent_roster_uses_hot_reload_host_without_self_review() {
         let host = AdapterHost::new(
@@ -5267,6 +5325,69 @@ mod tests {
                 .map(|(slot, _)| *slot)
                 .collect::<Vec<_>>(),
             vec![0, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn each_fresh_human_question_restarts_at_the_first_roster_slot() {
+        let scripted_turns = |slot| {
+            [
+                AgentEvent::Text {
+                    slot,
+                    text: format!("first batch from {slot}"),
+                },
+                AgentEvent::TurnComplete { slot },
+                AgentEvent::Text {
+                    slot,
+                    text: format!("second batch from {slot}"),
+                },
+                AgentEvent::TurnComplete { slot },
+            ]
+        };
+        let hosts = (0..2)
+            .map(|slot| {
+                AdapterHost::new(
+                    Box::new(ScriptedAdapter::new(
+                        slot,
+                        AgentCapabilities::default(),
+                        scripted_turns(slot),
+                    )),
+                    None,
+                )
+            })
+            .collect();
+        let mut relay = RelayHost::new(hosts, 2).expect("two-agent relay");
+        relay.start().await.expect("start");
+        let (sender, _events) = std::sync::mpsc::channel::<AdapterResult<AgentEvent>>();
+        let (_control_sender, mut controls) = tokio::sync::mpsc::unbounded_channel();
+
+        let (_, deferred) = run_relay_sequence_with_controls(
+            &mut relay,
+            &mut controls,
+            &sender,
+            "question one".into(),
+            0,
+        )
+        .await;
+        assert!(deferred.is_empty());
+        let first = enqueue_fresh_roster_prompt(&mut relay, "question two".into(), 0)
+            .expect("fresh question");
+        let (_, deferred) = run_relay_sequence_with_controls(
+            &mut relay,
+            &mut controls,
+            &sender,
+            String::new(),
+            first,
+        )
+        .await;
+        assert!(deferred.is_empty());
+        assert_eq!(
+            relay
+                .dispatches()
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>(),
+            [0, 1, 0, 1]
         );
     }
 

@@ -814,6 +814,7 @@ struct ToolWindow {
     block_id: u64,
     prefix: String,
     calls: VecDeque<ToolCall>,
+    seen_call_ids: BTreeSet<String>,
 }
 
 const MAX_TOOL_WINDOW_ROWS: usize = 2;
@@ -2789,6 +2790,7 @@ impl App {
                             block_id,
                             prefix,
                             calls: VecDeque::new(),
+                            seen_call_ids: BTreeSet::new(),
                         },
                     );
                 }
@@ -2797,6 +2799,7 @@ impl App {
                         .tool_windows
                         .get_mut(slot)
                         .expect("tool window inserted");
+                    window.seen_call_ids.insert(update.id.clone());
                     window.calls.retain(|call| call.id != update.id);
                     window.calls.push_back(ToolCall {
                         id: update.id.clone(),
@@ -3310,11 +3313,21 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
 }
 
 fn tool_window_source(window: &ToolWindow) -> String {
+    let total_calls = window.seen_call_ids.len();
     let calls = window
         .calls
         .iter()
         .map(|call| {
-            let header = format!("🔧 {} · {}", call.title, tool_status_label(call.status));
+            let status = if call.status == ToolStatus::Completed {
+                if total_calls == 1 {
+                    "1 tool call".to_owned()
+                } else {
+                    format!("{total_calls} tool calls")
+                }
+            } else {
+                tool_status_label(call.status).to_owned()
+            };
+            let header = format!("🔧 {} · {status}", call.title);
             call.detail
                 .as_deref()
                 .filter(|detail| !detail.trim().is_empty())
@@ -3410,13 +3423,45 @@ fn compact_cell_label(value: &str, width: usize) -> String {
     label
 }
 
+fn compact_tail_cell_label(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if cell_width(value) <= width {
+        return value.to_owned();
+    }
+    let ellipsis = '…';
+    let content_budget = width.saturating_sub(cell_width(&ellipsis.to_string()));
+    let mut reversed = Vec::new();
+    let mut used = 0usize;
+    for character in value.chars().rev() {
+        let character_width = cell_width(&character.to_string());
+        if used.saturating_add(character_width) > content_budget {
+            break;
+        }
+        reversed.push(character);
+        used = used.saturating_add(character_width);
+    }
+    reversed.reverse();
+    format!("{ellipsis}{}", reversed.into_iter().collect::<String>())
+}
+
 fn actionable_detail_preview(value: &str, width: usize) -> String {
     const HINT: &str = "Ctrl+O open";
     let hint_width = cell_width(HINT);
     if width <= hint_width {
         return compact_cell_label(HINT, width);
     }
-    let preview = compact_cell_label(value, width.saturating_sub(hint_width + 1));
+    let preview_budget = width.saturating_sub(hint_width + 1);
+    let preview = value.strip_prefix("Thought · ").map_or_else(
+        || compact_cell_label(value, preview_budget),
+        |content| {
+            const PREFIX: &str = "Thought · ";
+            let content =
+                compact_tail_cell_label(content, preview_budget.saturating_sub(cell_width(PREFIX)));
+            format!("{PREFIX}{content}")
+        },
+    );
     let padding = width
         .saturating_sub(cell_width(&preview) + hint_width)
         .max(1);
@@ -4639,7 +4684,7 @@ fn block_style(kind: crate::transcript::BlockKind) -> Style {
         }
         crate::transcript::BlockKind::Agent => Style::default().fg(PRIMARY_TEXT),
         crate::transcript::BlockKind::Thought => Style::default().fg(THOUGHT_TEXT).italic(),
-        crate::transcript::BlockKind::Tool => Style::default().fg(Color::Gray),
+        crate::transcript::BlockKind::Tool => Style::default().fg(THOUGHT_TEXT),
         crate::transcript::BlockKind::Terminal => Style::default().fg(Color::Gray),
         crate::transcript::BlockKind::Diff => Style::default().fg(Color::Magenta),
         crate::transcript::BlockKind::Notice => Style::default().fg(THOUGHT_TEXT),
@@ -4648,9 +4693,8 @@ fn block_style(kind: crate::transcript::BlockKind) -> Style {
 
 fn marker_style(kind: crate::transcript::BlockKind, text: &str) -> Style {
     match kind {
-        crate::transcript::BlockKind::Tool | crate::transcript::BlockKind::Terminal => {
-            Style::default().fg(Color::Yellow).bold()
-        }
+        crate::transcript::BlockKind::Tool => Style::default().fg(THOUGHT_TEXT).bold(),
+        crate::transcript::BlockKind::Terminal => Style::default().fg(Color::Yellow).bold(),
         crate::transcript::BlockKind::Notice => Style::default().fg(ACCENT).bold(),
         _ => row_style(kind, text).bold(),
     }
@@ -4967,10 +5011,10 @@ mod tests {
         assert_eq!(THOUGHT_TEXT, Color::Rgb(142, 142, 147));
         assert_eq!(block_style(BlockKind::Human).fg, Some(ACCENT));
         assert_eq!(block_style(BlockKind::Thought).fg, Some(THOUGHT_TEXT));
-        assert_eq!(block_style(BlockKind::Tool).fg, Some(Color::Gray));
+        assert_eq!(block_style(BlockKind::Tool).fg, Some(THOUGHT_TEXT));
         assert_eq!(block_style(BlockKind::Terminal).fg, Some(Color::Gray));
         assert_eq!(block_style(BlockKind::Notice).fg, Some(THOUGHT_TEXT));
-        assert_eq!(marker_style(BlockKind::Tool, "Run").fg, Some(Color::Yellow));
+        assert_eq!(marker_style(BlockKind::Tool, "Run").fg, Some(THOUGHT_TEXT));
         assert_eq!(marker_style(BlockKind::Notice, "Wait").fg, Some(ACCENT));
         assert_eq!(selected_style().bg, None);
         assert!(selected_style().add_modifier.contains(Modifier::REVERSED));
@@ -5784,6 +5828,15 @@ mod tests {
         assert_eq!(hint_column(&short), hint_column(&long));
         assert!(short.ends_with("Ctrl+O open"));
         assert!(long.ends_with("Ctrl+O open"));
+
+        let before = actionable_detail_preview("Thought · abcdefghijklmnopqrstuvwxyz", 40);
+        let after = actionable_detail_preview("Thought · abcdefghijklmnopqrstuvwxyzZ", 40);
+        let before_visible = before.split_once("Ctrl+O open").expect("hint").0.trim_end();
+        let after_visible = after.split_once("Ctrl+O open").expect("hint").0.trim_end();
+        assert_eq!(cell_width(before_visible), cell_width(after_visible));
+        assert!(before_visible.ends_with('z'));
+        assert!(after_visible.ends_with('Z'));
+        assert_ne!(before_visible, after_visible);
     }
 
     #[test]
@@ -5956,7 +6009,7 @@ mod tests {
             });
         }
         assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
-        assert_eq!(app.transcript.row_count(80), 3);
+        assert_eq!(app.transcript.row_count(80), 2);
 
         app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
         assert!(!footer_agent_label(&app, 0, 1).contains("1:05"));
@@ -7323,7 +7376,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_render_under_the_agent_header_as_a_two_line_rolling_window() {
+    fn tools_render_under_the_agent_header_as_a_one_line_sliding_window() {
         let backend = TestBackend::new(72, 12);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
@@ -7343,10 +7396,10 @@ mod tests {
         assert_eq!(app.transcript.len(), 1);
         assert_eq!(app.tool_windows[&0].calls.len(), 2);
         let preview = app.transcript.viewport(72, 0, 10, 0);
-        assert_eq!(preview.len(), 3);
+        assert_eq!(preview.len(), 2);
         assert!(preview[0].text.starts_with("Antigravity: ["));
-        assert!(preview[1].text.contains("Noisy two"));
-        assert!(preview[2].text.contains("Noisy three"));
+        assert!(preview[1].text.contains("Noisy three"));
+        assert!(preview[1].text.contains("tool output"));
 
         terminal
             .draw(|frame| render(frame, &mut app))
@@ -7359,7 +7412,7 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>();
         assert!(rows.iter().any(|row| row.contains("Antigravity")));
-        assert_eq!(rows.iter().filter(|row| row.contains("Noisy")).count(), 2);
+        assert_eq!(rows.iter().filter(|row| row.contains("Noisy")).count(), 1);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.contains("Ctrl+O open"))
@@ -7373,6 +7426,14 @@ mod tests {
         );
         app.apply_event(&tool("three", codeswarm_adapters::ToolStatus::Completed));
         assert_eq!(app.tool_windows[&0].calls.len(), 2);
+        let completed = app.transcript.viewport(72, 0, 10, 0);
+        assert!(
+            completed
+                .iter()
+                .any(|row| row.text.contains("3 tool calls")),
+            "completed={completed:?}"
+        );
+        assert!(completed.iter().all(|row| !row.text.contains("completed")));
         app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
         assert!(!app.tool_windows.contains_key(&0));
     }
