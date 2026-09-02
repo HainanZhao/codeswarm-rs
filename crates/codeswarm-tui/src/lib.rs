@@ -897,6 +897,28 @@ pub struct App {
 
 const CONFIG_SETTING_COUNT: usize = 13;
 
+fn agent_event_slot(event: &AgentEvent) -> Option<usize> {
+    match event {
+        AgentEvent::Ready { slot, .. }
+        | AgentEvent::TurnStarted { slot }
+        | AgentEvent::ModesReplaced { slot, .. }
+        | AgentEvent::ModeUpdated { slot, .. }
+        | AgentEvent::ModelsReplaced { slot, .. }
+        | AgentEvent::ModelUpdated { slot, .. }
+        | AgentEvent::UserText { slot, .. }
+        | AgentEvent::CommandsReplaced { slot, .. }
+        | AgentEvent::UsageUpdated { slot, .. }
+        | AgentEvent::Text { slot, .. }
+        | AgentEvent::Thought { slot, .. }
+        | AgentEvent::Tool { slot, .. }
+        | AgentEvent::Permission { slot, .. }
+        | AgentEvent::Terminal { slot, .. }
+        | AgentEvent::TurnComplete { slot }
+        | AgentEvent::Failed { slot, .. } => Some(*slot),
+        AgentEvent::RosterUpdated { .. } => None,
+    }
+}
+
 impl Default for App {
     fn default() -> Self {
         Self {
@@ -2590,6 +2612,17 @@ impl App {
     /// objects to the renderer. Text chunks are coalesced into one transcript
     /// block per active agent turn.
     pub fn apply_event(&mut self, event: &AgentEvent) {
+        // A dropped slot is a tombstone. Adapter transports may already have
+        // queued Ready/model/text events when the coordinator drops it; those
+        // stale events must not resurrect the footer entry or its protocol
+        // state. A real reload first changes the slot back to `starting`.
+        if agent_event_slot(event).is_some_and(|slot| {
+            self.agent_states
+                .get(&slot)
+                .is_some_and(|state| state == "dropped")
+        }) {
+            return;
+        }
         match event {
             AgentEvent::RosterUpdated { update } => match update {
                 codeswarm_adapters::RosterUpdate::Added {

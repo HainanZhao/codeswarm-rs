@@ -1394,6 +1394,10 @@ fn save_roster_slots(slots: &[RosterSlot]) -> std::io::Result<()> {
     let Some(path) = settings_path() else {
         return Ok(());
     };
+    save_roster_slots_at(path, slots)
+}
+
+fn save_roster_slots_at(path: impl AsRef<Path>, slots: &[RosterSlot]) -> std::io::Result<()> {
     settings::update(path, |settings| {
         let launcher = settings
             .entry("launcher")
@@ -2894,6 +2898,17 @@ fn should_apply_configured_models(event: &AgentEvent) -> bool {
     )
 }
 
+fn rejection_interrupts_roster_reconcile(update: &codeswarm_adapters::RosterUpdate) -> bool {
+    matches!(
+        update,
+        codeswarm_adapters::RosterUpdate::Rejected { action, .. }
+            if action.starts_with("add agent")
+                || action.starts_with("drop agent")
+                || action.starts_with("reload agent")
+                || action.starts_with("swap agents")
+    )
+}
+
 fn run_terminal(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
@@ -2987,7 +3002,7 @@ fn run_terminal(
                                         selected_slot = Some(*first);
                                     }
                                 }
-                                codeswarm_adapters::RosterUpdate::Rejected { .. } => {
+                                update if rejection_interrupts_roster_reconcile(update) => {
                                     config_reconcile_pending = false;
                                     pending_first = None;
                                 }
@@ -3880,10 +3895,11 @@ mod tests {
         interaction_height, load_prompt_history_from, load_session_metadata_candidates,
         mouse_scroll_delta, next_event_batch, normalize_arguments, normalize_selected_slot,
         parse_launch, prepare_launch_arguments, program_available, project_dir_argument,
-        project_prompt_history_path, reconcile_config_roster, restore_mouse_after_selection_window,
+        project_prompt_history_path, reconcile_config_roster,
+        rejection_interrupts_roster_reconcile, restore_mouse_after_selection_window,
         resume_launch_from_metadata, run_relay_sequence_with_controls, sanitize_direct_event,
-        session_metadata_path_for, should_apply_configured_models, standalone_session_metadata,
-        terminal_capture_enabled_for, validate_project_directory,
+        save_roster_slots_at, session_metadata_path_for, should_apply_configured_models,
+        standalone_session_metadata, terminal_capture_enabled_for, validate_project_directory,
     };
     use async_trait::async_trait;
     use codeswarm::tui::{App, ConfigKey, PermissionAction, QueuedPrompt, StoreAgent};
@@ -4986,6 +5002,72 @@ mod tests {
             receiver.try_recv(),
             Ok(AdapterControl::Add { identity, .. }) if identity == "anthropic.com"
         ));
+    }
+
+    #[test]
+    fn duplicate_roster_save_survives_model_rejection_drop_and_restart() {
+        let mut app = codeswarm::tui::App::default();
+        for slot in 0..2 {
+            app.set_agent_name(slot, "Claude");
+            app.set_agent_identity(slot, "claude.com");
+        }
+        app.set_config_agents(vec![StoreAgent {
+            identity: "claude.com".into(),
+            name: "Claude".into(),
+            adapter: "ACP".into(),
+            command: "npx -y @agentclientprotocol/claude-agent-acp".into(),
+            available: true,
+            selected: true,
+            model: None,
+        }]);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut pending_first = None;
+        assert!(!reconcile_config_roster(&mut app, &sender, &mut pending_first).unwrap());
+        assert!(matches!(receiver.try_recv(), Ok(AdapterControl::Drop(1))));
+
+        let model_rejection = codeswarm_adapters::RosterUpdate::Rejected {
+            action: "set model for agent 0".into(),
+            detail: "Unsupported operation: set_model".into(),
+        };
+        assert!(!rejection_interrupts_roster_reconcile(&model_rejection));
+
+        app.apply_event(&AgentEvent::RosterUpdated {
+            update: codeswarm_adapters::RosterUpdate::Dropped { slot: 1 },
+        });
+        assert!(reconcile_config_roster(&mut app, &sender, &mut pending_first).unwrap());
+        assert!(receiver.try_recv().is_err());
+
+        let path = std::env::temp_dir().join(format!(
+            "codeswarm-roster-save-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"launcher":{"roster":[{"agent":"claude.com"},{"agent":"claude.com"}]}}"#,
+        )
+        .expect("old settings");
+        save_roster_slots_at(&path, &app.config_roster_slots()).expect("save new roster");
+        let saved = std::fs::read_to_string(&path).expect("read saved roster");
+        assert!(matches!(
+            bare_launch_from_settings(&saved),
+            Launch::Roster { identities, .. } if identities == ["claude.com"]
+        ));
+        std::fs::remove_file(path).expect("cleanup");
+
+        // A transport event queued before the drop cannot resurrect slot 1
+        // and make its footer entry flash after the save completes.
+        app.apply_event(&AgentEvent::Ready {
+            slot: 1,
+            capabilities: AgentCapabilities {
+                supports_models: true,
+                ..AgentCapabilities::default()
+            },
+        });
+        assert_eq!(app.active_roster_slots(), vec![0]);
     }
 
     #[test]

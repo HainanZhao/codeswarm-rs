@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-09-02
+
+### Fixed
+
+- Model-setting rejections no longer cancel an in-progress roster save, and
+  delayed adapter events cannot resurrect a dropped slot. Updated fleets now
+  persist through restart without a stale footer entry flashing.
+
 ## [0.8.7] - 2026-09-02
 
 ### Fixed
