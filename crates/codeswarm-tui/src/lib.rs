@@ -3411,10 +3411,16 @@ fn compact_cell_label(value: &str, width: usize) -> String {
 }
 
 fn actionable_detail_preview(value: &str, width: usize) -> String {
-    const HINT: &str = " · Ctrl+O open";
+    const HINT: &str = "Ctrl+O open";
     let hint_width = cell_width(HINT);
-    let preview = compact_cell_label(value, width.saturating_sub(hint_width));
-    compact_cell_label(&format!("{preview}{HINT}"), width)
+    if width <= hint_width {
+        return compact_cell_label(HINT, width);
+    }
+    let preview = compact_cell_label(value, width.saturating_sub(hint_width + 1));
+    let padding = width
+        .saturating_sub(cell_width(&preview) + hint_width)
+        .max(1);
+    format!("{preview}{}{HINT}", " ".repeat(padding))
 }
 
 fn compact_workspace_path(path: &std::path::Path, width: usize) -> String {
@@ -4908,10 +4914,10 @@ mod tests {
         ACCENT, AGENT_COLORS, App, CONFIG_SETTING_COUNT, ConfigAction, ConfigKey, FooterAction,
         LocalCommand, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PathPickerAction, PermissionAction,
         PermissionKey, PromptAction, PromptEditor, STATUS_BG, StoreAction, StoreAgent, StoreKey,
-        THOUGHT_TEXT, TRANSCRIPT_BG, agent_header_color, agent_slot_color, block_style, cell_width,
-        compact_cell_label, compact_workspace_path, file_reference_spans, footer_agent_label,
-        format_turn_elapsed, markdown_spans, markdown_style, marker_style, render,
-        render_prompt_separator, row_style, selected_style,
+        THOUGHT_TEXT, TRANSCRIPT_BG, actionable_detail_preview, agent_header_color,
+        agent_slot_color, block_style, cell_width, compact_cell_label, compact_workspace_path,
+        file_reference_spans, footer_agent_label, format_turn_elapsed, markdown_spans,
+        markdown_style, marker_style, render, render_prompt_separator, row_style, selected_style,
     };
 
     fn key(key: Key) -> Input {
@@ -5762,6 +5768,22 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!opened.contains("Ctrl+O open"));
+    }
+
+    #[test]
+    fn ctrl_o_hint_stays_right_aligned_as_thought_text_streams() {
+        let short = actionable_detail_preview("Thought · checking", 60);
+        let long = actionable_detail_preview(
+            "Thought · a much longer streaming thought preview that keeps changing",
+            60,
+        );
+        assert_eq!(cell_width(&short), 60);
+        assert_eq!(cell_width(&long), 60);
+        let hint_column =
+            |line: &str| cell_width(line.split_once("Ctrl+O open").expect("action hint").0);
+        assert_eq!(hint_column(&short), hint_column(&long));
+        assert!(short.ends_with("Ctrl+O open"));
+        assert!(long.ends_with("Ctrl+O open"));
     }
 
     #[test]
@@ -7213,7 +7235,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("● Codex 12:05")));
         assert!(
             rows.iter()
-                .any(|row| row.contains("  Thought · 3 words · checking relay state"))
+                .any(|row| row.contains("  Thought · checking relay state"))
         );
         assert!(
             rows.iter()
@@ -7226,7 +7248,7 @@ mod tests {
         assert!(rows.iter().all(|row| !row.contains("Wait · completed")));
         let thought_row = rows
             .iter()
-            .position(|row| row.contains("Thought · 3 words"))
+            .position(|row| row.contains("Thought · checking relay state"))
             .expect("thought row");
         let answer_row = rows
             .iter()
@@ -7273,7 +7295,7 @@ mod tests {
         let thought = app.transcript.viewport(120, 0, 2, 0);
         assert!(thought[0].text.starts_with("Agent 0: ["));
         assert!(thought[0].text.ends_with(']'));
-        assert_eq!(thought[1].text, "Thought · 2 words · first second");
+        assert_eq!(thought[1].text, "Thought · first second");
 
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -7289,7 +7311,7 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Agent 0"), "rendered={rendered:?}");
         assert!(
-            rendered.contains("Thought · 2 words"),
+            rendered.contains("Thought · first second"),
             "rendered={rendered:?}"
         );
         app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });

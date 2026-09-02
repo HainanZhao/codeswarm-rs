@@ -56,6 +56,8 @@ pub const POLICIES: &[ModePolicy] = &[
         name: "Auto pilot",
         description: "Automatically approve tools and bypass prompts",
         aliases: &[
+            "auto",
+            "autopilot",
             "fullaccess",
             "yolo",
             "bypasspermissions",
@@ -154,6 +156,24 @@ mod tests {
         assert_eq!(
             super::resolve(DEFAULT_POLICY_ID, &modes).map(|mode| mode.id),
             Some("agent-full-access".into())
+        );
+    }
+
+    #[test]
+    fn maps_claude_auto_catalog_to_auto_pilot() {
+        let modes = vec![
+            Mode {
+                id: "default".into(),
+                label: "Manual".into(),
+            },
+            Mode {
+                id: "auto".into(),
+                label: "Auto".into(),
+            },
+        ];
+        assert_eq!(
+            super::resolve(DEFAULT_POLICY_ID, &modes).map(|mode| mode.id),
+            Some("auto".into())
         );
     }
 

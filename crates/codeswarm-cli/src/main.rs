@@ -1699,18 +1699,20 @@ fn reconcile_config_roster(
         let Some(target_slot) = slots.get(position).copied() else {
             break;
         };
+        if live_slot_identity(app, target_slot).eq_ignore_ascii_case(&agent.identity) {
+            continue;
+        }
         let Some(found_slot) = slots
             .into_iter()
+            .skip(position + 1)
             .find(|slot| live_slot_identity(app, *slot).eq_ignore_ascii_case(&agent.identity))
         else {
             continue;
         };
-        if found_slot != target_slot {
-            controls
-                .send(AdapterControl::Swap(target_slot, found_slot))
-                .map_err(|_| "unable to queue roster reorder".to_owned())?;
-            return Ok(false);
-        }
+        controls
+            .send(AdapterControl::Swap(target_slot, found_slot))
+            .map_err(|_| "unable to queue roster reorder".to_owned())?;
+        return Ok(false);
     }
     Ok(true)
 }
@@ -5002,6 +5004,31 @@ mod tests {
             receiver.try_recv(),
             Ok(AdapterControl::Add { identity, .. }) if identity == "anthropic.com"
         ));
+    }
+
+    #[test]
+    fn duplicate_agents_already_in_order_do_not_swap_forever() {
+        let mut app = codeswarm::tui::App::default();
+        for slot in 0..2 {
+            app.set_agent_name(slot, "Claude");
+            app.set_agent_identity(slot, "claude.com");
+        }
+        app.set_config_agents(
+            (0..2)
+                .map(|_| StoreAgent {
+                    identity: "claude.com".into(),
+                    name: "Claude".into(),
+                    adapter: "ACP".into(),
+                    command: "npx -y @agentclientprotocol/claude-agent-acp".into(),
+                    available: true,
+                    selected: true,
+                    model: Some("default".into()),
+                })
+                .collect(),
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(reconcile_config_roster(&mut app, &sender, &mut None).unwrap());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]

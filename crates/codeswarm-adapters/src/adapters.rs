@@ -3154,7 +3154,10 @@ impl AgentAdapter for AcpAdapter {
                 Ok(None) => {}
                 Err(error) => return Some(Err(error)),
             }
-            if value.get("id").and_then(Value::as_u64) == self.prompt_request_id {
+            if value.get("id").is_some_and(|id| {
+                self.prompt_request_id
+                    .is_some_and(|expected| rpc_id_to_string(id) == expected.to_string())
+            }) {
                 if let Some(error) = value.get("error") {
                     self.prompt_request_id = None;
                     return Some(Err(AdapterError::Protocol(error.to_string())));
@@ -4501,6 +4504,29 @@ mod tests {
             adapter.next_event().await,
             Some(Ok(AgentEvent::TurnComplete { .. }))
         ));
+    }
+
+    #[tokio::test]
+    async fn acp_string_prompt_ids_complete_and_allow_a_follow_up_turn() {
+        let script = r#"read _; echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{}}}'; read _; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session-1","modes":{"currentModeId":"plan","availableModes":[{"id":"plan","name":"Plan"}]}}}'; read _; echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}}}'; echo '{"jsonrpc":"2.0","id":"3","result":{"stopReason":"end_turn"}}'; read _; echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second"}}}}'; echo '{"jsonrpc":"2.0","id":"4","result":{"stopReason":"end_turn"}}'"#;
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut adapter = AcpAdapter::new(1, cwd, "sh", vec!["-c".into(), script.into()]);
+        adapter.start().await.expect("initialize");
+        assert!(adapter.next_event().await.is_some());
+        assert!(adapter.next_event().await.is_some());
+
+        for (prompt, expected) in [("first prompt", "first"), ("follow up", "second")] {
+            adapter.send_prompt(prompt.into()).await.expect("prompt");
+            assert!(matches!(
+                adapter.next_event().await,
+                Some(Ok(AgentEvent::Text { text, .. })) if text == expected
+            ));
+            assert!(matches!(
+                adapter.next_event().await,
+                Some(Ok(AgentEvent::TurnComplete { slot: 1 }))
+            ));
+        }
+        adapter.stop().await.expect("stop");
     }
 
     #[tokio::test]

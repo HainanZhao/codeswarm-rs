@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.9] - 2026-09-02
+
+### Changed
+
+- Collapsed thought streams show a rolling window of the last two rendered
+  lines, and the `Ctrl+O open` hint stays fixed at the right edge.
+
+### Fixed
+
+- Duplicate identities already in roster order no longer swap against their
+  first matching peer forever, eliminating the flashing footer and allowing
+  configuration persistence to complete.
+- Claude ACP's advertised `auto` mode maps to CodeSwarm's Auto pilot policy,
+  so startup keeps the coordinator alive for later roster changes.
+- ACP prompt completion accepts equivalent numeric and string JSON-RPC IDs,
+  preventing a completed agent from remaining stuck in the working state.
+
 ## [0.8.8] - 2026-09-02
 
 ### Fixed
