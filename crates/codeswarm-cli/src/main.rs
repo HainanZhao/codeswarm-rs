@@ -2887,6 +2887,13 @@ fn next_event_batch<T>(events: &Receiver<T>) -> Vec<T> {
     events.try_iter().take(MAX_EVENTS_PER_FRAME).collect()
 }
 
+fn should_apply_configured_models(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::Ready { capabilities, .. } if capabilities.supports_models
+    )
+}
+
 fn run_terminal(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
@@ -3039,7 +3046,7 @@ fn run_terminal(
                             }
                         }
                         app.apply_event(&event);
-                        if matches!(&event, AgentEvent::ModelsReplaced { .. })
+                        if should_apply_configured_models(&event)
                             && let Some(controls) = &controls
                         {
                             for (slot, model) in app.take_config_model_changes() {
@@ -3875,8 +3882,8 @@ mod tests {
         parse_launch, prepare_launch_arguments, program_available, project_dir_argument,
         project_prompt_history_path, reconcile_config_roster, restore_mouse_after_selection_window,
         resume_launch_from_metadata, run_relay_sequence_with_controls, sanitize_direct_event,
-        session_metadata_path_for, standalone_session_metadata, terminal_capture_enabled_for,
-        validate_project_directory,
+        session_metadata_path_for, should_apply_configured_models, standalone_session_metadata,
+        terminal_capture_enabled_for, validate_project_directory,
     };
     use async_trait::async_trait;
     use codeswarm::tui::{App, ConfigKey, PermissionAction, QueuedPrompt, StoreAgent};
@@ -3902,6 +3909,29 @@ mod tests {
         assert_eq!(batch.first(), Some(&0));
         assert_eq!(batch.last(), Some(&(MAX_EVENTS_PER_FRAME - 1)));
         assert_eq!(receiver.try_recv(), Ok(MAX_EVENTS_PER_FRAME));
+    }
+
+    #[test]
+    fn model_catalog_replacement_does_not_reapply_configuration() {
+        assert!(should_apply_configured_models(&AgentEvent::Ready {
+            slot: 1,
+            capabilities: AgentCapabilities {
+                supports_models: true,
+                ..AgentCapabilities::default()
+            },
+        }));
+        assert!(!should_apply_configured_models(
+            &AgentEvent::ModelsReplaced {
+                slot: 1,
+                config_id: "model".into(),
+                models: Vec::new(),
+                current_model: None,
+            }
+        ));
+        assert!(!should_apply_configured_models(&AgentEvent::Ready {
+            slot: 1,
+            capabilities: AgentCapabilities::default(),
+        }));
     }
 
     #[derive(Debug)]

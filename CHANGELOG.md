@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-09-02
+
+### Fixed
+
+- Provider model-catalog notifications no longer retrigger `set_model`; saved
+  slot models are applied once when the target becomes ready, preventing a
+  post-configuration feedback loop and continuous footer flashing.
+
 ## [0.8.6] - 2026-09-02
 
 ### Changed
