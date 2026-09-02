@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-02
+
+### Added
+
+- Rosters are persisted as ordered slots, so one agent can occupy multiple
+  positions with an independent model selection in each slot. Legacy
+  newline-separated roster settings remain readable and migrate on save.
+
+### Fixed
+
+- Tool activity stays in the timestamped agent transcript rather than the
+  transient status ribbon. Each turn shows a rolling window of its two latest
+  tool calls, one compact detail row per call; `Ctrl+O` opens the retained full
+  details.
+- Sustained adapter output is processed in bounded batches, so it cannot starve
+  terminal rendering or keyboard input.
+
 ## [0.8.1] - 2026-08-31
 
 ### Changed

@@ -259,6 +259,9 @@ pub struct StoreAgent {
     pub command: String,
     pub available: bool,
     pub selected: bool,
+    /// Desired model for this roster slot. Unselected catalog template rows
+    /// keep this empty.
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -797,6 +800,23 @@ struct StatusBanner {
     expires_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct ToolCall {
+    id: String,
+    title: String,
+    status: ToolStatus,
+    detail: Option<String>,
+}
+
+#[derive(Debug)]
+struct ToolWindow {
+    block_id: u64,
+    prefix: String,
+    calls: VecDeque<ToolCall>,
+}
+
+const MAX_TOOL_WINDOW_ROWS: usize = 2;
+
 #[derive(Debug)]
 pub struct App {
     pub transcript: Transcript,
@@ -846,7 +866,7 @@ pub struct App {
     agent_states: BTreeMap<usize, String>,
     agent_modes: BTreeMap<usize, (Vec<codeswarm_adapters::Mode>, Option<String>)>,
     agent_models: BTreeMap<usize, (String, Vec<codeswarm_adapters::Mode>, Option<String>)>,
-    pending_model_changes: BTreeMap<String, String>,
+    pending_model_changes: BTreeMap<usize, String>,
     agent_commands: BTreeMap<usize, Vec<AgentCommand>>,
     agent_usage: BTreeMap<usize, UsageUpdate>,
     agent_turn_started: BTreeMap<usize, Instant>,
@@ -857,10 +877,9 @@ pub struct App {
     selected_queue: Option<usize>,
     keyboard_help: bool,
     streaming_blocks: BTreeMap<(usize, crate::transcript::BlockKind), u64>,
-    /// Active tool-call IDs are stable across ACP lifecycle updates. Keep the
-    /// corresponding transcript block so updates replace the preview in
-    /// place instead of adding an unbounded card for every status change.
-    tool_blocks: BTreeMap<(usize, String), u64>,
+    /// One compact rolling tool window per active agent turn. Each window
+    /// keeps the latest two calls and retains full details for Ctrl+O.
+    tool_windows: BTreeMap<usize, ToolWindow>,
     focused_detail: Option<u64>,
     /// Background workspace index used only by the optional `@path` picker.
     /// It is deliberately separate from transcript state so index updates do
@@ -938,7 +957,7 @@ impl Default for App {
             selected_queue: None,
             keyboard_help: false,
             streaming_blocks: BTreeMap::new(),
-            tool_blocks: BTreeMap::new(),
+            tool_windows: BTreeMap::new(),
             focused_detail: None,
             path_index: None,
             path_query: String::new(),
@@ -995,7 +1014,7 @@ impl App {
                 self.transcript.clear();
                 self.scroll_y = 0;
                 self.streaming_blocks.clear();
-                self.tool_blocks.clear();
+                self.tool_windows.clear();
                 self.focused_detail = None;
                 self.status = "conversation cleared".into();
                 LocalCommand::Handled
@@ -1075,9 +1094,16 @@ impl App {
         self.status = "collaboration configuration".into();
     }
 
-    pub fn take_config_model_changes(&mut self) -> Vec<(String, String)> {
-        std::mem::take(&mut self.pending_model_changes)
-            .into_iter()
+    pub fn take_config_model_changes(&mut self) -> Vec<(usize, String)> {
+        self.pending_model_changes.clear();
+        let live_slots = self.active_roster_slots();
+        self.config_agents
+            .iter()
+            .filter(|agent| agent.selected)
+            .enumerate()
+            .filter_map(|(position, agent)| {
+                Some((*live_slots.get(position)?, agent.model.clone()?))
+            })
             .collect()
     }
 
@@ -1116,6 +1142,33 @@ impl App {
             .filter(|agent| agent.selected)
             .map(|agent| agent.identity.clone())
             .collect()
+    }
+
+    /// Return the ordered independent roster slots, including model choices.
+    pub fn config_roster_slots(&self) -> Vec<codeswarm_adapters::launcher::RosterSlot> {
+        self.config_agents
+            .iter()
+            .filter(|agent| agent.selected)
+            .map(|agent| codeswarm_adapters::launcher::RosterSlot {
+                agent: agent.identity.clone(),
+                model: agent.model.clone(),
+            })
+            .collect()
+    }
+
+    fn live_slot_for_config_row(&self, row: usize) -> Option<usize> {
+        let identity = &self.config_agents.get(row)?.identity;
+        let occurrence = self.config_agents[..row]
+            .iter()
+            .filter(|agent| agent.selected && agent.identity.eq_ignore_ascii_case(identity))
+            .count();
+        self.active_roster_slots()
+            .into_iter()
+            .filter(|slot| {
+                self.agent_identity(*slot)
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(identity))
+            })
+            .nth(occurrence)
     }
 
     pub fn show_store(&mut self, agents: Vec<StoreAgent>) {
@@ -1197,8 +1250,24 @@ impl App {
                 StoreAction::Changed
             }
             StoreKey::Toggle => {
-                self.store_agents[self.store_selected].selected =
-                    !self.store_agents[self.store_selected].selected;
+                let agent = self.store_agents[self.store_selected].clone();
+                if agent.selected {
+                    self.store_agents.remove(self.store_selected);
+                    self.store_selected = self
+                        .store_selected
+                        .min(self.store_agents.len().saturating_sub(1));
+                } else {
+                    let mut slot = agent;
+                    slot.selected = true;
+                    slot.model = None;
+                    let insert_at = self
+                        .store_agents
+                        .iter()
+                        .position(|agent| !agent.selected)
+                        .unwrap_or(self.store_agents.len());
+                    self.store_agents.insert(insert_at, slot);
+                    self.store_selected = insert_at;
+                }
                 StoreAction::Changed
             }
             StoreKey::Save => {
@@ -1216,13 +1285,19 @@ impl App {
                 self.store_status = "Roster saved".into();
                 StoreAction::Save(selected)
             }
-            StoreKey::MoveUp if self.store_selected > 0 => {
+            StoreKey::MoveUp
+                if self.store_selected > 0 && self.store_agents[self.store_selected].selected =>
+            {
                 self.store_agents
                     .swap(self.store_selected, self.store_selected - 1);
                 self.store_selected -= 1;
                 StoreAction::Changed
             }
-            StoreKey::MoveDown if self.store_selected + 1 < self.store_agents.len() => {
+            StoreKey::MoveDown
+                if self.store_selected + 1 < self.store_agents.len()
+                    && self.store_agents[self.store_selected].selected
+                    && self.store_agents[self.store_selected + 1].selected =>
+            {
                 self.store_agents
                     .swap(self.store_selected, self.store_selected + 1);
                 self.store_selected += 1;
@@ -1316,16 +1391,14 @@ impl App {
                 if self.config_selected >= CONFIG_SETTING_COUNT =>
             {
                 let index = self.config_selected - CONFIG_SETTING_COUNT;
-                let Some(identity) = self
-                    .config_agents
-                    .get(index)
-                    .map(|agent| agent.identity.clone())
-                else {
+                let Some(agent) = self.config_agents.get(index) else {
                     return ConfigAction::Ignored;
                 };
-                let Some(slot) = self.agent_identities.iter().find_map(|(slot, candidate)| {
-                    candidate.eq_ignore_ascii_case(&identity).then_some(*slot)
-                }) else {
+                if !agent.selected {
+                    self.status = "add this agent to a slot before selecting its model".into();
+                    return ConfigAction::Ignored;
+                }
+                let Some(slot) = self.live_slot_for_config_row(index) else {
                     self.status = "model list is available after the agent starts".into();
                     return ConfigAction::Ignored;
                 };
@@ -1340,8 +1413,9 @@ impl App {
                 }
                 let current = self
                     .pending_model_changes
-                    .get(&identity)
+                    .get(&slot)
                     .cloned()
+                    .or_else(|| self.config_agents[index].model.clone())
                     .or(current);
                 let position = current
                     .as_ref()
@@ -1353,7 +1427,9 @@ impl App {
                     position.checked_sub(1).unwrap_or(models.len() - 1)
                 };
                 self.pending_model_changes
-                    .insert(identity, models[next].id.clone());
+                    .insert(slot, models[next].id.clone());
+                self.config_agents[index].model = Some(models[next].id.clone());
+                self.config_roster_dirty = true;
                 self.status = format!("{} model: {}", self.agent_name(slot), models[next].label);
                 ConfigAction::Changed
             }
@@ -1362,10 +1438,22 @@ impl App {
                 if self.config_selected >= CONFIG_SETTING_COUNT =>
             {
                 let index = self.config_selected - CONFIG_SETTING_COUNT;
+                if !self
+                    .config_agents
+                    .get(index)
+                    .is_some_and(|agent| agent.selected)
+                {
+                    return ConfigAction::Ignored;
+                }
+                let slot_count = self
+                    .config_agents
+                    .iter()
+                    .take_while(|agent| agent.selected)
+                    .count();
                 let target = if key == ConfigKey::MoveUp {
                     index.checked_sub(1)
                 } else {
-                    (index + 1 < self.config_agents.len()).then_some(index + 1)
+                    (index + 1 < slot_count).then_some(index + 1)
                 };
                 if let Some(target) = target {
                     self.config_agents.swap(index, target);
@@ -1400,13 +1488,29 @@ impl App {
             ConfigKey::Confirm => {
                 if self.config_selected >= CONFIG_SETTING_COUNT {
                     let index = self.config_selected - CONFIG_SETTING_COUNT;
-                    if let Some(agent) = self.config_agents.get_mut(index) {
-                        agent.selected = !agent.selected;
+                    if let Some(agent) = self.config_agents.get(index).cloned() {
+                        if agent.selected {
+                            self.config_agents.remove(index);
+                            self.config_selected = self.config_selected.min(
+                                CONFIG_SETTING_COUNT + self.config_agents.len().saturating_sub(1),
+                            );
+                        } else {
+                            let mut slot = agent.clone();
+                            slot.selected = true;
+                            slot.model = None;
+                            let insert_at = self
+                                .config_agents
+                                .iter()
+                                .position(|agent| !agent.selected)
+                                .unwrap_or(self.config_agents.len());
+                            self.config_agents.insert(insert_at, slot);
+                            self.config_selected = CONFIG_SETTING_COUNT + insert_at;
+                        }
                         self.config_roster_dirty = true;
                         self.status = if agent.selected {
-                            format!("{} added to roster", agent.name)
+                            format!("{} slot removed", agent.name)
                         } else {
-                            format!("{} removed from roster", agent.name)
+                            format!("{} slot added", agent.name)
                         };
                     }
                     return ConfigAction::Changed;
@@ -2601,63 +2705,53 @@ impl App {
                     self.status = "waiting".into();
                     return;
                 }
-                let state = match update.status {
-                    ToolStatus::Pending => "pending",
-                    ToolStatus::Running => "running",
-                    ToolStatus::Completed => "completed",
-                    ToolStatus::Failed => "failed",
-                };
-                let kind = update
-                    .detail
-                    .as_deref()
-                    .filter(|detail| looks_like_unified_diff(detail))
-                    .map_or(crate::transcript::BlockKind::Tool, |_| {
-                        crate::transcript::BlockKind::Diff
+                if !self.tool_windows.contains_key(slot) {
+                    let prefix = agent_message_prefix(&self.agent_name(*slot));
+                    let block_id = self.transcript.append(
+                        crate::transcript::BlockKind::Tool,
+                        prefix.clone(),
+                        true,
+                    );
+                    self.tool_windows.insert(
+                        *slot,
+                        ToolWindow {
+                            block_id,
+                            prefix,
+                            calls: VecDeque::new(),
+                        },
+                    );
+                }
+                let (block_id, source) = {
+                    let window = self
+                        .tool_windows
+                        .get_mut(slot)
+                        .expect("tool window inserted");
+                    window.calls.retain(|call| call.id != update.id);
+                    window.calls.push_back(ToolCall {
+                        id: update.id.clone(),
+                        title: update.title.clone(),
+                        status: update.status,
+                        detail: update.detail.clone(),
                     });
-                let key = (*slot, update.id.clone());
-                let prefix = self
-                    .tool_blocks
-                    .get(&key)
-                    .and_then(|id| self.transcript.source(*id))
-                    .and_then(attributed_message_prefix)
-                    .unwrap_or_else(|| agent_message_prefix(&self.agent_name(*slot)));
-                let source = update.detail.as_deref().map_or_else(
-                    || format!("{prefix}{} · {state}", update.title),
-                    |detail| format!("{prefix}{} · {state}\n{detail}", update.title),
+                    while window.calls.len() > MAX_TOOL_WINDOW_ROWS {
+                        window.calls.pop_front();
+                    }
+                    (window.block_id, tool_window_source(window))
+                };
+                let _ = self.transcript.replace(
+                    block_id,
+                    crate::transcript::BlockKind::Tool,
+                    source,
+                    self.transcript.is_collapsed(block_id) != Some(false),
                 );
-                let initially_collapsed = if kind == crate::transcript::BlockKind::Tool {
-                    // Normal tool calls always enter the transcript as a
-                    // compact two-line preview. Ctrl+O is the only path that
-                    // opens retained output; failures must not self-expand.
-                    true
+                self.focused_detail = Some(block_id);
+                self.active_agent = self.agent_name(*slot);
+                self.agent_states.insert(*slot, "working".into());
+                self.status = if update.status == ToolStatus::Failed {
+                    format!("tool failed: {}", update.title)
                 } else {
-                    match self.tool_expand_policy {
-                        ToolExpandPolicy::Always => false,
-                        ToolExpandPolicy::Never => true,
-                        ToolExpandPolicy::Fail => {
-                            self.collapse_details && update.status != ToolStatus::Failed
-                        }
-                    }
+                    "working".into()
                 };
-                let id = if let Some(id) = self.tool_blocks.get(&key).copied() {
-                    let collapsed = if self.transcript.is_collapsed(id) == Some(false) {
-                        false
-                    } else {
-                        initially_collapsed
-                    };
-                    if self.transcript.replace(id, kind, source.clone(), collapsed) {
-                        id
-                    } else {
-                        let id = self.transcript.append(kind, source, initially_collapsed);
-                        self.tool_blocks.insert(key, id);
-                        id
-                    }
-                } else {
-                    let id = self.transcript.append(kind, source, initially_collapsed);
-                    self.tool_blocks.insert(key, id);
-                    id
-                };
-                self.focused_detail = Some(id);
             }
             AgentEvent::Permission { slot, request } => {
                 self.mark_agent_turn_started(*slot);
@@ -2699,8 +2793,7 @@ impl App {
                     .remove(&(*slot, crate::transcript::BlockKind::Agent));
                 self.streaming_blocks
                     .remove(&(*slot, crate::transcript::BlockKind::Thought));
-                self.tool_blocks
-                    .retain(|(tool_slot, _), _| tool_slot != slot);
+                self.tool_windows.remove(slot);
                 self.streaming_blocks
                     .remove(&(*slot, crate::transcript::BlockKind::Human));
                 if self
@@ -2721,6 +2814,7 @@ impl App {
             } => {
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
+                self.tool_windows.remove(slot);
                 self.streaming_blocks
                     .remove(&(*slot, crate::transcript::BlockKind::Agent));
                 self.streaming_blocks
@@ -3000,7 +3094,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
     let total_height = usize::from(area.height);
     // Keep one stable system-message row immediately above the prompt, plus a
-    // separator and footer below it. None appears or disappears with activity.
+    // separator and footer below it. Tool activity belongs in the transcript.
     let status_height = usize::from(area.height > 0);
     let system_height = usize::from(area.height > 2);
     let separator_height = usize::from(area.height > 3);
@@ -3135,10 +3229,29 @@ fn agent_message_prefix(name: &str) -> String {
     format!("{name}: [{:02}:{:02}] ", now.hour(), now.minute())
 }
 
-fn attributed_message_prefix(source: &str) -> Option<String> {
-    let (speaker, body) = source.split_once(": ")?;
-    let end = body.find("] ").filter(|_| body.starts_with('['))?;
-    Some(format!("{speaker}: {}", &body[..end + 2]))
+fn tool_status_label(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Pending => "pending",
+        ToolStatus::Running => "running",
+        ToolStatus::Completed => "completed",
+        ToolStatus::Failed => "failed",
+    }
+}
+
+fn tool_window_source(window: &ToolWindow) -> String {
+    let calls = window
+        .calls
+        .iter()
+        .map(|call| {
+            let header = format!("🔧 {} · {}", call.title, tool_status_label(call.status));
+            call.detail
+                .as_deref()
+                .filter(|detail| !detail.trim().is_empty())
+                .map_or(header.clone(), |detail| format!("{header}\n{detail}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{}{}", window.prefix, calls)
 }
 
 fn footer_mode_label(app: &App) -> String {
@@ -3972,15 +4085,14 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
                     }),
                 ),
             ];
-            if let Some(slot) = app.agent_identities.iter().find_map(|(slot, identity)| {
-                identity
-                    .eq_ignore_ascii_case(&agent.identity)
-                    .then_some(*slot)
-            }) && let Some((_config_id, models, current)) = app.agent_models.get(&slot)
+            if agent.selected
+                && let Some(slot) = app.live_slot_for_config_row(roster_index)
+                && let Some((_config_id, models, current)) = app.agent_models.get(&slot)
             {
                 let selected_model = app
                     .pending_model_changes
-                    .get(&agent.identity)
+                    .get(&slot)
+                    .or(agent.model.as_ref())
                     .or(current.as_ref())
                     .or_else(|| models.first().map(|model| &model.id));
                 if let Some(model) =
@@ -4708,16 +4820,6 @@ fn add_file_reference_range(
     }
 }
 
-fn looks_like_unified_diff(text: &str) -> bool {
-    let mut has_hunk = false;
-    let mut has_file_header = false;
-    for line in text.lines() {
-        has_hunk |= line.starts_with("@@");
-        has_file_header |= line.starts_with("--- ") || line.starts_with("+++ ");
-    }
-    has_hunk && has_file_header
-}
-
 #[cfg(test)]
 mod tests {
     use crate::transcript::BlockKind;
@@ -4734,11 +4836,10 @@ mod tests {
         ACCENT, AGENT_COLORS, App, CONFIG_SETTING_COUNT, ConfigAction, ConfigKey, FooterAction,
         LocalCommand, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PathPickerAction, PermissionAction,
         PermissionKey, PromptAction, PromptEditor, STATUS_BG, StoreAction, StoreAgent, StoreKey,
-        THOUGHT_TEXT, TRANSCRIPT_BG, agent_header_color, agent_slot_color,
-        attributed_message_prefix, block_style, cell_width, compact_cell_label,
-        compact_workspace_path, file_reference_spans, footer_agent_label, format_turn_elapsed,
-        markdown_spans, markdown_style, marker_style, render, render_prompt_separator, row_style,
-        selected_style,
+        THOUGHT_TEXT, TRANSCRIPT_BG, agent_header_color, agent_slot_color, block_style, cell_width,
+        compact_cell_label, compact_workspace_path, file_reference_spans, footer_agent_label,
+        format_turn_elapsed, markdown_spans, markdown_style, marker_style, render,
+        render_prompt_separator, row_style, selected_style,
     };
 
     fn key(key: Key) -> Input {
@@ -5746,12 +5847,7 @@ mod tests {
             },
         });
         assert_eq!(app.transcript.len(), blocks_before_wait + 1);
-        assert!(
-            app.transcript
-                .viewport(80, 0, 4, 0)
-                .iter()
-                .any(|row| row.text.contains("Tool · Tool call · completed"))
-        );
+        assert_eq!(app.tool_windows[&0].calls.len(), 1);
         assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
 
         for (id, title) in [("read", "Read files"), ("search", "Search code")] {
@@ -5766,7 +5862,7 @@ mod tests {
             });
         }
         assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
-        assert!(app.transcript.row_count(80) > 0);
+        assert_eq!(app.transcript.row_count(80), 3);
 
         app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
         assert!(!footer_agent_label(&app, 0, 1).contains("1:05"));
@@ -6094,6 +6190,7 @@ mod tests {
                 command: "one --acp".into(),
                 available: true,
                 selected: true,
+                model: None,
             },
             StoreAgent {
                 identity: "two.example".into(),
@@ -6102,6 +6199,7 @@ mod tests {
                 command: "two".into(),
                 available: true,
                 selected: false,
+                model: None,
             },
         ]);
         app.handle_local_command("/config");
@@ -6141,6 +6239,7 @@ mod tests {
             command: "codex-acp".into(),
             available: true,
             selected: true,
+            model: None,
         }]);
         app.apply_event(&codeswarm_adapters::AgentEvent::ModelsReplaced {
             slot: 0,
@@ -6163,6 +6262,7 @@ mod tests {
             app.handle_config_key(ConfigKey::NextValue),
             ConfigAction::Changed
         );
+        assert!(app.config_roster_dirty());
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut app))
@@ -6175,9 +6275,64 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Smart ←/→"), "rendered={rendered:?}");
+        assert_eq!(app.take_config_model_changes(), vec![(0, "smart".into())]);
+    }
+
+    #[test]
+    fn duplicate_agent_slots_target_their_own_models() {
+        let mut app = App::default();
+        for slot in 0..2 {
+            app.set_agent_name(slot, "Claude");
+            app.set_agent_identity(slot, "anthropic.com");
+            app.apply_event(&codeswarm_adapters::AgentEvent::ModelsReplaced {
+                slot,
+                config_id: "model".into(),
+                models: vec![
+                    codeswarm_adapters::Mode {
+                        id: "sonnet".into(),
+                        label: "Sonnet".into(),
+                    },
+                    codeswarm_adapters::Mode {
+                        id: "opus".into(),
+                        label: "Opus".into(),
+                    },
+                ],
+                current_model: Some(if slot == 0 { "sonnet" } else { "opus" }.into()),
+            });
+        }
+        app.set_config_agents(vec![
+            StoreAgent {
+                identity: "anthropic.com".into(),
+                name: "Claude".into(),
+                adapter: "ACP".into(),
+                command: "claude-agent-acp".into(),
+                available: true,
+                selected: true,
+                model: Some("sonnet".into()),
+            },
+            StoreAgent {
+                identity: "anthropic.com".into(),
+                name: "Claude".into(),
+                adapter: "ACP".into(),
+                command: "claude-agent-acp".into(),
+                available: true,
+                selected: true,
+                model: Some("opus".into()),
+            },
+        ]);
+        app.open_config();
+        app.config_selected = CONFIG_SETTING_COUNT + 1;
+        assert_eq!(
+            app.handle_config_key(ConfigKey::PreviousValue),
+            ConfigAction::Changed
+        );
         assert_eq!(
             app.take_config_model_changes(),
-            vec![("openai.com".into(), "smart".into())]
+            vec![(0, "sonnet".into()), (1, "sonnet".into())]
+        );
+        assert_eq!(
+            app.config_roster_slots()[1].model.as_deref(),
+            Some("sonnet")
         );
     }
 
@@ -6192,6 +6347,7 @@ mod tests {
                 command: "codex --acp".into(),
                 available: true,
                 selected: true,
+                model: None,
             },
             StoreAgent {
                 identity: "qwen.example".into(),
@@ -6200,6 +6356,7 @@ mod tests {
                 command: "qwen --acp".into(),
                 available: true,
                 selected: true,
+                model: None,
             },
         ]);
         app.open_collaboration_config();
@@ -6449,7 +6606,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_tool_activity_starts_collapsed_for_every_expand_policy() {
+    fn completed_tool_activity_uses_the_rolling_transcript_for_every_expand_policy() {
         let tool = |status| codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
@@ -6462,20 +6619,20 @@ mod tests {
 
         let mut app = App::default();
         app.apply_event(&tool(codeswarm_adapters::ToolStatus::Completed));
-        assert_eq!(app.transcript.row_count(80), 3);
+        assert_eq!(app.transcript.row_count(80), 2);
         let mut failed = App::default();
         failed.apply_event(&tool(codeswarm_adapters::ToolStatus::Failed));
-        assert_eq!(failed.transcript.row_count(80), 3);
+        assert_eq!(failed.transcript.row_count(80), 2);
 
         let mut always = App::default();
         always.set_tool_expand_policy("always");
         always.apply_event(&tool(codeswarm_adapters::ToolStatus::Completed));
-        assert_eq!(always.transcript.row_count(80), 3);
+        assert_eq!(always.transcript.row_count(80), 2);
 
         let mut never = App::default();
         never.set_tool_expand_policy("never");
         never.apply_event(&tool(codeswarm_adapters::ToolStatus::Failed));
-        assert_eq!(never.transcript.row_count(80), 3);
+        assert_eq!(never.transcript.row_count(80), 2);
     }
 
     #[test]
@@ -6527,6 +6684,7 @@ mod tests {
             command: "codex --acp".into(),
             available: true,
             selected: true,
+            model: None,
         }]);
         app.handle_local_command("/config");
         terminal
@@ -6620,6 +6778,7 @@ mod tests {
                 command: "one-acp".into(),
                 available: true,
                 selected: false,
+                model: None,
             },
             StoreAgent {
                 identity: "two.example".into(),
@@ -6628,6 +6787,7 @@ mod tests {
                 command: "two".into(),
                 available: true,
                 selected: false,
+                model: None,
             },
         ]);
         assert_eq!(app.handle_store_key(StoreKey::Toggle), StoreAction::Changed);
@@ -6635,6 +6795,7 @@ mod tests {
             app.handle_store_key(StoreKey::Save),
             StoreAction::Save(vec![0])
         );
+        assert_eq!(app.handle_store_key(StoreKey::Down), StoreAction::Changed);
         assert_eq!(app.handle_store_key(StoreKey::Down), StoreAction::Changed);
         assert_eq!(app.handle_store_key(StoreKey::Toggle), StoreAction::Changed);
         assert_eq!(app.handle_store_key(StoreKey::MoveUp), StoreAction::Changed);
@@ -6656,6 +6817,7 @@ mod tests {
             command: "missing-agent".into(),
             available: false,
             selected: true,
+            model: None,
         }]);
 
         assert_eq!(
@@ -6686,6 +6848,7 @@ mod tests {
             command: "custom-agent --acp".into(),
             available: false,
             selected: false,
+            model: None,
         }]);
         terminal
             .draw(|frame| render(frame, &mut app))
@@ -6720,6 +6883,7 @@ mod tests {
             command: "agent".into(),
             available: true,
             selected: false,
+            model: None,
         }]);
         app.set_store_directory("");
         app.begin_store_directory_edit();
@@ -6783,6 +6947,7 @@ mod tests {
             command: "mobile-agent".into(),
             available: true,
             selected: false,
+            model: None,
         }]);
         terminal
             .draw(|frame| render(frame, &mut app))
@@ -6814,6 +6979,7 @@ mod tests {
                     command: format!("agent-{index}"),
                     available: true,
                     selected: false,
+                    model: None,
                 })
                 .collect(),
         );
@@ -6995,33 +7161,34 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_renders_below_header_with_two_line_preview_and_one_hint() {
+    fn tools_render_under_the_agent_header_as_a_two_line_rolling_window() {
         let backend = TestBackend::new(72, 12);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
         app.set_agent_name(0, "Antigravity");
-        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
+        let tool = |id: &str, status| codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
-                id: "read".into(),
-                title: "Read files".into(),
-                status: codeswarm_adapters::ToolStatus::Running,
-                detail: Some("first output line\nsecond output line\nthird output line".into()),
+                id: id.into(),
+                title: format!("Noisy {id}"),
+                status,
+                detail: Some("tool output that remains available with Ctrl+O".into()),
             },
-        });
-
+        };
+        app.apply_event(&tool("one", codeswarm_adapters::ToolStatus::Pending));
+        app.apply_event(&tool("two", codeswarm_adapters::ToolStatus::Running));
+        app.apply_event(&tool("three", codeswarm_adapters::ToolStatus::Running));
+        assert_eq!(app.transcript.len(), 1);
+        assert_eq!(app.tool_windows[&0].calls.len(), 2);
         let preview = app.transcript.viewport(72, 0, 10, 0);
         assert_eq!(preview.len(), 3);
-        assert_eq!(preview[0].kind, BlockKind::Agent);
-        assert_eq!(preview[1].kind, BlockKind::Tool);
-        assert_eq!(preview[2].kind, BlockKind::Tool);
-        assert!(preview[1].text.starts_with("Tool · Read files · running"));
-        assert!(preview[2].text.ends_with('…'));
-        assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
+        assert!(preview[0].text.starts_with("Antigravity: ["));
+        assert!(preview[1].text.contains("Noisy two"));
+        assert!(preview[2].text.contains("Noisy three"));
 
         terminal
             .draw(|frame| render(frame, &mut app))
-            .expect("draw collapsed tool");
+            .expect("draw tool window");
         let rows = terminal
             .backend()
             .buffer()
@@ -7029,62 +7196,27 @@ mod tests {
             .chunks(72)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>();
-        let header_row = rows
-            .iter()
-            .position(|row| row.contains("● Antigravity"))
-            .expect("agent header");
-        let tool_row = rows
-            .iter()
-            .position(|row| row.contains("Tool · Read files · running"))
-            .expect("tool preview");
-        assert_eq!(tool_row, header_row + 1);
+        assert!(rows.iter().any(|row| row.contains("Antigravity")));
+        assert_eq!(rows.iter().filter(|row| row.contains("Noisy")).count(), 2);
         assert_eq!(
             rows.iter()
                 .filter(|row| row.contains("Ctrl+O open"))
                 .count(),
             1
         );
-
-        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
-            slot: 0,
-            update: codeswarm_adapters::ToolUpdate {
-                id: "read".into(),
-                title: "Read files".into(),
-                status: codeswarm_adapters::ToolStatus::Completed,
-                detail: Some("updated output\nsecond line\nthird line".into()),
-            },
-        });
-        assert_eq!(app.transcript.len(), 1);
-        assert!(
-            app.transcript
-                .viewport(72, 0, 10, 0)
-                .iter()
-                .any(|row| row.text.contains("Read files · completed"))
-        );
         assert_eq!(app.toggle_focused_detail(), Some(false));
-        assert!(app.transcript.row_count(72) > 3);
-        let tool_id = app.focused_detail.expect("focused tool");
-        let original_prefix =
-            attributed_message_prefix(app.transcript.source(tool_id).expect("tool source"))
-                .expect("tool attribution");
-        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
-            slot: 0,
-            update: codeswarm_adapters::ToolUpdate {
-                id: "read".into(),
-                title: "Read files".into(),
-                status: codeswarm_adapters::ToolStatus::Completed,
-                detail: Some("final output\nsecond line\nthird line".into()),
-            },
-        });
-        assert_eq!(app.transcript.is_collapsed(tool_id), Some(false));
-        assert_eq!(
-            attributed_message_prefix(app.transcript.source(tool_id).expect("updated source")),
-            Some(original_prefix)
+        assert!(
+            app.export_markdown()
+                .contains("tool output that remains available")
         );
+        app.apply_event(&tool("three", codeswarm_adapters::ToolStatus::Completed));
+        assert_eq!(app.tool_windows[&0].calls.len(), 2);
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
+        assert!(!app.tool_windows.contains_key(&0));
     }
 
     #[test]
-    fn ordinary_tool_details_render_collapsed_and_expand_with_ctrl_o() {
+    fn tool_output_is_retained_for_ctrl_o_and_export() {
         let mut app = App::default();
         app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
@@ -7095,46 +7227,9 @@ mod tests {
                 detail: Some("large output\nsecond line".into()),
             },
         });
-        assert_eq!(app.transcript.row_count(80), 3);
+        assert_eq!(app.transcript.row_count(80), 2);
         assert_eq!(app.toggle_focused_detail(), Some(false));
-        assert!(app.transcript.row_count(80) > 3);
         assert!(app.export_markdown().contains("large output\nsecond line"));
-    }
-
-    #[test]
-    fn tool_diff_payload_is_retained_and_classified_lazily() {
-        let mut app = App::default();
-        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
-            slot: 0,
-            update: codeswarm_adapters::ToolUpdate {
-                id: "patch".into(),
-                title: "Apply patch".into(),
-                status: codeswarm_adapters::ToolStatus::Completed,
-                detail: Some("--- a/file.rs\n+++ b/file.rs\n@@ -1 +1 @@\n-old\n+new".into()),
-            },
-        });
-        let rows = app.transcript.viewport(80, 0, 4, 0);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].kind, BlockKind::Agent);
-        assert_eq!(rows[1].kind, BlockKind::Diff);
-        assert!(rows[1].text.contains("Diff"));
-        assert_eq!(app.toggle_focused_detail(), Some(false));
-        assert!(app.transcript.row_count(80) > 1);
-        app.set_diff_split(true);
-        let backend = TestBackend::new(80, 12);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
-        terminal
-            .draw(|frame| render(frame, &mut app))
-            .expect("draw split diff");
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("original"), "rendered={rendered:?}");
-        assert!(rendered.contains("updated"), "rendered={rendered:?}");
     }
 
     #[test]
@@ -7406,6 +7501,7 @@ mod tests {
             command: "codex-acp".into(),
             available: true,
             selected: true,
+            model: None,
         }]);
         terminal
             .draw(|frame| render(frame, &mut app))

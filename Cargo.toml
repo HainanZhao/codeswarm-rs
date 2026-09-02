@@ -3,7 +3,7 @@ members = [".", "crates/codeswarm-adapters"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.1"
+version = "0.8.4"
 edition = "2024"
 license = "MIT"
 authors = ["CodeSwarm contributors"]
@@ -43,7 +43,7 @@ name = "codeswarm"
 path = "crates/codeswarm-cli/src/main.rs"
 
 [dependencies]
-codeswarm-adapters = { version = "=0.8.1", path = "crates/codeswarm-adapters" }
+codeswarm-adapters = { version = "=0.8.4", path = "crates/codeswarm-adapters" }
 crossterm.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true

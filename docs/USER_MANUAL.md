@@ -94,10 +94,12 @@ bounded to preserve tmux responsiveness.
 
 Unknown slash commands are reported locally and are never sent to an agent.
 
-The configuration panel includes the catalog-backed roster,
+The configuration panel includes a slot-based roster. The same catalog agent
+can occupy multiple slots, and each running slot can select and persist a
+different advertised model. Enter adds/removes a slot, Left/Right changes its
+model, and Alt+Up/Down changes slot order. The panel also includes
 compact/comfortable density, normal/hidden scrollbar, thought visibility,
-tool-detail expansion, diff view, and a notification policy. Enter toggles a
-catalog agent, Alt+↑/↓ changes its order, and Ctrl+S saves the roster (and
+tool-detail expansion, diff view, and a notification policy. Ctrl+S saves the roster (and
 applies idle-session changes when possible). On Linux
 notifications use `notify-send`; on
 macOS they use `osascript` when the corresponding system tool is available.

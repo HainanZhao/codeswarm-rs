@@ -8,7 +8,17 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// One persisted roster position. Slots are independent: the same agent may
+/// occupy several positions and each position may select a different model.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RosterSlot {
+    #[serde(alias = "identity")]
+    pub agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 struct SettingsFile {
@@ -17,7 +27,14 @@ struct SettingsFile {
 
 #[derive(Debug, Deserialize)]
 struct LauncherSettings {
-    roster: Option<String>,
+    roster: Option<SavedRoster>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SavedRoster {
+    Slots(Vec<RosterSlot>),
+    Legacy(String),
 }
 
 /// The action the bare launcher should take after reading persisted state.
@@ -50,19 +67,38 @@ impl LaunchDecision {
 /// and values of the wrong type are treated as an empty saved roster; startup
 /// must remain safe when a user has a truncated or hand-edited settings file.
 pub fn parse_saved_roster(settings_json: &str) -> Vec<String> {
+    parse_saved_slots(settings_json)
+        .into_iter()
+        .map(|slot| slot.agent)
+        .collect()
+}
+
+/// Parse the slot-based roster format. The former newline-separated identity
+/// string is accepted as a lossless model-free migration input.
+pub fn parse_saved_slots(settings_json: &str) -> Vec<RosterSlot> {
     let Ok(settings) = serde_json::from_str::<SettingsFile>(settings_json) else {
         return Vec::new();
     };
     settings
         .launcher
         .and_then(|launcher| launcher.roster)
-        .map(|roster| {
-            roster
+        .map(|roster| match roster {
+            SavedRoster::Slots(slots) => slots
+                .into_iter()
+                .filter_map(|mut slot| {
+                    slot.agent = slot.agent.trim().to_owned();
+                    (!slot.agent.is_empty()).then_some(slot)
+                })
+                .collect(),
+            SavedRoster::Legacy(roster) => roster
                 .lines()
                 .map(str::trim)
                 .filter(|identity| !identity.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
+                .map(|agent| RosterSlot {
+                    agent: agent.to_owned(),
+                    model: None,
+                })
+                .collect(),
         })
         .unwrap_or_default()
 }
@@ -85,13 +121,27 @@ pub fn read_saved_roster(path: impl AsRef<Path>) -> Vec<String> {
 /// repeated identities; the launcher does not silently reorder a user's
 /// roster.  Unknown or removed identities are filtered out.
 pub fn resolve_saved_roster(settings_json: &str, available_identities: &[String]) -> Vec<String> {
-    parse_saved_roster(settings_json)
+    resolve_saved_slots(settings_json, available_identities)
         .into_iter()
-        .filter_map(|saved| {
+        .map(|slot| slot.agent)
+        .collect()
+}
+
+/// Resolve saved slots while retaining their per-slot model choices.
+pub fn resolve_saved_slots(
+    settings_json: &str,
+    available_identities: &[String],
+) -> Vec<RosterSlot> {
+    parse_saved_slots(settings_json)
+        .into_iter()
+        .filter_map(|mut saved| {
             available_identities
                 .iter()
-                .find(|available| available.eq_ignore_ascii_case(&saved))
-                .cloned()
+                .find(|available| available.eq_ignore_ascii_case(&saved.agent))
+                .map(|available| {
+                    saved.agent.clone_from(available);
+                    saved
+                })
         })
         .collect()
 }
@@ -115,8 +165,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        LaunchDecision, launch_decision, parse_saved_roster, read_saved_roster,
-        resolve_saved_roster,
+        LaunchDecision, RosterSlot, launch_decision, parse_saved_roster, parse_saved_slots,
+        read_saved_roster, resolve_saved_roster,
     };
 
     fn catalog() -> Vec<String> {
@@ -131,6 +181,24 @@ mod tests {
     fn parses_multiline_roster_and_ignores_blank_lines() {
         let settings = r#"{"launcher":{"roster":" claude.ai\n\nopenai.com \n"}}"#;
         assert_eq!(parse_saved_roster(settings), ["claude.ai", "openai.com"]);
+    }
+
+    #[test]
+    fn parses_duplicate_slot_agents_with_independent_models() {
+        let settings = r#"{"launcher":{"roster":[{"agent":"claude.ai","model":"opus"},{"agent":"claude.ai","model":"sonnet"}]}}"#;
+        assert_eq!(
+            parse_saved_slots(settings),
+            [
+                RosterSlot {
+                    agent: "claude.ai".into(),
+                    model: Some("opus".into())
+                },
+                RosterSlot {
+                    agent: "claude.ai".into(),
+                    model: Some("sonnet".into())
+                },
+            ]
+        );
     }
 
     #[test]

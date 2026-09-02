@@ -88,10 +88,24 @@ entries replace built-ins with the same identity or add a new agent:
 ```
 
 Use `adapter: "native"` for a native command. Bare `codeswarm` displays these
-entries in the store; `Space` selects them, `Alt+↑/↓` changes roster order,
+entries in the store; `Space` adds or removes slots, `Alt+↑/↓` changes roster order,
 `Ctrl+S` saves without launching, and `Enter` saves and launches the selection.
-The store writes the selected identities back
-to `launcher.roster` without overwriting other settings.
+The store writes an ordered array of independent slots to `launcher.roster`
+without overwriting other settings. Repeating an agent is supported, and each
+slot may retain its own advertised model:
+
+```json
+{
+  "launcher": {
+    "roster": [
+      { "agent": "anthropic.com", "model": "claude-opus-4-1" },
+      { "agent": "anthropic.com", "model": "claude-sonnet-4-5" }
+    ]
+  }
+}
+```
+
+Legacy newline-separated `launcher.roster` values are migrated when saved.
 
 ## Commands
 
@@ -99,7 +113,8 @@ Inside the conversation prompt:
 
 - `/help` shows keyboard and command help.
 - `/config` opens settings, including the
-  catalog-backed roster editor (Enter toggles, Alt+↑/↓ reorders, Ctrl+S saves
+  slot-based roster editor (Enter adds/removes a slot, ←/→ selects that
+  running slot's model, Alt+↑/↓ reorders, Ctrl+S saves
   and applies idle-session changes when possible).
 - `/export` writes the retained conversation to Markdown.
 - `/cancel` cancels active work and reports when nothing is running.

@@ -17,7 +17,7 @@ use codeswarm::tui::{
 use codeswarm_adapters::PermissionAnswer;
 use codeswarm_adapters::agents::{AdapterKind, AgentDefinition, catalog_from_settings};
 use codeswarm_adapters::history;
-use codeswarm_adapters::launcher::{LaunchDecision, launch_decision, parse_saved_roster};
+use codeswarm_adapters::launcher::{RosterSlot, parse_saved_slots, resolve_saved_slots};
 use codeswarm_adapters::persistence::{SessionMetadata, SessionMetadataStore};
 use codeswarm_adapters::relay::{CollaborationStrategy, RelayDecision};
 use codeswarm_adapters::settings;
@@ -281,7 +281,7 @@ enum AdapterControl {
     SetStrategy(CollaborationStrategy),
     SetMode(String),
     SetModel {
-        identity: String,
+        slot: usize,
         model: String,
     },
     Reload(usize),
@@ -393,6 +393,7 @@ enum Launch {
     Roster {
         specs: Vec<AgentSpec>,
         identities: Vec<String>,
+        models: Vec<Option<String>>,
         session_ids: Vec<Option<String>>,
         prompt: Option<String>,
         first_slot: usize,
@@ -490,6 +491,7 @@ fn main() -> std::io::Result<()> {
         Launch::Roster {
             specs,
             identities,
+            models,
             session_ids,
             prompt,
             first_slot,
@@ -498,6 +500,7 @@ fn main() -> std::io::Result<()> {
             &mut terminal,
             specs,
             identities,
+            models,
             session_ids,
             prompt,
             first_slot,
@@ -718,6 +721,7 @@ fn parse_named_agent_launch(arguments: &[String]) -> Option<Launch> {
     Some(Launch::Roster {
         specs,
         identities,
+        models: Vec::new(),
         session_ids: Vec::new(),
         prompt,
         first_slot,
@@ -851,6 +855,7 @@ fn resume_launch_from_metadata(
     Ok(Launch::Roster {
         specs,
         identities: saved_identities,
+        models: Vec::new(),
         session_ids,
         prompt: None,
         first_slot: 0,
@@ -865,33 +870,34 @@ fn bare_launch_from_settings(settings: &str) -> Launch {
         .filter(|agent| agent.active)
         .map(|agent| agent.identity.clone())
         .collect::<Vec<_>>();
-    match launch_decision(settings, &identities) {
-        LaunchDecision::Restore { identities } => {
-            let specs = identities
-                .iter()
-                .filter_map(|identity| {
-                    catalog
-                        .iter()
-                        .find(|candidate| {
-                            candidate.active && candidate.identity.eq_ignore_ascii_case(identity)
-                        })
-                        .map(agent_spec)
-                })
-                .collect::<Vec<_>>();
-            if specs.is_empty() {
-                Launch::Store
-            } else {
-                Launch::Roster {
-                    specs,
-                    identities,
-                    session_ids: Vec::new(),
-                    prompt: None,
-                    first_slot: 0,
-                    max_rounds: 100,
-                }
+    let slots = resolve_saved_slots(settings, &identities);
+    if slots.is_empty() {
+        Launch::Store
+    } else {
+        let specs = slots
+            .iter()
+            .filter_map(|slot| {
+                catalog
+                    .iter()
+                    .find(|candidate| {
+                        candidate.active && candidate.identity.eq_ignore_ascii_case(&slot.agent)
+                    })
+                    .map(agent_spec)
+            })
+            .collect::<Vec<_>>();
+        if specs.is_empty() {
+            Launch::Store
+        } else {
+            Launch::Roster {
+                specs,
+                identities: slots.iter().map(|slot| slot.agent.clone()).collect(),
+                models: slots.iter().map(|slot| slot.model.clone()).collect(),
+                session_ids: Vec::new(),
+                prompt: None,
+                first_slot: 0,
+                max_rounds: 100,
             }
         }
-        LaunchDecision::OpenStore => Launch::Store,
     }
 }
 
@@ -976,6 +982,7 @@ fn parse_roster_launch(arguments: &[String]) -> Option<Launch> {
     Some(Launch::Roster {
         specs,
         identities,
+        models: Vec::new(),
         session_ids: Vec::new(),
         prompt: Some(prompt?),
         first_slot,
@@ -1123,8 +1130,12 @@ fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std:
         .and_then(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_default();
     let catalog = catalog_from_settings(&settings);
-    let saved_roster = parse_saved_roster(&settings);
-    let has_saved_roster = !saved_roster.is_empty();
+    let saved_slots = parse_saved_slots(&settings);
+    let saved_roster = saved_slots
+        .iter()
+        .map(|slot| slot.agent.clone())
+        .collect::<Vec<_>>();
+    let has_saved_roster = !saved_slots.is_empty();
     let mut launchable_catalog = codeswarm_adapters::agents::active_catalog(catalog);
     launchable_catalog.sort_by_key(|agent| {
         saved_roster
@@ -1132,7 +1143,22 @@ fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std:
             .position(|saved| saved.eq_ignore_ascii_case(&agent.identity))
             .unwrap_or(usize::MAX)
     });
-    let agents = launchable_catalog
+    let default_identities = launchable_catalog
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.short_name.as_str(),
+                "claude" | "codex" | "gemini" | "antigravity"
+            ) && command_available(
+                agent
+                    .detect_command
+                    .as_deref()
+                    .unwrap_or(agent.command.as_str()),
+            )
+        })
+        .map(|agent| agent.identity.clone())
+        .collect::<Vec<_>>();
+    let templates = launchable_catalog
         .iter()
         .map(|agent| {
             // Availability follows the catalog's detection command, not the
@@ -1154,19 +1180,34 @@ fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std:
                 },
                 command: agent.command.clone(),
                 available,
-                selected: if has_saved_roster {
-                    saved_roster
-                        .iter()
-                        .any(|saved| saved.eq_ignore_ascii_case(&agent.identity))
-                } else {
-                    matches!(
-                        agent.short_name.as_str(),
-                        "claude" | "codex" | "gemini" | "antigravity"
-                    ) && available
-                },
+                selected: false,
+                model: None,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let source_slots = if has_saved_roster {
+        saved_slots.clone()
+    } else {
+        default_identities
+            .into_iter()
+            .map(|agent| RosterSlot { agent, model: None })
+            .collect()
+    };
+    let mut agents = source_slots
+        .iter()
+        .filter_map(|slot| {
+            templates
+                .iter()
+                .find(|agent| agent.identity.eq_ignore_ascii_case(&slot.agent))
+                .cloned()
+                .map(|mut agent| {
+                    agent.selected = true;
+                    agent.model = slot.model.clone();
+                    agent
+                })
+        })
+        .collect::<Vec<_>>();
+    agents.extend(templates);
     app.show_store(agents);
     app.set_store_directory(
         std::env::current_dir()
@@ -1249,12 +1290,15 @@ fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std:
         let Some(store_key) = store_key else { continue };
         match app.handle_store_key(store_key) {
             StoreAction::Save(indices) => {
-                let identities = indices
+                let slots = indices
                     .into_iter()
                     .filter_map(|index| app.store_agents().get(index))
-                    .map(|agent| agent.identity.clone())
+                    .map(|agent| RosterSlot {
+                        agent: agent.identity.clone(),
+                        model: agent.model.clone(),
+                    })
                     .collect::<Vec<_>>();
-                if let Err(error) = save_roster(&identities) {
+                if let Err(error) = save_roster_slots(&slots) {
                     app.set_store_status(format!("Save failed: {error}"));
                 }
             }
@@ -1270,7 +1314,15 @@ fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std:
                     .iter()
                     .map(|agent| agent.identity.clone())
                     .collect::<Vec<_>>();
-                save_roster(&identities)?;
+                save_roster_slots(
+                    &selected
+                        .iter()
+                        .map(|agent| RosterSlot {
+                            agent: agent.identity.clone(),
+                            model: agent.model.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                )?;
                 let specs = selected
                     .iter()
                     .filter_map(|agent| {
@@ -1280,7 +1332,17 @@ fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std:
                     })
                     .map(agent_spec)
                     .collect::<Vec<_>>();
-                return run_roster(terminal, specs, identities, Vec::new(), None, 0, 100);
+                let models = selected.iter().map(|agent| agent.model.clone()).collect();
+                return run_roster(
+                    terminal,
+                    specs,
+                    identities,
+                    models,
+                    Vec::new(),
+                    None,
+                    0,
+                    100,
+                );
             }
             StoreAction::Close => return Ok(()),
             StoreAction::Directory(_) => {}
@@ -1327,7 +1389,7 @@ fn executable_file(path: &Path) -> bool {
     }
 }
 
-fn save_roster(identities: &[String]) -> std::io::Result<()> {
+fn save_roster_slots(slots: &[RosterSlot]) -> std::io::Result<()> {
     let Some(path) = settings_path() else {
         return Ok(());
     };
@@ -1338,7 +1400,7 @@ fn save_roster(identities: &[String]) -> std::io::Result<()> {
         if !launcher.is_object() {
             *launcher = serde_json::json!({});
         }
-        launcher["roster"] = serde_json::Value::String(identities.join("\n"));
+        launcher["roster"] = serde_json::to_value(slots).unwrap_or_else(|_| serde_json::json!([]));
     })
 }
 
@@ -1431,7 +1493,11 @@ fn load_config_agents(app: &mut App) {
     let settings = settings_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_default();
-    let saved = parse_saved_roster(&settings);
+    let saved_slots = parse_saved_slots(&settings);
+    let saved = saved_slots
+        .iter()
+        .map(|slot| slot.agent.clone())
+        .collect::<Vec<_>>();
     let current_identities = app
         .active_roster_slots()
         .into_iter()
@@ -1444,33 +1510,46 @@ fn load_config_agents(app: &mut App) {
             .position(|identity| identity.eq_ignore_ascii_case(&agent.identity))
             .unwrap_or(usize::MAX)
     });
-    let agents = catalog
+    let templates = catalog
         .into_iter()
-        .map(|agent| {
-            let selected = saved
-                .iter()
-                .any(|identity| identity.eq_ignore_ascii_case(&agent.identity))
-                || current_identities
-                    .iter()
-                    .any(|identity| identity.eq_ignore_ascii_case(&agent.identity));
-            StoreAgent {
-                identity: agent.identity,
-                name: agent.name,
-                adapter: match agent.adapter {
-                    AdapterKind::Native => "native".into(),
-                    AdapterKind::Acp => "ACP".into(),
-                },
-                available: command_available(
-                    agent
-                        .detect_command
-                        .as_deref()
-                        .unwrap_or(agent.command.as_str()),
-                ),
-                command: agent.command,
-                selected,
-            }
+        .map(|agent| StoreAgent {
+            identity: agent.identity,
+            name: agent.name,
+            adapter: match agent.adapter {
+                AdapterKind::Native => "native".into(),
+                AdapterKind::Acp => "ACP".into(),
+            },
+            available: command_available(
+                agent
+                    .detect_command
+                    .as_deref()
+                    .unwrap_or(agent.command.as_str()),
+            ),
+            command: agent.command,
+            selected: false,
+            model: None,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let mut seen = std::collections::BTreeMap::<String, usize>::new();
+    let mut agents = current_identities
+        .iter()
+        .filter_map(|identity| {
+            let mut agent = templates
+                .iter()
+                .find(|agent| agent.identity.eq_ignore_ascii_case(identity))?
+                .clone();
+            let occurrence = seen.entry(identity.to_ascii_lowercase()).or_default();
+            agent.selected = true;
+            agent.model = saved_slots
+                .iter()
+                .filter(|slot| slot.agent.eq_ignore_ascii_case(identity))
+                .nth(*occurrence)
+                .and_then(|slot| slot.model.clone());
+            *occurrence += 1;
+            Some(agent)
+        })
+        .collect::<Vec<_>>();
+    agents.extend(templates);
     app.set_config_agents(agents);
 }
 
@@ -1542,17 +1621,31 @@ fn reconcile_config_roster(
 
     // Drop catalog agents removed from the desired roster. Ad-hoc names are
     // intentionally retained because they have no catalog identity to map.
-    let desired_identities = desired
-        .iter()
-        .map(|agent| agent.identity.to_ascii_lowercase())
-        .collect::<std::collections::BTreeSet<_>>();
+    let desired_counts = desired.iter().fold(
+        std::collections::BTreeMap::<String, usize>::new(),
+        |mut counts, agent| {
+            *counts
+                .entry(agent.identity.to_ascii_lowercase())
+                .or_default() += 1;
+            counts
+        },
+    );
+    let mut live_counts = std::collections::BTreeMap::<String, usize>::new();
     for slot in app.active_roster_slots().into_iter() {
         let identity = live_slot_identity(app, slot);
+        let count = live_counts
+            .entry(identity.to_ascii_lowercase())
+            .or_default();
+        *count += 1;
         if app
             .config_agents()
             .iter()
             .any(|agent| agent.identity.eq_ignore_ascii_case(&identity))
-            && !desired_identities.contains(&identity.to_ascii_lowercase())
+            && *count
+                > desired_counts
+                    .get(&identity.to_ascii_lowercase())
+                    .copied()
+                    .unwrap_or(0)
         {
             controls
                 .send(AdapterControl::Drop(slot))
@@ -1562,12 +1655,21 @@ fn reconcile_config_roster(
     }
 
     // Add selected catalog entries not represented by a live display name.
+    let live_counts = app.active_roster_slots().into_iter().fold(
+        std::collections::BTreeMap::<String, usize>::new(),
+        |mut counts, slot| {
+            *counts
+                .entry(live_slot_identity(app, slot).to_ascii_lowercase())
+                .or_default() += 1;
+            counts
+        },
+    );
+    let mut desired_seen = std::collections::BTreeMap::<String, usize>::new();
     for agent in &desired {
-        if app
-            .active_roster_slots()
-            .into_iter()
-            .any(|slot| live_slot_identity(app, slot).eq_ignore_ascii_case(&agent.identity))
-        {
+        let key = agent.identity.to_ascii_lowercase();
+        let occurrence = desired_seen.entry(key.clone()).or_default();
+        *occurrence += 1;
+        if *occurrence <= live_counts.get(&key).copied().unwrap_or(0) {
             continue;
         }
         let spec = if agent.adapter.eq_ignore_ascii_case("native") {
@@ -1797,10 +1899,12 @@ fn run_acp_program(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_roster(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     specs: Vec<AgentSpec>,
     identities: Vec<String>,
+    models: Vec<Option<String>>,
     session_ids: Vec<Option<String>>,
     prompt: Option<String>,
     first_slot: usize,
@@ -1822,6 +1926,7 @@ fn run_roster(
     let (events, controls, worker) = spawn_relay(
         specs,
         identities,
+        models,
         session_ids,
         prompt,
         first_slot,
@@ -2306,6 +2411,7 @@ fn run_acp_task(
 fn spawn_relay(
     specs: Vec<AgentSpec>,
     identities: Vec<String>,
+    models: Vec<Option<String>>,
     session_ids: Vec<Option<String>>,
     prompt: Option<String>,
     first_slot: usize,
@@ -2323,6 +2429,7 @@ fn spawn_relay(
             control_receiver,
             specs,
             identities,
+            models,
             session_ids,
             prompt,
             first_slot,
@@ -2437,6 +2544,7 @@ fn run_relay_task(
     mut controls: tokio::sync::mpsc::UnboundedReceiver<AdapterControl>,
     specs: Vec<AgentSpec>,
     identities: Vec<String>,
+    models: Vec<Option<String>>,
     session_ids: Vec<Option<String>>,
     prompt: Option<String>,
     first_slot: usize,
@@ -2547,6 +2655,13 @@ fn run_relay_task(
             let _ = sender.send(Err(error));
             return;
         }
+        for (slot, model) in models.into_iter().enumerate() {
+            if let Some(model) = model
+                && let Err(error) = relay.set_model(slot, model).await
+            {
+                let _ = sender.send(Err(error));
+            }
+        }
         let mut pending_commands = VecDeque::new();
         if let Some(prompt) = prompt {
             let (stopping, deferred) = run_relay_sequence_with_controls(
@@ -2655,15 +2770,8 @@ fn run_relay_task(
                         let _ = sender.send(Err(error));
                     }
                 }
-                Some(AdapterControl::SetModel { identity, model }) => {
-                    let slot = relay.active_slot_for_identity(&identity);
-                    let result = match slot {
-                        Some(slot) => relay.set_model(slot, model).await,
-                        None => Err(AdapterError::Transport(
-                            "model target is no longer active".into(),
-                        )),
-                    };
-                    if let Err(error) = result {
+                Some(AdapterControl::SetModel { slot, model }) => {
+                    if let Err(error) = relay.set_model(slot, model).await {
                         let _ = sender.send(Err(error));
                     }
                 }
@@ -2759,6 +2867,15 @@ fn run_relay_task(
     });
 }
 
+/// Bound the work performed between terminal frames. Adapter output is
+/// unbounded, so draining until the channel is empty can otherwise starve
+/// rendering and keyboard input indefinitely under a sustained stream.
+const MAX_EVENTS_PER_FRAME: usize = 128;
+
+fn next_event_batch<T>(events: &Receiver<T>) -> Vec<T> {
+    events.try_iter().take(MAX_EVENTS_PER_FRAME).collect()
+}
+
 fn run_terminal(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
@@ -2821,7 +2938,7 @@ fn run_terminal(
         selected_slot = normalize_selected_slot(app, selected_slot);
         app.set_selected_agent(selected_slot);
         if let Some(events) = &events {
-            while let Ok(event) = events.try_recv() {
+            for event in next_event_batch(events) {
                 match event {
                     Ok(event) => {
                         match &event {
@@ -2945,8 +3062,8 @@ fn run_terminal(
                             match reconcile_config_roster(app, controls, &mut pending_first) {
                                 Ok(true) => {
                                     config_reconcile_pending = false;
-                                    let roster = app.config_roster_identities();
-                                    match save_roster(&roster) {
+                                    let roster = app.config_roster_slots();
+                                    match save_roster_slots(&roster) {
                                         Ok(()) => {
                                             app.mark_config_roster_saved();
                                             app.status = "roster saved".into();
@@ -3106,9 +3223,9 @@ fn run_terminal(
                             continue;
                         }
                         if app.config_roster_dirty() {
-                            let roster = app.config_roster_identities();
+                            let roster = app.config_roster_slots();
                             if controls.is_none() {
-                                match save_roster(&roster) {
+                                match save_roster_slots(&roster) {
                                     Ok(()) => {
                                         app.mark_config_roster_saved();
                                         app.status = "roster saved for the next launch".into();
@@ -3120,7 +3237,7 @@ fn run_terminal(
                             } else if let Some(controls) = &controls {
                                 config_reconcile_pending = true;
                                 match reconcile_config_roster(app, controls, &mut pending_first) {
-                                    Ok(true) => match save_roster(&roster) {
+                                    Ok(true) => match save_roster_slots(&roster) {
                                         Ok(()) => {
                                             config_reconcile_pending = false;
                                             app.mark_config_roster_saved();
@@ -3158,8 +3275,8 @@ fn run_terminal(
                             ));
                         }
                         if let Some(controls) = &controls {
-                            for (identity, model) in app.take_config_model_changes() {
-                                let _ = controls.send(AdapterControl::SetModel { identity, model });
+                            for (slot, model) in app.take_config_model_changes() {
+                                let _ = controls.send(AdapterControl::SetModel { slot, model });
                             }
                         }
                     }
@@ -3731,16 +3848,17 @@ fn notify_permission_request(agent: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterControl, AgentSpec, ConfigInputDecoder, Launch, apply_mouse_scroll,
-        apply_navigation_scroll, apply_notification_preferences, bare_launch_from_settings,
-        cancel_standalone_turn, consume_one_shot_route, dispatch_permission_action,
-        dispatch_queued_prompt, finish_pending_cancellation, interaction_height,
-        load_prompt_history_from, load_session_metadata_candidates, mouse_scroll_delta,
-        normalize_arguments, normalize_selected_slot, parse_launch, prepare_launch_arguments,
-        program_available, project_dir_argument, project_prompt_history_path,
-        reconcile_config_roster, restore_mouse_after_selection_window, resume_launch_from_metadata,
-        run_relay_sequence_with_controls, sanitize_direct_event, session_metadata_path_for,
-        standalone_session_metadata, terminal_capture_enabled_for, validate_project_directory,
+        AdapterControl, AgentSpec, ConfigInputDecoder, Launch, MAX_EVENTS_PER_FRAME,
+        apply_mouse_scroll, apply_navigation_scroll, apply_notification_preferences,
+        bare_launch_from_settings, cancel_standalone_turn, consume_one_shot_route,
+        dispatch_permission_action, dispatch_queued_prompt, finish_pending_cancellation,
+        interaction_height, load_prompt_history_from, load_session_metadata_candidates,
+        mouse_scroll_delta, next_event_batch, normalize_arguments, normalize_selected_slot,
+        parse_launch, prepare_launch_arguments, program_available, project_dir_argument,
+        project_prompt_history_path, reconcile_config_roster, restore_mouse_after_selection_window,
+        resume_launch_from_metadata, run_relay_sequence_with_controls, sanitize_direct_event,
+        session_metadata_path_for, standalone_session_metadata, terminal_capture_enabled_for,
+        validate_project_directory,
     };
     use async_trait::async_trait;
     use codeswarm::tui::{App, ConfigKey, PermissionAction, QueuedPrompt, StoreAgent};
@@ -3753,6 +3871,20 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn event_batches_leave_excess_adapter_updates_for_the_next_frame() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for value in 0..=MAX_EVENTS_PER_FRAME {
+            sender.send(value).expect("queue event");
+        }
+
+        let batch = next_event_batch(&receiver);
+        assert_eq!(batch.len(), MAX_EVENTS_PER_FRAME);
+        assert_eq!(batch.first(), Some(&0));
+        assert_eq!(batch.last(), Some(&(MAX_EVENTS_PER_FRAME - 1)));
+        assert_eq!(receiver.try_recv(), Ok(MAX_EVENTS_PER_FRAME));
+    }
 
     #[derive(Debug)]
     struct YieldingAdapter {
@@ -4473,6 +4605,7 @@ mod tests {
             command: "codex --acp".into(),
             available: true,
             selected: true,
+            model: None,
         }]);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut pending_first = None;
@@ -4502,6 +4635,7 @@ mod tests {
                 command: "second-reviewer".into(),
                 available: true,
                 selected: true,
+                model: None,
             },
             StoreAgent {
                 identity: "first.example".into(),
@@ -4510,6 +4644,7 @@ mod tests {
                 command: "first-reviewer".into(),
                 available: true,
                 selected: true,
+                model: None,
             },
         ]);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -4538,6 +4673,7 @@ mod tests {
                 command: "qwen --acp".into(),
                 available: true,
                 selected: true,
+                model: None,
             },
             StoreAgent {
                 identity: "openai.com".into(),
@@ -4546,6 +4682,7 @@ mod tests {
                 command: "codex --acp".into(),
                 available: true,
                 selected: true,
+                model: None,
             },
         ]);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -4585,6 +4722,7 @@ mod tests {
             command: "codex --acp".into(),
             available: true,
             selected: true,
+            model: None,
         }]);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut pending_first = None;
@@ -4612,6 +4750,7 @@ mod tests {
                 command: "codex --acp".into(),
                 available: true,
                 selected: true,
+                model: None,
             },
             StoreAgent {
                 identity: "qwen.ai".into(),
@@ -4620,6 +4759,7 @@ mod tests {
                 command: "qwen --acp".into(),
                 available: true,
                 selected: true,
+                model: None,
             },
         ]);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -4658,6 +4798,7 @@ mod tests {
                 command: format!("{} --acp", name.to_ascii_lowercase()),
                 available: true,
                 selected: true,
+                model: None,
             })
             .collect(),
         );
@@ -4746,6 +4887,52 @@ mod tests {
                     AgentSpec::Acp("npx -y --package=@agentclientprotocol/codex-acp codex-acp".into()),
                     AgentSpec::Agy("agy --dangerously-skip-permissions".into())
                 ]
+        ));
+    }
+
+    #[test]
+    fn bare_launch_restores_duplicate_slots_and_their_models() {
+        let launch = bare_launch_from_settings(
+            r#"{"launcher":{"roster":[{"agent":"openai.com","model":"fast"},{"agent":"openai.com","model":"smart"}]}}"#,
+        );
+        assert!(matches!(
+            launch,
+            Launch::Roster { identities, models, .. }
+                if identities == ["openai.com", "openai.com"]
+                    && models == [Some("fast".into()), Some("smart".into())]
+        ));
+    }
+
+    #[test]
+    fn config_reconciliation_adds_a_second_slot_for_the_same_agent() {
+        let mut app = codeswarm::tui::App::default();
+        app.set_agent_name(0, "Claude");
+        app.set_agent_identity(0, "anthropic.com");
+        app.set_config_agents(vec![
+            StoreAgent {
+                identity: "anthropic.com".into(),
+                name: "Claude".into(),
+                adapter: "ACP".into(),
+                command: "claude-agent-acp".into(),
+                available: true,
+                selected: true,
+                model: None,
+            },
+            StoreAgent {
+                identity: "anthropic.com".into(),
+                name: "Claude".into(),
+                adapter: "ACP".into(),
+                command: "claude-agent-acp".into(),
+                available: true,
+                selected: true,
+                model: None,
+            },
+        ]);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(!reconcile_config_roster(&mut app, &sender, &mut None).expect("reconcile"));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AdapterControl::Add { identity, .. }) if identity == "anthropic.com"
         ));
     }
 

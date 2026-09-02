@@ -376,10 +376,58 @@ fn collapsed_activity_preview(
 ) -> String {
     let attribution = attributed_message(&block.source);
     let source = attribution.map_or_else(|| presentation_source(block), |(_, _, content)| content);
+    if label == "Tool" && source.lines().any(|line| line.starts_with('🔧')) {
+        let preview = rolling_tool_preview(source, width, max_lines);
+        return attribution.map_or(preview.clone(), |(speaker, timestamp, _)| {
+            format!("{speaker}: [{timestamp}] {preview}")
+        });
+    }
     let preview = bounded_head_preview(label, source, width, max_lines);
     attribution.map_or(preview.clone(), |(speaker, timestamp, _)| {
         format!("{speaker}: [{timestamp}] {preview}")
     })
+}
+
+/// Preserve one compact row per logical tool call. Full details stay in the
+/// source block for Ctrl+O, while the collapsed transcript rolls through only
+/// the newest calls instead of wrapping their output into the conversation.
+fn rolling_tool_preview(source: &str, width: usize, max_lines: usize) -> String {
+    let mut calls = Vec::new();
+    let mut current = Vec::new();
+    for line in source.lines() {
+        if line.starts_with('🔧') && !current.is_empty() {
+            calls.push(std::mem::take(&mut current));
+        }
+        current.push(line);
+    }
+    if !current.is_empty() {
+        calls.push(current);
+    }
+
+    calls
+        .into_iter()
+        .rev()
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|call| {
+            let header = call.first().copied().unwrap_or_default().trim();
+            let detail = call
+                .iter()
+                .skip(1)
+                .map(|line| line.trim())
+                .find(|line| !line.is_empty())
+                .unwrap_or_default();
+            let summary = if detail.is_empty() {
+                header.to_owned()
+            } else {
+                format!("{header} · {detail}")
+            };
+            truncate_chars(&summary, width)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn bounded_head_preview(label: &str, source: &str, width: usize, max_lines: usize) -> String {
