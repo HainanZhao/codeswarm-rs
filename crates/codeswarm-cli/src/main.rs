@@ -3072,6 +3072,10 @@ fn run_terminal(
                                             app.status = format!("unable to save roster: {error}");
                                         }
                                     }
+                                    for (slot, model) in app.take_config_model_changes() {
+                                        let _ =
+                                            controls.send(AdapterControl::SetModel { slot, model });
+                                    }
                                 }
                                 Ok(false) => {}
                                 Err(error) => {

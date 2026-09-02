@@ -1171,6 +1171,24 @@ impl App {
             .nth(occurrence)
     }
 
+    /// Use this row's live adapter when it exists. A newly added duplicate
+    /// slot can borrow another instance's advertised catalog until its own
+    /// adapter starts, because model IDs are provider-agent configuration.
+    fn model_source_slot_for_config_row(&self, row: usize) -> Option<usize> {
+        if let Some(slot) = self.live_slot_for_config_row(row)
+            && self.agent_models.contains_key(&slot)
+        {
+            return Some(slot);
+        }
+        let identity = &self.config_agents.get(row)?.identity;
+        self.active_roster_slots().into_iter().find(|slot| {
+            self.agent_models.contains_key(slot)
+                && self
+                    .agent_identity(*slot)
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(identity))
+        })
+    }
+
     pub fn show_store(&mut self, agents: Vec<StoreAgent>) {
         self.store_agents = agents;
         self.store_selected = 0;
@@ -1391,18 +1409,24 @@ impl App {
                 if self.config_selected >= CONFIG_SETTING_COUNT =>
             {
                 let index = self.config_selected - CONFIG_SETTING_COUNT;
-                let Some(agent) = self.config_agents.get(index) else {
+                let Some((agent_selected, agent_name)) = self
+                    .config_agents
+                    .get(index)
+                    .map(|agent| (agent.selected, agent.name.clone()))
+                else {
                     return ConfigAction::Ignored;
                 };
-                if !agent.selected {
+                if !agent_selected {
                     self.status = "add this agent to a slot before selecting its model".into();
                     return ConfigAction::Ignored;
                 }
-                let Some(slot) = self.live_slot_for_config_row(index) else {
-                    self.status = "model list is available after the agent starts".into();
+                let target_slot = self.live_slot_for_config_row(index);
+                let Some(source_slot) = self.model_source_slot_for_config_row(index) else {
+                    self.status = "model list is available after this agent starts".into();
                     return ConfigAction::Ignored;
                 };
-                let Some((_config_id, models, current)) = self.agent_models.get(&slot).cloned()
+                let Some((_config_id, models, current)) =
+                    self.agent_models.get(&source_slot).cloned()
                 else {
                     self.status = "this agent did not advertise model selection".into();
                     return ConfigAction::Ignored;
@@ -1411,11 +1435,12 @@ impl App {
                     self.status = "this agent did not advertise model selection".into();
                     return ConfigAction::Ignored;
                 }
-                let current = self
-                    .pending_model_changes
-                    .get(&slot)
-                    .cloned()
-                    .or_else(|| self.config_agents[index].model.clone())
+                let current = self.config_agents[index]
+                    .model
+                    .clone()
+                    .or_else(|| {
+                        target_slot.and_then(|slot| self.pending_model_changes.get(&slot).cloned())
+                    })
                     .or(current);
                 let position = current
                     .as_ref()
@@ -1426,11 +1451,13 @@ impl App {
                 } else {
                     position.checked_sub(1).unwrap_or(models.len() - 1)
                 };
-                self.pending_model_changes
-                    .insert(slot, models[next].id.clone());
+                if let Some(slot) = target_slot {
+                    self.pending_model_changes
+                        .insert(slot, models[next].id.clone());
+                }
                 self.config_agents[index].model = Some(models[next].id.clone());
                 self.config_roster_dirty = true;
-                self.status = format!("{} model: {}", self.agent_name(slot), models[next].label);
+                self.status = format!("{agent_name} model: {}", models[next].label);
                 ConfigAction::Changed
             }
             ConfigKey::PreviousValue | ConfigKey::NextValue => ConfigAction::Ignored,
@@ -4086,13 +4113,14 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ];
             if agent.selected
-                && let Some(slot) = app.live_slot_for_config_row(roster_index)
-                && let Some((_config_id, models, current)) = app.agent_models.get(&slot)
+                && let Some(source_slot) = app.model_source_slot_for_config_row(roster_index)
+                && let Some((_config_id, models, current)) = app.agent_models.get(&source_slot)
             {
-                let selected_model = app
-                    .pending_model_changes
-                    .get(&slot)
-                    .or(agent.model.as_ref())
+                let target_slot = app.live_slot_for_config_row(roster_index);
+                let selected_model = agent
+                    .model
+                    .as_ref()
+                    .or_else(|| target_slot.and_then(|slot| app.pending_model_changes.get(&slot)))
                     .or(current.as_ref())
                     .or_else(|| models.first().map(|model| &model.id));
                 if let Some(model) =
@@ -6334,6 +6362,77 @@ mod tests {
             app.config_roster_slots()[1].model.as_deref(),
             Some("sonnet")
         );
+    }
+
+    #[test]
+    fn pending_duplicate_slot_borrows_the_running_agents_model_catalog() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Claude");
+        app.set_agent_identity(0, "anthropic.com");
+        app.apply_event(&codeswarm_adapters::AgentEvent::ModelsReplaced {
+            slot: 0,
+            config_id: "model".into(),
+            models: vec![
+                codeswarm_adapters::Mode {
+                    id: "sonnet".into(),
+                    label: "Sonnet".into(),
+                },
+                codeswarm_adapters::Mode {
+                    id: "opus".into(),
+                    label: "Opus".into(),
+                },
+            ],
+            current_model: Some("sonnet".into()),
+        });
+        app.set_config_agents(vec![
+            StoreAgent {
+                identity: "anthropic.com".into(),
+                name: "Claude".into(),
+                adapter: "ACP".into(),
+                command: "claude-agent-acp".into(),
+                available: true,
+                selected: true,
+                model: None,
+            },
+            StoreAgent {
+                identity: "anthropic.com".into(),
+                name: "Claude".into(),
+                adapter: "ACP".into(),
+                command: "claude-agent-acp".into(),
+                available: true,
+                selected: true,
+                model: None,
+            },
+        ]);
+        app.open_config();
+        app.config_selected = CONFIG_SETTING_COUNT + 1;
+
+        assert_eq!(
+            app.handle_config_key(ConfigKey::NextValue),
+            ConfigAction::Changed
+        );
+        assert_eq!(app.config_roster_slots()[1].model.as_deref(), Some("opus"));
+        // The pending slot does not accidentally retarget the first adapter.
+        assert!(app.take_config_model_changes().is_empty());
+
+        app.set_agent_name(1, "Claude");
+        app.set_agent_identity(1, "anthropic.com");
+        app.apply_event(&codeswarm_adapters::AgentEvent::ModelsReplaced {
+            slot: 1,
+            config_id: "model".into(),
+            models: vec![
+                codeswarm_adapters::Mode {
+                    id: "sonnet".into(),
+                    label: "Sonnet".into(),
+                },
+                codeswarm_adapters::Mode {
+                    id: "opus".into(),
+                    label: "Opus".into(),
+                },
+            ],
+            current_model: Some("sonnet".into()),
+        });
+        assert_eq!(app.take_config_model_changes(), vec![(1, "opus".into())]);
     }
 
     #[test]

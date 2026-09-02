@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-09-02
+
+### Fixed
+
+- A newly added duplicate agent slot can select a model from the matching
+  running agent's catalog, and CodeSwarm applies it when the new slot becomes
+  ready.
+
 ## [0.8.4] - 2026-09-02
 
 ### Added
