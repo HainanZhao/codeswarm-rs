@@ -20,7 +20,7 @@ use crate::{
     reduce,
     relay::{
         CollaborationStrategy, DEFAULT_STOP_ACKNOWLEDGMENT, Relay, RelayDecision, STOP_TOKEN,
-        strip_stop_token,
+        is_usage_limit_response, strip_stop_token,
     },
     resources,
 };
@@ -458,6 +458,9 @@ fn map_event_slot(event: AgentEvent, slot: RosterSlot) -> AgentEvent {
         AgentEvent::Permission { request, .. } => AgentEvent::Permission { slot, request },
         AgentEvent::Terminal { event, .. } => AgentEvent::Terminal { slot, event },
         AgentEvent::TurnComplete { .. } => AgentEvent::TurnComplete { slot },
+        AgentEvent::UsageLimitReached { detail, .. } => {
+            AgentEvent::UsageLimitReached { slot, detail }
+        }
         AgentEvent::Failed {
             started, detail, ..
         } => AgentEvent::Failed {
@@ -1192,6 +1195,7 @@ impl RelayHost {
                 update: RosterUpdate::Reloaded { slot },
             });
         }
+        let _ = self.relay.clear_limited(slot);
         Ok(())
     }
 
@@ -1602,6 +1606,23 @@ impl RelayHost {
         if let Some(sink) = &self.event_sink {
             sink(completion_event);
         }
+        // A provider plan that ran out mid-turn routes future turns around
+        // the agent instead of back into the exhausted quota.
+        if is_usage_limit_response(&response) {
+            let detail = response.clone();
+            let _ = self.relay.mark_limited(*slot);
+            // A normal finish: the ring cursor advances past the limited
+            // agent so the batch continues with a healthy peer.
+            self.relay.finish(*slot, *direct, false);
+            self.queue_session_metadata()?;
+            if let Some(sink) = &self.event_sink {
+                sink(AgentEvent::UsageLimitReached {
+                    slot: *slot,
+                    detail,
+                });
+            }
+            return Ok(decision);
+        }
         if !*direct && !response.is_empty() {
             self.relay
                 .record_public(public_context_speaker(&speaker_name), response);
@@ -1620,6 +1641,23 @@ fn report_relay_failure(
     started: bool,
     detail: String,
 ) {
+    // A quota rejection is not a crash: route around the agent without
+    // tombstoning the slot so a recharge can restore it.
+    if is_usage_limit_response(&detail) {
+        let _ = relay.mark_limited(slot);
+        if let Some(sink) = event_sink {
+            sink(AgentEvent::UsageLimitReached {
+                slot,
+                detail: detail.clone(),
+            });
+            sink(AgentEvent::Failed {
+                slot,
+                started,
+                detail,
+            });
+        }
+        return;
+    }
     let _ = relay.tombstone(slot);
     if let Some(sink) = event_sink {
         sink(AgentEvent::Failed {
@@ -5188,6 +5226,67 @@ mod tests {
             positions,
             [("start", 0), ("complete", 0), ("start", 1), ("complete", 1)]
         );
+    }
+
+    #[tokio::test]
+    async fn relay_host_routes_around_a_usage_limited_agent() {
+        let capabilities = AgentCapabilities::default();
+        let first = ScriptedAdapter::new(
+            0,
+            capabilities.clone(),
+            [
+                AgentEvent::Text {
+                    slot: 0,
+                    text: "You've hit your usage limit. Visit chatgpt.com to purchase more \
+                           credits or try again later."
+                        .into(),
+                },
+                AgentEvent::TurnComplete { slot: 0 },
+            ],
+        );
+        let second = ScriptedAdapter::new(
+            1,
+            capabilities,
+            [
+                AgentEvent::Text {
+                    slot: 1,
+                    text: "review done".into(),
+                },
+                AgentEvent::TurnComplete { slot: 1 },
+            ],
+        );
+        let hosts = vec![
+            AdapterHost::new(Box::new(first), None),
+            AdapterHost::new(Box::new(second), None),
+        ];
+        let mut relay = super::RelayHost::new(hosts, 4).expect("relay");
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&events);
+        relay.set_event_sink(move |event| captured.lock().expect("events").push(event));
+        relay.start().await.expect("start");
+        events.lock().expect("events").clear();
+        assert!(matches!(
+            relay.run_turn("task", 0).await.expect("limited turn"),
+            crate::relay::RelayDecision::Dispatch { slot: 0, .. }
+        ));
+        assert!(
+            events
+                .lock()
+                .expect("events")
+                .iter()
+                .any(|event| matches!(event, AgentEvent::UsageLimitReached { slot: 0, .. }))
+        );
+        // The next automatic turn skips the limited agent entirely.
+        assert!(matches!(
+            relay.run_turn("", 0).await.expect("next turn"),
+            crate::relay::RelayDecision::Dispatch { slot: 1, .. }
+        ));
+        assert!(relay.relay().is_limited(0));
+        // A reload restores the agent to the ring. (ScriptedAdapter cannot
+        // feed further turns, so the restored routing itself is covered by
+        // the relay unit tests.)
+        relay.reload(0).await.expect("reload");
+        assert!(!relay.relay().is_limited(0));
     }
 
     #[tokio::test]

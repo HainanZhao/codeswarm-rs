@@ -12,6 +12,18 @@ pub const MAX_QUEUED_PROMPTS: usize = 100;
 pub const STOP_TOKEN: &str = "[CODESWARM:STOP]";
 pub const DEFAULT_STOP_ACKNOWLEDGMENT: &str = "👍";
 
+/// Recognize a provider usage-limit reply (for example an exhausted Codex
+/// plan). Kept deliberately narrow so ordinary conversation mentioning
+/// "limits" is never misclassified.
+pub fn is_usage_limit_response(text: &str) -> bool {
+    let haystack = text.to_lowercase();
+    haystack.contains("usage limit")
+        || haystack.contains("insufficient_quota")
+        || haystack.contains("quota exceeded")
+        || haystack.contains("insufficient credits")
+        || haystack.contains("billing") && haystack.contains("upgrade")
+}
+
 pub fn strip_stop_token(response: &str) -> (String, bool) {
     let trimmed = response.trim_end();
     let requested = trimmed.ends_with(STOP_TOKEN);
@@ -69,6 +81,10 @@ pub enum RelayDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Relay {
     active: Vec<bool>,
+    /// Slots whose provider plan is exhausted. Unlike a tombstone this is
+    /// expected to clear (recharge or reload), so queued prompts targeting a
+    /// limited slot are preserved instead of discarded.
+    limited: Vec<bool>,
     max_rounds: usize,
     rounds: usize,
     stopped: bool,
@@ -89,6 +105,7 @@ impl Relay {
         assert!(max_rounds >= 1);
         Self {
             active: vec![true; roster_size],
+            limited: vec![false; roster_size],
             max_rounds,
             rounds: 0,
             stopped: false,
@@ -137,6 +154,41 @@ impl Relay {
         let active = self.active.get_mut(slot).ok_or("slot out of range")?;
         *active = false;
         Ok(())
+    }
+
+    /// Flag a slot whose provider plan is exhausted. Routing skips it but its
+    /// queued prompts and roster identity are preserved for a later recharge.
+    pub fn mark_limited(&mut self, slot: RosterSlot) -> Result<(), &'static str> {
+        let limited = self.limited.get_mut(slot).ok_or("slot out of range")?;
+        *limited = true;
+        Ok(())
+    }
+
+    /// Clear a usage-limit flag after a recharge or adapter reload.
+    pub fn clear_limited(&mut self, slot: RosterSlot) -> Result<(), &'static str> {
+        let limited = self.limited.get_mut(slot).ok_or("slot out of range")?;
+        *limited = false;
+        Ok(())
+    }
+
+    pub fn is_limited(&self, slot: RosterSlot) -> bool {
+        self.limited.get(slot).copied().unwrap_or(false)
+    }
+
+    /// A slot is routable when it is active and not usage-limited.
+    fn routable(&self, slot: RosterSlot) -> bool {
+        self.active.get(slot).copied().unwrap_or(false)
+            && !self.limited.get(slot).copied().unwrap_or(false)
+    }
+
+    /// Slots that can currently receive a turn.
+    pub fn routable_slots(&self) -> impl Iterator<Item = RosterSlot> + '_ {
+        (0..self.active.len()).filter(|slot| self.routable(*slot))
+    }
+
+    /// Whether any slot other than `excluded` can still receive a turn.
+    fn any_routable_except(&self, excluded: RosterSlot) -> bool {
+        self.routable_slots().any(|slot| slot != excluded)
     }
 
     pub fn reactivate(&mut self, slot: RosterSlot) -> Result<(), &'static str> {
@@ -284,8 +336,14 @@ impl Relay {
         if self.active_slots().next().is_none() {
             return RelayDecision::Collapsed;
         }
-        let queued = Self::pop_active(&self.active, &mut self.direct)
-            .or_else(|| Self::pop_active(&self.active, &mut self.steering));
+        // Every live slot may be usage-limited; never spin the batch against
+        // an exhausted plan. The queued work survives for the next begin().
+        if !self.any_routable_except(usize::MAX) {
+            self.stopped = true;
+            return RelayDecision::Paused;
+        }
+        let queued = Self::pop_routable(&self.active, &self.limited, &mut self.direct)
+            .or_else(|| Self::pop_routable(&self.active, &self.limited, &mut self.steering));
         // A reviewer stop ends only the current automatic batch. A later
         // queued/user prompt starts a fresh batch without rebuilding the
         // relay, while an unprompted handoff remains complete.
@@ -355,37 +413,44 @@ impl Relay {
         }
     }
 
-    fn pop_active(active: &[bool], queue: &mut VecDeque<QueuedPrompt>) -> Option<QueuedPrompt> {
-        let position = queue
-            .iter()
-            .position(|queued| active.get(queued.slot).copied().unwrap_or(false))?;
+    /// Pop the first queued prompt whose target is routable. Prompts aimed at
+    /// a limited slot stay queued until the slot recovers.
+    fn pop_routable(
+        active: &[bool],
+        limited: &[bool],
+        queue: &mut VecDeque<QueuedPrompt>,
+    ) -> Option<QueuedPrompt> {
+        let position = queue.iter().position(|queued| {
+            active.get(queued.slot).copied().unwrap_or(false)
+                && !limited.get(queued.slot).copied().unwrap_or(false)
+        })?;
         queue.remove(position)
     }
 
     fn first_active_from(&self, start: RosterSlot) -> RosterSlot {
         (0..self.active.len())
             .map(|offset| (start + offset) % self.active.len())
-            .find(|slot| self.active[*slot])
-            .expect("callers require an active roster")
+            .find(|slot| self.routable(*slot))
+            .expect("callers require a routable roster")
     }
 
     fn next_active(&self, slot: RosterSlot) -> RosterSlot {
         (1..=self.active.len())
             .map(|offset| (slot + offset) % self.active.len())
-            .find(|candidate| self.active[*candidate])
-            .expect("callers require an active roster")
+            .find(|candidate| self.routable(*candidate))
+            .expect("callers require a routable roster")
     }
 
     fn next_automatic_slot(&mut self, first: RosterSlot) -> RosterSlot {
         match self.strategy {
             CollaborationStrategy::Roster | CollaborationStrategy::Manual => self
                 .next
-                .filter(|slot| self.active[*slot])
+                .filter(|slot| self.routable(*slot))
                 .unwrap_or_else(|| self.first_active_from(first)),
             CollaborationStrategy::Pair => {
                 let primary = self.first_active_from(0);
                 let partner = if let Some(partner) = self.pair_partner {
-                    if self.active.get(partner).copied().unwrap_or(false) && partner != primary {
+                    if self.routable(partner) && partner != primary {
                         partner
                     } else {
                         let partner = self.next_active(primary);
@@ -393,18 +458,17 @@ impl Relay {
                         partner
                     }
                 } else {
-                    let partner =
-                        if first != primary && self.active.get(first).copied().unwrap_or(false) {
-                            first
-                        } else {
-                            self.next_active(primary)
-                        };
+                    let partner = if first != primary && self.routable(first) {
+                        first
+                    } else {
+                        self.next_active(primary)
+                    };
                     self.pair_partner = Some(partner);
                     partner
                 };
                 match self.previous_slot {
-                    Some(previous) if previous == primary && self.active[partner] => partner,
-                    Some(previous) if previous == partner && self.active[primary] => primary,
+                    Some(previous) if previous == primary && self.routable(partner) => partner,
+                    Some(previous) if previous == partner && self.routable(primary) => primary,
                     Some(previous) if previous == primary || previous == partner => primary,
                     _ => self.first_active_from(first),
                 }
@@ -667,6 +731,88 @@ mod tests {
         assert!(matches!(
             relay.begin("after removal", 2),
             RelayDecision::Dispatch { slot: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn usage_limit_detection_matches_provider_copy() {
+        assert!(super::is_usage_limit_response(
+            "You've hit your usage limit. Visit chatgpt.com to purchase more credits."
+        ));
+        assert!(super::is_usage_limit_response("Error: insufficient_quota"));
+        assert!(super::is_usage_limit_response(
+            "Monthly quota exceeded for this plan"
+        ));
+        assert!(!super::is_usage_limit_response(
+            "The rate limit on the build job slowed things down."
+        ));
+        assert!(!super::is_usage_limit_response("Ready to review the diff."));
+    }
+
+    #[test]
+    fn a_limited_slot_is_routed_around_until_cleared() {
+        let mut relay = Relay::new(2, 10);
+        relay.mark_limited(0).expect("mark limited");
+        assert!(relay.is_limited(0));
+        assert!(matches!(
+            relay.begin("task", 0),
+            RelayDecision::Dispatch {
+                slot: 1,
+                can_stop: false,
+                ..
+            }
+        ));
+        relay.finish(1, false, false);
+        // The ring still skips the limited slot after a full loop.
+        assert!(matches!(
+            relay.begin("again", 1),
+            RelayDecision::Dispatch { slot: 1, .. }
+        ));
+        relay.clear_limited(0).expect("clear limited");
+        assert!(!relay.is_limited(0));
+        relay.finish(1, false, false);
+        assert!(matches!(
+            relay.begin("next", 1),
+            RelayDecision::Dispatch { slot: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn prompts_targeting_a_limited_slot_wait_for_recovery() {
+        let mut relay = Relay::new(2, 10);
+        relay.mark_limited(1).expect("mark limited");
+        assert_eq!(relay.enqueue_direct(1, "private work"), Ok(true));
+        assert!(matches!(
+            relay.begin("task", 0),
+            RelayDecision::Dispatch { slot: 0, .. }
+        ));
+        relay.finish(0, false, false);
+        // The direct prompt is not dropped while slot 1 is limited...
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch { slot: 0, .. }
+        ));
+        relay.finish(0, false, false);
+        // ...and dispatches once the slot recovers.
+        relay.clear_limited(1).expect("clear limited");
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch { slot: 1, direct: true, prompt, .. } if prompt == "private work"
+        ));
+    }
+
+    #[test]
+    fn an_all_limited_roster_pauses_instead_of_spinning() {
+        let mut relay = Relay::new(2, 10);
+        relay.mark_limited(0).expect("mark limited");
+        relay.mark_limited(1).expect("mark limited");
+        assert_eq!(relay.begin("task", 0), RelayDecision::Paused);
+        // Queued work is preserved for the next begin().
+        assert!(relay.enqueue_human("queued", Some(1)));
+        relay.clear_limited(1).expect("recharge one agent");
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch { slot: 1, prompt, .. } if prompt == "queued"
         ));
     }
 }

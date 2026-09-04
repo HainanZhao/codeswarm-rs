@@ -259,7 +259,14 @@ impl Transcript {
                         text: truncate_chars(&format!("{speaker}: [{timestamp}]"), width),
                     });
                 }
-                for line in wrap(body, width) {
+                let lines = if block.kind == BlockKind::Tool && !block.collapsed {
+                    body.lines()
+                        .map(|line| truncate_chars(line, width))
+                        .collect()
+                } else {
+                    wrap(body, width)
+                };
+                for line in lines {
                     self.rows.push(RenderRow {
                         block_id: block.id,
                         kind: block.kind,
@@ -287,7 +294,16 @@ impl Transcript {
                 }
                 continue;
             }
-            for (line_index, line) in wrap(&block.source, width).into_iter().enumerate() {
+            let lines = if block.kind == BlockKind::Tool {
+                block
+                    .source
+                    .lines()
+                    .map(|line| truncate_chars(line, width))
+                    .collect()
+            } else {
+                wrap(&block.source, width)
+            };
+            for (line_index, line) in lines.into_iter().enumerate() {
                 self.rows.push(RenderRow {
                     block_id: block.id,
                     kind: block.kind,

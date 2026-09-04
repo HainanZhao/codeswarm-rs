@@ -3075,6 +3075,12 @@ fn run_terminal(
                                 mode_catalog_slots.remove(slot);
                                 mode_capable_slots.remove(slot);
                             }
+                            AgentEvent::UsageLimitReached { slot, .. } => {
+                                mode_catalog_slots.remove(slot);
+                                mode_capable_slots.remove(slot);
+                                turn_active = false;
+                                cancel_requested_at = None;
+                            }
                             AgentEvent::ModesReplaced { slot, .. } => {
                                 mode_catalog_slots.insert(*slot);
                             }
@@ -3090,7 +3096,9 @@ fn run_terminal(
                         }
                         if matches!(
                             &event,
-                            AgentEvent::TurnComplete { .. } | AgentEvent::Failed { .. }
+                            AgentEvent::TurnComplete { .. }
+                                | AgentEvent::UsageLimitReached { .. }
+                                | AgentEvent::Failed { .. }
                         ) {
                             pending_permission = None;
                             app.clear_terminal_alerts();

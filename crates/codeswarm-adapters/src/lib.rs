@@ -195,6 +195,12 @@ pub enum AgentEvent {
     TurnComplete {
         slot: RosterSlot,
     },
+    /// A provider plan is exhausted for this slot. The relay routes around
+    /// the agent until it is recharged or reloaded.
+    UsageLimitReached {
+        slot: RosterSlot,
+        detail: String,
+    },
     Failed {
         slot: RosterSlot,
         started: bool,
@@ -357,6 +363,12 @@ pub fn reduce(state: &mut SessionState, event: AgentEvent) -> Vec<Effect> {
                 effects.push(effect);
             }
             effects
+        }
+        AgentEvent::UsageLimitReached { slot, .. } => {
+            if state.active_slot == Some(slot) {
+                state.active_slot = None;
+            }
+            vec![Effect::Render]
         }
         AgentEvent::Failed {
             slot,

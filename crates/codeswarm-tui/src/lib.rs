@@ -817,7 +817,7 @@ struct ToolWindow {
     seen_call_ids: BTreeSet<String>,
 }
 
-const MAX_TOOL_WINDOW_ROWS: usize = 2;
+const MAX_TOOL_HISTORY_ROWS: usize = 20;
 
 #[derive(Debug)]
 pub struct App {
@@ -915,6 +915,7 @@ fn agent_event_slot(event: &AgentEvent) -> Option<usize> {
         | AgentEvent::Permission { slot, .. }
         | AgentEvent::Terminal { slot, .. }
         | AgentEvent::TurnComplete { slot }
+        | AgentEvent::UsageLimitReached { slot, .. }
         | AgentEvent::Failed { slot, .. } => Some(*slot),
         AgentEvent::RosterUpdated { .. } => None,
     }
@@ -1947,9 +1948,9 @@ impl App {
             .keys()
             .copied()
             .filter(|slot| {
-                self.agent_states
-                    .get(slot)
-                    .is_none_or(|state| state != "dropped" && state != "error")
+                self.agent_states.get(slot).is_none_or(|state| {
+                    state != "dropped" && state != "error" && state != "limited"
+                })
             })
             .collect()
     }
@@ -2807,7 +2808,7 @@ impl App {
                         status: update.status,
                         detail: update.detail.clone(),
                     });
-                    while window.calls.len() > MAX_TOOL_WINDOW_ROWS {
+                    while window.calls.len() > MAX_TOOL_HISTORY_ROWS {
                         window.calls.pop_front();
                     }
                     (window.block_id, tool_window_source(window))
@@ -2880,6 +2881,32 @@ impl App {
                 self.status = "idle".into();
                 self.agent_states.insert(*slot, "ready".into());
                 self.next_agent = self.next_roster_slot_after(*slot);
+            }
+            AgentEvent::UsageLimitReached { slot, detail } => {
+                self.cancelling_agents.remove(slot);
+                self.agent_turn_started.remove(slot);
+                self.tool_windows.remove(slot);
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Agent));
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Thought));
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Human));
+                if self
+                    .permission
+                    .as_ref()
+                    .is_some_and(|request| request.slot == *slot)
+                {
+                    self.permission = None;
+                }
+                self.agent_states.insert(*slot, "limited".into());
+                if self.next_agent == Some(*slot) {
+                    self.next_agent = self.next_roster_slot_after(*slot);
+                }
+                let name = self.agent_name(*slot);
+                self.status = format!(
+                    "{name} out of credits — routed around · /reload in /config once recharged ({detail})"
+                );
             }
             AgentEvent::Failed {
                 slot,
@@ -3317,8 +3344,10 @@ fn tool_window_source(window: &ToolWindow) -> String {
     let calls = window
         .calls
         .iter()
-        .map(|call| {
-            let status = if call.status == ToolStatus::Completed {
+        .enumerate()
+        .map(|(index, call)| {
+            let latest = index + 1 == window.calls.len();
+            let status = if latest && call.status == ToolStatus::Completed {
                 if total_calls == 1 {
                     "1 tool call".to_owned()
                 } else {
@@ -3327,11 +3356,16 @@ fn tool_window_source(window: &ToolWindow) -> String {
             } else {
                 tool_status_label(call.status).to_owned()
             };
-            let header = format!("🔧 {} · {status}", call.title);
-            call.detail
+            let mut row = format!("🔧 {} · {status}", call.title);
+            if let Some(detail) = call
+                .detail
                 .as_deref()
-                .filter(|detail| !detail.trim().is_empty())
-                .map_or(header.clone(), |detail| format!("{header}\n{detail}"))
+                .and_then(|detail| detail.lines().rev().find(|line| !line.trim().is_empty()))
+            {
+                row.push_str(" · ");
+                row.push_str(&detail.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            row
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -3590,6 +3624,7 @@ fn footer_agent_label(app: &App, slot: usize, active_count: usize) -> String {
         "working" => "●",
         "starting" => "◌",
         "error" => "!",
+        "limited" => "℃",
         _ if app.collaboration == "Manual routing" && selected => "⌖",
         _ => "○",
     };
@@ -4956,12 +4991,13 @@ mod tests {
 
     use super::{
         ACCENT, AGENT_COLORS, App, CONFIG_SETTING_COUNT, ConfigAction, ConfigKey, FooterAction,
-        LocalCommand, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PathPickerAction, PermissionAction,
-        PermissionKey, PromptAction, PromptEditor, STATUS_BG, StoreAction, StoreAgent, StoreKey,
-        THOUGHT_TEXT, TRANSCRIPT_BG, actionable_detail_preview, agent_header_color,
-        agent_slot_color, block_style, cell_width, compact_cell_label, compact_workspace_path,
-        file_reference_spans, footer_agent_label, format_turn_elapsed, markdown_spans,
-        markdown_style, marker_style, render, render_prompt_separator, row_style, selected_style,
+        LocalCommand, MAX_TOOL_HISTORY_ROWS, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PathPickerAction,
+        PermissionAction, PermissionKey, PromptAction, PromptEditor, STATUS_BG, StoreAction,
+        StoreAgent, StoreKey, THOUGHT_TEXT, TRANSCRIPT_BG, actionable_detail_preview,
+        agent_header_color, agent_slot_color, block_style, cell_width, compact_cell_label,
+        compact_workspace_path, file_reference_spans, footer_agent_label, format_turn_elapsed,
+        markdown_spans, markdown_style, marker_style, render, render_prompt_separator, row_style,
+        selected_style,
     };
 
     fn key(key: Key) -> Input {
@@ -5562,6 +5598,35 @@ mod tests {
             app.handle_local_command("/unknown"),
             Some(LocalCommand::Handled)
         );
+    }
+
+    #[test]
+    fn usage_limit_marks_the_agent_limited_until_reload() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Codex");
+        app.set_agent_name(1, "Claude");
+        app.apply_event(&codeswarm_adapters::AgentEvent::UsageLimitReached {
+            slot: 0,
+            detail: "You've hit your usage limit.".into(),
+        });
+        assert_eq!(
+            app.agent_states.get(&0).map(String::as_str),
+            Some("limited")
+        );
+        assert!(
+            app.status.contains("Codex out of credits"),
+            "status={:?}",
+            app.status
+        );
+        assert!(
+            app.status.contains("/reload"),
+            "status should point at recovery: {:?}",
+            app.status
+        );
+        assert_eq!(app.active_roster_slots(), vec![1]);
+        // A reload puts the agent back into the roster flow.
+        app.mark_agent_reloaded(0);
+        assert_eq!(app.active_roster_slots(), vec![0, 1]);
     }
 
     #[test]
@@ -7394,7 +7459,7 @@ mod tests {
         app.apply_event(&tool("two", codeswarm_adapters::ToolStatus::Running));
         app.apply_event(&tool("three", codeswarm_adapters::ToolStatus::Running));
         assert_eq!(app.transcript.len(), 1);
-        assert_eq!(app.tool_windows[&0].calls.len(), 2);
+        assert_eq!(app.tool_windows[&0].calls.len(), 3);
         let preview = app.transcript.viewport(72, 0, 10, 0);
         assert_eq!(preview.len(), 2);
         assert!(preview[0].text.starts_with("Antigravity: ["));
@@ -7420,12 +7485,23 @@ mod tests {
             1
         );
         assert_eq!(app.toggle_focused_detail(), Some(false));
+        let history = app.transcript.viewport(72, 0, 10, 0);
+        assert_eq!(history.len(), 4);
+        for title in ["Noisy one", "Noisy two", "Noisy three"] {
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|row| row.text.contains(title))
+                    .count(),
+                1
+            );
+        }
         assert!(
             app.export_markdown()
                 .contains("tool output that remains available")
         );
         app.apply_event(&tool("three", codeswarm_adapters::ToolStatus::Completed));
-        assert_eq!(app.tool_windows[&0].calls.len(), 2);
+        assert_eq!(app.tool_windows[&0].calls.len(), 3);
         let completed = app.transcript.viewport(72, 0, 10, 0);
         assert!(
             completed
@@ -7450,9 +7526,64 @@ mod tests {
                 detail: Some("large output\nsecond line".into()),
             },
         });
+        // The collapsed activity row keeps the newest output excerpt visible.
         assert_eq!(app.transcript.row_count(80), 2);
+        let collapsed = app.transcript.viewport(80, 0, 10, 0);
+        assert!(
+            collapsed
+                .iter()
+                .any(|row| row.text.contains("Run tests") && row.text.contains("second line")),
+            "collapsed={collapsed:?}"
+        );
+        // Expanding the focused detail keeps one physical row per call with
+        // the same excerpt rather than replaying the full output history.
         assert_eq!(app.toggle_focused_detail(), Some(false));
-        assert!(app.export_markdown().contains("large output\nsecond line"));
+        let expanded = app.transcript.viewport(80, 0, 10, 0);
+        assert!(
+            expanded
+                .iter()
+                .any(|row| row.text.contains("Run tests") && row.text.contains("second line")),
+            "expanded={expanded:?}"
+        );
+        // Export carries the retained call summary, excerpt included.
+        let markdown = app.export_markdown();
+        assert!(markdown.contains("## Tool"), "markdown={markdown:?}");
+        assert!(
+            markdown.contains("Run tests · 1 tool call"),
+            "markdown={markdown:?}"
+        );
+        assert!(markdown.contains("second line"), "markdown={markdown:?}");
+    }
+
+    #[test]
+    fn expanded_tool_history_is_capped_and_keeps_one_row_per_call() {
+        let mut app = App::default();
+        for index in 0..25 {
+            app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
+                slot: 0,
+                update: codeswarm_adapters::ToolUpdate {
+                    id: format!("call-{index}"),
+                    title: format!("Tool {index}"),
+                    status: codeswarm_adapters::ToolStatus::Completed,
+                    detail: Some(format!("old output\nlatest output {index}")),
+                },
+            });
+        }
+        let window = &app.tool_windows[&0];
+        assert_eq!(window.seen_call_ids.len(), 25);
+        assert_eq!(window.calls.len(), MAX_TOOL_HISTORY_ROWS);
+        assert_eq!(
+            window.calls.front().map(|call| call.id.as_str()),
+            Some("call-5")
+        );
+
+        assert_eq!(app.toggle_focused_detail(), Some(false));
+        let rows = app.transcript.viewport(48, 0, 100, 0);
+        assert_eq!(rows.len(), MAX_TOOL_HISTORY_ROWS + 1);
+        assert!(rows.iter().any(|row| row.text.contains("Tool 5")));
+        assert!(rows.iter().any(|row| row.text.contains("Tool 24")));
+        assert!(rows.iter().all(|row| !row.text.contains("old output")));
+        assert!(rows.iter().any(|row| row.text.contains("25 tool calls")));
     }
 
     #[test]
