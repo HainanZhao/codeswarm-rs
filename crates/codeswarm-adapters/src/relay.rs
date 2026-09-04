@@ -17,11 +17,14 @@ pub const DEFAULT_STOP_ACKNOWLEDGMENT: &str = "👍";
 /// "limits" is never misclassified.
 pub fn is_usage_limit_response(text: &str) -> bool {
     let haystack = text.to_lowercase();
-    haystack.contains("usage limit")
+    let exhausted_usage = haystack.contains("usage limit")
+        && ["hit", "reached", "exceeded"]
+            .iter()
+            .any(|marker| haystack.contains(marker));
+    exhausted_usage
         || haystack.contains("insufficient_quota")
         || haystack.contains("quota exceeded")
         || haystack.contains("insufficient credits")
-        || haystack.contains("billing") && haystack.contains("upgrade")
 }
 
 pub fn strip_stop_token(response: &str) -> (String, bool) {
@@ -254,6 +257,7 @@ impl Relay {
         swap_option(&mut self.previous_slot, first, second);
         swap_option(&mut self.pair_partner, first, second);
         self.active.swap(first, second);
+        self.limited.swap(first, second);
         self.context.swap_agents(first, second);
         Ok(())
     }
@@ -325,6 +329,7 @@ impl Relay {
 
     pub fn add_agent(&mut self) {
         self.active.push(true);
+        self.limited.push(false);
         self.context.add_agent();
     }
 
@@ -746,7 +751,26 @@ mod tests {
         assert!(!super::is_usage_limit_response(
             "The rate limit on the build job slowed things down."
         ));
+        assert!(!super::is_usage_limit_response(
+            "I updated the usage-limit documentation and billing upgrade flow."
+        ));
         assert!(!super::is_usage_limit_response("Ready to review the diff."));
+    }
+
+    #[test]
+    fn hot_added_and_swapped_slots_keep_limit_state_with_the_agent() {
+        let mut relay = Relay::new(2, 10);
+        relay.add_agent();
+        relay.mark_limited(2).expect("mark hot-added slot limited");
+        assert!(relay.is_limited(2));
+
+        relay.swap_agents(0, 2).expect("swap limited agent");
+        assert!(relay.is_limited(0));
+        assert!(!relay.is_limited(2));
+        assert!(matches!(
+            relay.begin("task", 0),
+            RelayDecision::Dispatch { slot: 1, .. }
+        ));
     }
 
     #[test]

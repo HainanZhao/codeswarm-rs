@@ -2538,8 +2538,17 @@ async fn run_relay_sequence_with_controls(
             return (false, blocking);
         }
         // A one-agent roster uses the same hot-reload-capable host but never
-        // reviews itself. Adding a peer later naturally enables the ring.
-        if relay.relay().active_slots().count() == 1 {
+        // reviews itself. A roster with one currently routable agent has the
+        // same behavior until a limited peer recovers.
+        let sole_routable = relay
+            .relay()
+            .routable_slots()
+            .next()
+            .filter(|_| relay.relay().routable_slots().count() == 1);
+        if matches!(
+            (&decision, sole_routable),
+            (Some(RelayDecision::Dispatch { slot, .. }), Some(sole)) if *slot == sole
+        ) {
             return (false, blocking);
         }
         // The first invocation carries the human task. Subsequent invocations
@@ -5450,6 +5459,62 @@ mod tests {
 
         assert!(!stopping);
         assert!(deferred.is_empty());
+        assert_eq!(
+            relay
+                .dispatches()
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_failure_hands_off_once_without_a_solo_self_review() {
+        let limited = ScriptedAdapter::new(
+            0,
+            AgentCapabilities::default(),
+            [AgentEvent::Failed {
+                slot: 0,
+                started: true,
+                detail: "insufficient_quota".into(),
+            }],
+        );
+        let healthy = ScriptedAdapter::new(
+            1,
+            AgentCapabilities::default(),
+            [
+                AgentEvent::Text {
+                    slot: 1,
+                    text: "continued safely".into(),
+                },
+                AgentEvent::TurnComplete { slot: 1 },
+            ],
+        );
+        let mut relay = RelayHost::new(
+            vec![
+                AdapterHost::new(Box::new(limited), None),
+                AdapterHost::new(Box::new(healthy), None),
+            ],
+            10,
+        )
+        .expect("relay");
+        relay.start().await.expect("start");
+        let (sender, events) = std::sync::mpsc::channel::<AdapterResult<AgentEvent>>();
+        let (_control_sender, mut controls) = tokio::sync::mpsc::unbounded_channel();
+
+        let (stopping, deferred) = run_relay_sequence_with_controls(
+            &mut relay,
+            &mut controls,
+            &sender,
+            "initial task".into(),
+            0,
+        )
+        .await;
+
+        assert!(!stopping);
+        assert!(deferred.is_empty());
+        assert!(events.try_iter().all(|event| event.is_ok()));
         assert_eq!(
             relay
                 .dispatches()

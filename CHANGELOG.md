@@ -7,14 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.12] - 2026-09-04
+
 ### Fixed
 
-- An agent whose provider plan is exhausted (for example Codex replying with
-  "You've hit your usage limit") no longer receives further relay turns. The
-  relay routes around the limited slot while preserving its queued prompts,
-  the roster shows the agent as limited, and a reload restores it to the ring
-  once the plan is recharged. Quota rejections surfaced as adapter failures
-  are treated the same way instead of tombstoning the agent.
+- Quota failures reported through an adapter error now leave the affected
+  agent limited instead of immediately overwriting that state with a crash,
+  and the relay continues to the next healthy peer without making the sole
+  routable agent review itself repeatedly.
+- Usage-limit state now follows agents through roster swaps and works for
+  agents added while a session is running.
+- Ordinary agent responses discussing usage-limit or billing documentation
+  are no longer mistaken for provider quota exhaustion.
 
 ## [0.8.11] - 2026-09-02
 
@@ -23,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Ctrl+O` on tool activity opens a capped chronological history of the 20
   latest calls rather than repeating the collapsed summary. Each call occupies
   one physical row with its title, status, and latest output excerpt.
+
+### Fixed
+
+- An agent whose provider plan is exhausted (for example Codex replying with
+  "You've hit your usage limit") no longer receives further relay turns. The
+  relay routes around the limited slot while preserving its queued prompts,
+  the roster shows the agent as limited, and a reload restores it to the ring
+  once the plan is recharged. Quota rejections surfaced as adapter failures
+  are treated the same way instead of tombstoning the agent.
 
 ## [0.8.10] - 2026-09-02
 

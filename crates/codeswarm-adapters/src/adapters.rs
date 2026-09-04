@@ -1441,8 +1441,15 @@ impl RelayHost {
             .get_mut(*slot)
             .ok_or_else(|| AdapterError::Transport("relay selected missing adapter".into()))?;
         if let Err(error) = host.send_prompt(prompt.clone()).await {
-            report_relay_failure(&mut self.relay, &event_sink, *slot, true, error.to_string());
+            let limited =
+                report_relay_failure(&mut self.relay, &event_sink, *slot, true, error.to_string());
+            if limited {
+                self.relay.finish(*slot, *direct, false);
+            }
             let _ = self.queue_session_metadata();
+            if limited {
+                return Ok(decision);
+            }
             return Err(error);
         }
         if let Some(sink) = &self.event_sink {
@@ -1457,14 +1464,20 @@ impl RelayHost {
         let completion_event = loop {
             if self.cancel_requested.swap(false, Ordering::AcqRel) {
                 if let Err(error) = cancel_with_timeout(host).await {
-                    report_relay_failure(
+                    let limited = report_relay_failure(
                         &mut self.relay,
                         &event_sink,
                         *slot,
                         true,
                         error.to_string(),
                     );
+                    if limited {
+                        self.relay.finish(*slot, *direct, false);
+                    }
                     let _ = self.queue_session_metadata();
+                    if limited {
+                        return Ok(decision);
+                    }
                     return Err(error);
                 }
                 return Err(AdapterError::Transport("relay turn cancelled".into()));
@@ -1473,26 +1486,38 @@ impl RelayHost {
                 update = host.next_update() => match update {
                     Some(Ok(update)) => update,
                     Some(Err(error)) => {
-                        report_relay_failure(
+                        let limited = report_relay_failure(
                             &mut self.relay,
                             &event_sink,
                             *slot,
                             true,
                             error.to_string(),
                         );
+                        if limited {
+                            self.relay.finish(*slot, *direct, false);
+                        }
                         let _ = self.queue_session_metadata();
+                        if limited {
+                            return Ok(decision);
+                        }
                         return Err(error);
                     }
                     None => {
                         let error = AdapterError::Transport("adapter ended during turn".into());
-                        report_relay_failure(
+                        let limited = report_relay_failure(
                             &mut self.relay,
                             &event_sink,
                             *slot,
                             true,
                             error.to_string(),
                         );
+                        if limited {
+                            self.relay.finish(*slot, *direct, false);
+                        }
                         let _ = self.queue_session_metadata();
+                        if limited {
+                            return Ok(decision);
+                        }
                         return Err(error);
                     }
                 },
@@ -1501,14 +1526,20 @@ impl RelayHost {
                         continue;
                     }
                     if let Err(error) = cancel_with_timeout(host).await {
-                        report_relay_failure(
+                        let limited = report_relay_failure(
                             &mut self.relay,
                             &event_sink,
                             *slot,
                             true,
                             error.to_string(),
                         );
+                        if limited {
+                            self.relay.finish(*slot, *direct, false);
+                        }
                         let _ = self.queue_session_metadata();
+                        if limited {
+                            return Ok(decision);
+                        }
                         return Err(error);
                     }
                     return Err(AdapterError::Transport("relay turn cancelled".into()));
@@ -1552,14 +1583,20 @@ impl RelayHost {
                 AgentEvent::Failed {
                     started, detail, ..
                 } => {
-                    report_relay_failure(
+                    let limited = report_relay_failure(
                         &mut self.relay,
                         &event_sink,
                         *slot,
                         *started,
                         detail.clone(),
                     );
+                    if limited {
+                        self.relay.finish(*slot, *direct, false);
+                    }
                     let _ = self.queue_session_metadata();
+                    if limited {
+                        return Ok(decision);
+                    }
                     return Err(AdapterError::Transport(detail.clone()));
                 }
                 _ => {}
@@ -1640,23 +1677,15 @@ fn report_relay_failure(
     slot: RosterSlot,
     started: bool,
     detail: String,
-) {
+) -> bool {
     // A quota rejection is not a crash: route around the agent without
     // tombstoning the slot so a recharge can restore it.
     if is_usage_limit_response(&detail) {
         let _ = relay.mark_limited(slot);
         if let Some(sink) = event_sink {
-            sink(AgentEvent::UsageLimitReached {
-                slot,
-                detail: detail.clone(),
-            });
-            sink(AgentEvent::Failed {
-                slot,
-                started,
-                detail,
-            });
+            sink(AgentEvent::UsageLimitReached { slot, detail });
         }
-        return;
+        return true;
     }
     let _ = relay.tombstone(slot);
     if let Some(sink) = event_sink {
@@ -1666,6 +1695,7 @@ fn report_relay_failure(
             detail,
         });
     }
+    false
 }
 
 /// Deterministic in-memory adapter used for contract and relay tests.
@@ -5287,6 +5317,62 @@ mod tests {
         // the relay unit tests.)
         relay.reload(0).await.expect("reload");
         assert!(!relay.relay().is_limited(0));
+    }
+
+    #[tokio::test]
+    async fn relay_host_routes_around_usage_limit_failures_without_tombstoning() {
+        let limited = ScriptedAdapter::new(
+            0,
+            AgentCapabilities::default(),
+            [AgentEvent::Failed {
+                slot: 0,
+                started: true,
+                detail: "request failed: insufficient_quota".into(),
+            }],
+        );
+        let healthy = ScriptedAdapter::new(
+            1,
+            AgentCapabilities::default(),
+            [AgentEvent::TurnComplete { slot: 1 }],
+        );
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&events);
+        let mut relay = RelayHost::new(
+            vec![
+                AdapterHost::new(Box::new(limited), None),
+                AdapterHost::new(Box::new(healthy), None),
+            ],
+            4,
+        )
+        .expect("relay");
+        relay.set_event_sink(move |event| captured.lock().expect("events").push(event));
+        relay.start().await.expect("start");
+        events.lock().expect("events").clear();
+
+        assert!(matches!(
+            relay.run_turn("task", 0).await.expect("limited failure"),
+            crate::relay::RelayDecision::Dispatch { slot: 0, .. }
+        ));
+        assert!(relay.relay().is_limited(0));
+        assert_eq!(relay.relay().active_slots().collect::<Vec<_>>(), [0, 1]);
+        {
+            let events = events.lock().expect("events");
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::UsageLimitReached { slot: 0, .. }))
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::Failed { .. }))
+            );
+        }
+
+        assert!(matches!(
+            relay.run_turn("", 0).await.expect("healthy peer"),
+            crate::relay::RelayDecision::Dispatch { slot: 1, .. }
+        ));
     }
 
     #[tokio::test]
