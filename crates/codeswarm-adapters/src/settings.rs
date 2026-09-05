@@ -56,8 +56,7 @@ pub fn atomic_write(path: &Path, value: &Value) -> io::Result<()> {
             "settings path has no parent directory",
         ));
     };
-    fs::create_dir_all(parent)?;
-    set_private_directory(parent)?;
+    create_private_directory(parent)?;
 
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temporary = PathBuf::from(format!(
@@ -72,6 +71,11 @@ pub fn atomic_write(path: &Path, value: &Value) -> io::Result<()> {
     let result = (|| {
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         let mut file = options.open(&temporary)?;
         set_private_file(&file)?;
         let encoded = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
@@ -100,12 +104,17 @@ pub fn atomic_write(path: &Path, value: &Value) -> io::Result<()> {
     result
 }
 
-fn set_private_directory(path: &Path) -> io::Result<()> {
+fn create_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
     }
+    #[cfg(not(unix))]
+    fs::create_dir_all(path)?;
     Ok(())
 }
 
@@ -168,6 +177,29 @@ mod tests {
                 .all(|entry| entry.expect("entry").file_name() != ".codeswarm.json.tmp")
         );
         fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn settings_preserve_existing_parent_permissions_and_create_private_directories() {
+        let directory = tempfile_directory();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        update(directory.join("existing.json"), |_| {}).unwrap();
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let nested = directory.join("new");
+        let path = nested.join("settings.json");
+        update(&path, |_| {}).unwrap();
+        assert_eq!(
+            fs::metadata(nested).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

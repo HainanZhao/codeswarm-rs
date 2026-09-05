@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Failed metadata writes retain the newest snapshot, retry, and report errors.
 - Replacement agents retain the original task after public-journal pruning.
 - Command help, completion, argument validation, and documentation agree.
+- Settings saves preserve existing parent-directory permissions, including
+  shared temporary directories and configuration directories owned by others.
 
 ## [0.8.12] - 2026-09-04
 
