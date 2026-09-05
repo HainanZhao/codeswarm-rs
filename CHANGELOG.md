@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-05
+
+### Changed
+
+- Removed the transcript scrollbar and its settings toggle; scrolling and
+  follow-output continue to use the full conversation width.
+
 ## [0.9.1] - 2026-09-05
 
 ### Fixed

@@ -851,7 +851,6 @@ struct ConfigSnapshot {
     show_thoughts: bool,
     tool_expand_policy: ToolExpandPolicy,
     density: Density,
-    show_scrollbar: bool,
     sounds: bool,
     blink_title: bool,
     agents: Vec<StoreAgent>,
@@ -920,7 +919,6 @@ pub struct App {
     expand_tools: bool,
     density: Density,
     tool_expand_policy: ToolExpandPolicy,
-    show_scrollbar: bool,
     diff_split: bool,
     store_visible: bool,
     store_selected: usize,
@@ -969,7 +967,7 @@ pub struct App {
     next_agent: Option<usize>,
 }
 
-const CONFIG_SETTING_COUNT: usize = 14;
+const CONFIG_SETTING_COUNT: usize = 13;
 
 fn agent_event_slot(event: &AgentEvent) -> Option<usize> {
     match event {
@@ -1028,7 +1026,6 @@ impl Default for App {
             expand_tools: false,
             density: Density::Comfortable,
             tool_expand_policy: ToolExpandPolicy::Fail,
-            show_scrollbar: true,
             diff_split: false,
             store_visible: false,
             store_selected: 0,
@@ -1208,7 +1205,6 @@ impl App {
                 show_thoughts: self.show_thoughts,
                 tool_expand_policy: self.tool_expand_policy,
                 density: self.density,
-                show_scrollbar: self.show_scrollbar,
                 sounds: self.sounds,
                 blink_title: self.blink_title,
                 agents: self.config_agents.clone(),
@@ -1518,7 +1514,6 @@ impl App {
                     self.tool_expand_policy = snapshot.tool_expand_policy;
                     self.expand_tools = snapshot.tool_expand_policy == ToolExpandPolicy::Always;
                     self.density = snapshot.density;
-                    self.show_scrollbar = snapshot.show_scrollbar;
                     self.sounds = snapshot.sounds;
                     self.blink_title = snapshot.blink_title;
                     self.config_agents = snapshot.agents;
@@ -1747,16 +1742,15 @@ impl App {
                             Density::Compact => Density::Comfortable,
                         };
                     }
-                    9 => self.show_scrollbar = !self.show_scrollbar,
-                    10 => self.sounds = !self.sounds,
-                    11 => {
+                    9 => self.sounds = !self.sounds,
+                    10 => {
                         self.blink_title = !self.blink_title;
                         if !self.blink_title {
                             self.terminal_title_blink = false;
                         }
                     }
-                    12 => self.theme = self.theme.next(),
-                    13 => {}
+                    11 => self.theme = self.theme.next(),
+                    12 => {}
                     _ => return ConfigAction::Ignored,
                 }
                 self.status = "configuration updated".into();
@@ -1939,14 +1933,6 @@ impl App {
 
     pub fn set_density(&mut self, density: &str) {
         self.density = Density::from_setting(density);
-    }
-
-    pub fn scrollbar_visible(&self) -> bool {
-        self.show_scrollbar
-    }
-
-    pub fn set_scrollbar_visible(&mut self, visible: bool) {
-        self.show_scrollbar = visible;
     }
 
     pub fn diff_split(&self) -> bool {
@@ -3136,7 +3122,7 @@ impl App {
     }
 
     pub fn scroll_by(&mut self, delta: isize, width: usize, height: usize) {
-        let (content_width, _) = self.transcript_layout(width, height);
+        let content_width = width;
         let max_scroll = self
             .transcript
             .row_count(content_width)
@@ -3146,23 +3132,12 @@ impl App {
     }
 
     pub fn follow_tail(&mut self, width: usize, height: usize) {
-        let (content_width, _) = self.transcript_layout(width, height);
+        let content_width = width;
         self.scroll_y = self
             .transcript
             .row_count(content_width)
             .saturating_sub(height);
         self.follow_tail = true;
-    }
-
-    fn transcript_layout(&mut self, outer_width: usize, height: usize) -> (usize, bool) {
-        let scrollbar_visible = self.show_scrollbar
-            && outer_width > 0
-            && height > 0
-            && self.transcript.row_count(outer_width) > height;
-        (
-            outer_width.saturating_sub(usize::from(scrollbar_visible)),
-            scrollbar_visible,
-        )
     }
 
     pub fn toggle_focused_detail(&mut self) -> Option<bool> {
@@ -3462,32 +3437,14 @@ fn render_content(frame: &mut Frame, app: &mut App) {
     ])
     .split(area);
     let content_height = usize::from(rows[0].height);
-    let (content_width, scrollbar_visible) =
-        app.transcript_layout(usize::from(rows[0].width), content_height);
+    let content_width = usize::from(rows[0].width);
     if app.follow_tail {
         app.follow_tail(rows[0].width as usize, content_height);
     }
     let visible = app
         .transcript
         .viewport(content_width, app.scroll_y, content_height, 0);
-    render_transcript(
-        frame.buffer_mut(),
-        rows[0],
-        visible,
-        app,
-        app.diff_split,
-        scrollbar_visible,
-    );
-    if scrollbar_visible {
-        render_scrollbar(
-            frame.buffer_mut(),
-            rows[0],
-            app.scroll_y,
-            content_height,
-            &mut app.transcript,
-            content_width,
-        );
-    }
+    render_transcript(frame.buffer_mut(), rows[0], visible, app, app.diff_split);
 
     if app.queued_count() > 0 {
         render_queue(frame.buffer_mut(), rows[1], app);
@@ -4064,8 +4021,7 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
             area.height.saturating_sub(bottom_height),
         );
         let height = usize::from(transcript_area.height);
-        let (width, scrollbar_visible) =
-            app.transcript_layout(usize::from(transcript_area.width), height);
+        let width = usize::from(transcript_area.width);
         if app.follow_tail {
             app.follow_tail(transcript_area.width as usize, height);
         }
@@ -4076,18 +4032,7 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
             visible,
             app,
             app.diff_split,
-            scrollbar_visible,
         );
-        if scrollbar_visible {
-            render_scrollbar(
-                frame.buffer_mut(),
-                transcript_area,
-                app.scroll_y,
-                height,
-                &mut app.transcript,
-                width,
-            );
-        }
     }
 
     if area.height > 1 {
@@ -4177,55 +4122,6 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     } else {
         render_footer(frame.buffer_mut(), area, app);
-    }
-}
-
-fn render_scrollbar(
-    buffer: &mut Buffer,
-    area: Rect,
-    scroll_y: usize,
-    viewport_height: usize,
-    transcript: &mut Transcript,
-    content_width: usize,
-) {
-    if area.width == 0 || viewport_height == 0 {
-        return;
-    }
-    let track_height = area.height as usize;
-    if track_height == 0 {
-        return;
-    }
-    let total = transcript.row_count(content_width);
-    if total <= viewport_height {
-        return;
-    }
-    let thumb_height = (track_height.saturating_mul(track_height) / total.max(1))
-        .max(1)
-        .min(track_height);
-    let max_scroll = total.saturating_sub(viewport_height);
-    let thumb_offset = if max_scroll == 0 {
-        0
-    } else {
-        (track_height.saturating_sub(thumb_height))
-            .saturating_mul(scroll_y)
-            .checked_div(max_scroll)
-            .unwrap_or(0)
-    };
-    let x = area.right().saturating_sub(1);
-    for offset in 0..track_height {
-        let symbol = if offset >= thumb_offset && offset < thumb_offset + thumb_height {
-            "█"
-        } else {
-            "│"
-        };
-        let style = if symbol == "█" {
-            Style::default().fg(ACCENT).bg(TRANSCRIPT_BG)
-        } else {
-            Style::default().fg(SEPARATOR).bg(TRANSCRIPT_BG)
-        };
-        buffer[(x, area.y.saturating_add(offset as u16))]
-            .set_symbol(symbol)
-            .set_style(style);
     }
 }
 
@@ -4367,15 +4263,6 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
             },
             true,
         ),
-        (
-            "Scrollbar",
-            if app.show_scrollbar {
-                "Normal"
-            } else {
-                "Hidden"
-            },
-            true,
-        ),
         ("Sounds", if app.sounds { "On" } else { "Off" }, true),
         (
             "Blink title",
@@ -4479,7 +4366,6 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
                 "Thoughts" => "Thoughts",
                 "Tool details" => "Tools",
                 "Density" => "Density",
-                "Scrollbar" => "Scroll",
                 "Sounds" => "Sound",
                 "Blink title" => "Blink",
                 "Collaboration" => "Collab",
@@ -4728,7 +4614,6 @@ fn render_transcript(
     rows: Vec<RenderRow>,
     app: &App,
     diff_split: bool,
-    scrollbar_visible: bool,
 ) {
     // Keep the initial workspace quiet. The prompt and status ribbon already
     // explain how to begin; rendering an empty bordered panel only consumes
@@ -4758,7 +4643,7 @@ fn render_transcript(
                     && !row.text.is_empty()
             })
         });
-        let row_width = usize::from(area.width).saturating_sub(usize::from(scrollbar_visible));
+        let row_width = usize::from(area.width);
         rows.into_iter()
             .enumerate()
             .map(|(row_index, mut row)| {
@@ -5576,7 +5461,6 @@ mod tests {
         let backend = TestBackend::new(40, 8);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
-        app.set_scrollbar_visible(false);
         app.transcript
             .append(BlockKind::Agent, "Agent: response", false);
         terminal
@@ -5976,7 +5860,7 @@ mod tests {
         );
         app.transcript.append(BlockKind::Notice, "tail-ok", false);
         app.follow_tail(80, 8);
-        let tail = app.transcript.viewport(79, app.scroll_y, 8, 0);
+        let tail = app.transcript.viewport(80, app.scroll_y, 8, 0);
         assert!(
             tail.iter().any(|row| row.text.contains("tail-ok")),
             "tail={tail:?}, scroll={}",
@@ -7213,7 +7097,7 @@ mod tests {
         let mut app = App::default();
         assert!(app.blink_title_enabled());
         app.handle_local_command("/settings");
-        for _ in 0..11 {
+        for _ in 0..10 {
             app.handle_config_key(ConfigKey::Down);
         }
         assert_eq!(
@@ -7262,57 +7146,56 @@ mod tests {
     }
 
     #[test]
-    fn scrollbar_preference_toggles_the_cached_indicator() {
-        let mut app = App::default();
-        app.handle_local_command("/settings");
-        for _ in 0..9 {
-            app.handle_config_key(ConfigKey::Down);
+    fn overflowing_transcript_has_no_scrollbar_and_still_scrolls() {
+        for (width, height) in [(50, 12), (30, 6)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = App::default();
+            app.transcript
+                .append(BlockKind::Human, "You: short message", false);
+
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .expect("draw short transcript");
+            let content_height = if width < 36 {
+                usize::from(height - 4)
+            } else {
+                app.content_height(usize::from(height))
+            };
+            let right_edge = |buffer: &Buffer| {
+                (0..content_height)
+                    .map(|row| buffer[(width - 1, row as u16)].symbol())
+                    .collect::<String>()
+            };
+            let short_edge = right_edge(terminal.backend().buffer());
+            assert!(!short_edge.contains('█'), "right edge={short_edge:?}");
+            assert!(!short_edge.contains('│'), "right edge={short_edge:?}");
+
+            app.transcript.append(
+                BlockKind::Agent,
+                (0..300)
+                    .map(|index| format!("word{index}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                false,
+            );
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .expect("draw overflowing transcript");
+            let overflowing_edge = right_edge(terminal.backend().buffer());
+            assert!(
+                !overflowing_edge.contains('█') && !overflowing_edge.contains('│'),
+                "right edge={overflowing_edge:?}"
+            );
+            let tail = app.scroll_y;
+            assert!(tail > 0);
+            app.scroll_by(-1, usize::from(width), content_height);
+            assert_eq!(app.scroll_y, tail - 1);
+            assert!(!app.follow_tail);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            app.follow_tail(usize::from(width), content_height);
+            assert_eq!(app.scroll_y, tail);
         }
-        assert!(app.scrollbar_visible());
-        assert_eq!(
-            app.handle_config_key(ConfigKey::Confirm),
-            ConfigAction::Changed
-        );
-        assert!(!app.scrollbar_visible());
-    }
-
-    #[test]
-    fn scrollbar_renders_only_when_the_transcript_overflows() {
-        let backend = TestBackend::new(50, 12);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
-        let mut app = App::default();
-        app.transcript
-            .append(BlockKind::Human, "You: short message", false);
-
-        terminal
-            .draw(|frame| render(frame, &mut app))
-            .expect("draw short transcript");
-        let content_height = app.content_height(12);
-        let right_edge = |buffer: &Buffer| {
-            (0..content_height)
-                .map(|row| buffer[(49, row as u16)].symbol())
-                .collect::<String>()
-        };
-        let short_edge = right_edge(terminal.backend().buffer());
-        assert!(!short_edge.contains('█'), "right edge={short_edge:?}");
-        assert!(!short_edge.contains('│'), "right edge={short_edge:?}");
-
-        app.transcript.append(
-            BlockKind::Agent,
-            (0..300)
-                .map(|index| format!("word{index}"))
-                .collect::<Vec<_>>()
-                .join(" "),
-            false,
-        );
-        terminal
-            .draw(|frame| render(frame, &mut app))
-            .expect("draw overflowing transcript");
-        let overflowing_edge = right_edge(terminal.backend().buffer());
-        assert!(
-            overflowing_edge.contains('█') || overflowing_edge.contains('│'),
-            "right edge={overflowing_edge:?}"
-        );
     }
 
     #[test]
@@ -7321,7 +7204,7 @@ mod tests {
         assert!(app.sounds_enabled());
         assert!(app.notifications_enabled());
         app.handle_local_command("/settings");
-        for _ in 0..10 {
+        for _ in 0..9 {
             app.handle_config_key(ConfigKey::Down);
         }
         assert_eq!(
@@ -7645,13 +7528,13 @@ mod tests {
         }
         app.set_theme("light");
         app.open_config();
-        app.config_selected = 12;
+        app.config_selected = 11;
         app.handle_config_key(ConfigKey::Confirm);
         assert_eq!(app.theme(), "dark");
         app.handle_config_key(ConfigKey::Cancel);
         assert_eq!(app.theme(), "light");
         app.open_config();
-        app.config_selected = 12;
+        app.config_selected = 11;
         app.handle_config_key(ConfigKey::Confirm);
         app.handle_config_key(ConfigKey::Save);
         assert_eq!(app.theme(), "dark");
@@ -7798,7 +7681,6 @@ mod tests {
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
         app.set_agent_name(0, "Codex");
-        app.set_scrollbar_visible(false);
         app.transcript.append(BlockKind::Human, "You: hello", false);
         app.transcript.append(
             BlockKind::Thought,
@@ -8232,7 +8114,7 @@ mod tests {
         );
         app.follow_tail(80, 10);
         let tail = app.scroll_y;
-        assert_eq!(tail, app.transcript.row_count(79).saturating_sub(10));
+        assert_eq!(tail, app.transcript.row_count(80).saturating_sub(10));
         assert!(app.follow_tail);
         app.scroll_by(-1, 80, 10);
         assert!(!app.follow_tail);
@@ -8243,7 +8125,6 @@ mod tests {
         app.follow_tail(80, 10);
         assert!(app.follow_tail);
         assert!(app.scroll_y >= tail);
-        app.set_scrollbar_visible(false);
         app.follow_tail(80, 10);
         assert_eq!(
             app.scroll_y,

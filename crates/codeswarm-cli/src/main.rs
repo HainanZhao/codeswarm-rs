@@ -1553,13 +1553,6 @@ fn load_ui_preferences(app: &mut App) {
     {
         app.set_density(density);
     }
-    if let Some(scrollbar) = value
-        .get("ui")
-        .and_then(|ui| ui.get("scrollbar"))
-        .and_then(serde_json::Value::as_str)
-    {
-        app.set_scrollbar_visible(!scrollbar.eq_ignore_ascii_case("hidden"));
-    }
     if let Some(split) = value
         .get("diff")
         .and_then(|diff| diff.get("view"))
@@ -1867,14 +1860,7 @@ fn save_ui_preferences_at(path: &Path, app: &App) -> std::io::Result<()> {
             ui["prompt_message"] = serde_json::Value::String(app.prompt_message().into());
             ui["density"] = serde_json::Value::String(app.density().into());
             ui["theme"] = serde_json::Value::String(app.theme().into());
-            ui["scrollbar"] = serde_json::Value::String(
-                if app.scrollbar_visible() {
-                    "normal"
-                } else {
-                    "hidden"
-                }
-                .into(),
-            );
+            ui.as_object_mut().expect("ui object").remove("scrollbar");
         }
         let transcript = settings
             .entry("transcript")
@@ -4324,6 +4310,37 @@ mod tests {
             app.set_theme("light");
             super::apply_theme_preference(&mut app, &replacement);
             assert_eq!(app.theme(), "terminal");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saving_preferences_removes_obsolete_scrollbar_values() {
+        let root = std::env::temp_dir().join(format!(
+            "codeswarm-scrollbar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("settings.json");
+        std::fs::create_dir_all(&root).unwrap();
+        for value in [
+            serde_json::json!("normal"),
+            serde_json::json!("hidden"),
+            serde_json::json!(42),
+        ] {
+            std::fs::write(
+                &path,
+                serde_json::json!({"ui": {"scrollbar": value, "custom": "retained"}}).to_string(),
+            )
+            .unwrap();
+            super::save_ui_preferences_at(&path, &App::default()).unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(saved["ui"].get("scrollbar").is_none());
+            assert_eq!(saved["ui"]["custom"], "retained");
         }
         std::fs::remove_dir_all(root).unwrap();
     }

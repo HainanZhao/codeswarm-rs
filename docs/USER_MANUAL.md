@@ -98,7 +98,7 @@ The configuration panel includes a slot-based roster. The same catalog agent
 can occupy multiple slots, and each running slot can select and persist a
 different advertised model. Space adds/removes a slot, Left/Right changes its
 model, and Alt+Up/Down changes slot order. The panel also includes
-compact/comfortable density, normal/hidden scrollbar, thought visibility,
+compact/comfortable density, thought visibility,
 tool-detail expansion, diff view, and a notification policy. Ctrl+S saves the roster (and
 applies idle-session changes when possible). On Linux
 notifications use `notify-send`; on

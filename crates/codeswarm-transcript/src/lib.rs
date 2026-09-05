@@ -243,8 +243,7 @@ impl Transcript {
             return;
         }
 
-        // The scrollbar probes the outer width before rendering one column
-        // narrower. Keep both layouts so each scroll does not rewrap history.
+        // Keep two layouts so alternating viewport widths can reuse history.
         if self.cached_width != Some(width) {
             let alternate = self.alternate_rows.take();
             self.alternate_rows = self.cached_width.map(|width| RowCache {
@@ -921,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn scrollbar_width_probes_reuse_both_layouts_and_invalidate_on_changes() {
+    fn alternating_widths_reuse_both_layouts_and_invalidate_on_changes() {
         let mut transcript = fixtures::hundred_turn_transcript();
         transcript.row_count(80);
         let wide = transcript.rows.as_ptr();
