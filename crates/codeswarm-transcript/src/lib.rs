@@ -77,6 +77,24 @@ impl Transcript {
         id
     }
 
+    /// Place a block before another while retaining IDs, source, and expansion.
+    /// Only the affected suffix needs layout; completed earlier turns stay cached.
+    pub fn move_before(&mut self, id: u64, before: u64) -> bool {
+        let Some(from) = self.blocks.iter().position(|block| block.id == id) else {
+            return false;
+        };
+        let Some(to) = self.blocks.iter().position(|block| block.id == before) else {
+            return false;
+        };
+        if from <= to {
+            return true;
+        }
+        let block = self.blocks.remove(from);
+        self.blocks.insert(to, block);
+        self.invalidate_from(to);
+        true
+    }
+
     /// Number of durable logical blocks, not currently visible terminal rows.
     pub fn len(&self) -> usize {
         self.blocks.len()
@@ -123,12 +141,13 @@ impl Transcript {
     /// Toggle one block's detail. No other source is reparsed until a caller
     /// asks for a viewport.
     pub fn set_collapsed(&mut self, id: u64, collapsed: bool) -> bool {
-        let Some(block) = self.blocks.iter_mut().find(|block| block.id == id) else {
+        let Some(index) = self.blocks.iter().position(|block| block.id == id) else {
             return false;
         };
+        let block = &mut self.blocks[index];
         if block.collapsed != collapsed {
             block.collapsed = collapsed;
-            self.invalidate_from(id as usize);
+            self.invalidate_from(index);
         }
         true
     }
@@ -160,11 +179,12 @@ impl Transcript {
     /// renderers use this to turn thousands of token chunks into one logical
     /// response rather than thousands of transcript objects.
     pub fn extend(&mut self, id: u64, text: &str) -> bool {
-        let Some(block) = self.blocks.iter_mut().find(|block| block.id == id) else {
+        let Some(index) = self.blocks.iter().position(|block| block.id == id) else {
             return false;
         };
+        let block = &mut self.blocks[index];
         block.source.push_str(text);
-        self.invalidate_from(id as usize);
+        self.invalidate_from(index);
         true
     }
 
@@ -179,13 +199,14 @@ impl Transcript {
         source: impl Into<String>,
         collapsed: bool,
     ) -> bool {
-        let Some(block) = self.blocks.iter_mut().find(|block| block.id == id) else {
+        let Some(index) = self.blocks.iter().position(|block| block.id == id) else {
             return false;
         };
+        let block = &mut self.blocks[index];
         block.kind = kind;
         block.source = source.into();
         block.collapsed = collapsed;
-        self.invalidate_from(id as usize);
+        self.invalidate_from(index);
         true
     }
 
@@ -230,7 +251,6 @@ impl Transcript {
     }
 
     fn invalidate_from(&mut self, index: usize) {
-        // IDs are append-only indices, reset together with the blocks on clear.
         self.valid_blocks = self.valid_blocks.min(index);
         if let Some(cache) = &mut self.alternate_rows {
             cache.valid_blocks = cache.valid_blocks.min(index);
@@ -269,14 +289,18 @@ impl Transcript {
 
         let mut header_speaker = self.headers.get(self.valid_blocks).cloned().flatten();
         self.headers.truncate(self.valid_blocks);
-        if let Some(block) = self.blocks.get(self.valid_blocks) {
-            let row = self
-                .block_starts
-                .get(&block.id)
-                .copied()
-                .unwrap_or(self.rows.len());
-            self.rows.truncate(row);
-            self.block_starts.split_off(&block.id);
+        // Stable IDs may no longer follow presentation order. Only discard
+        // cached rows belonging to the invalid suffix, preserving earlier turns.
+        let invalid = &self.blocks[self.valid_blocks..];
+        let row = invalid
+            .iter()
+            .filter_map(|block| self.block_starts.get(&block.id))
+            .copied()
+            .min()
+            .unwrap_or(self.rows.len());
+        self.rows.truncate(row);
+        for block in invalid {
+            self.block_starts.remove(&block.id);
         }
         for block in self.blocks.iter().skip(self.valid_blocks) {
             self.headers.push(header_speaker.clone());
@@ -315,7 +339,9 @@ impl Transcript {
                         text: truncate_chars(&format!("{speaker}: [{timestamp}]"), width),
                     });
                 }
-                let lines = if block.kind == BlockKind::Tool && !block.collapsed {
+                let lines = if block.kind == BlockKind::Thought && block.collapsed {
+                    body.lines().map(str::to_owned).collect()
+                } else if block.kind == BlockKind::Tool && !block.collapsed {
                     body.lines()
                         .map(|line| truncate_chars(line, width))
                         .collect()
@@ -340,7 +366,12 @@ impl Transcript {
                 header_speaker = None;
             }
             if block.collapsed {
-                for (line_index, line) in wrap(&display, width).into_iter().enumerate() {
+                let lines = if block.kind == BlockKind::Thought {
+                    display.lines().map(str::to_owned).collect()
+                } else {
+                    wrap(&display, width)
+                };
+                for (line_index, line) in lines.into_iter().enumerate() {
                     self.rows.push(RenderRow {
                         block_id: block.id,
                         kind: block.kind,
@@ -404,19 +435,38 @@ fn collapsed_thought_preview(block: &TranscriptBlock, width: usize) -> String {
     });
     let source = attribution.map_or(block.source.as_str(), |(_, _, content)| content);
     let prefix = "Thought · ";
-    if source.trim().is_empty() || prefix.chars().count() >= width {
-        let preview = truncate_chars("Thought", width);
-        return attribution.map_or(preview.clone(), |(speaker, timestamp, _)| {
-            format!("{speaker}: {timestamp} {preview}")
-        });
-    }
-    let content_width = width.saturating_sub(prefix.chars().count()).max(1);
-    let content = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    let visible = truncate_start_chars(&content, content_width);
-    let preview = format!("{prefix}{visible}");
+    let preview = if source.trim().is_empty() || width <= prefix.chars().count() {
+        truncate_chars("Thought", width)
+    } else {
+        let lines = wrap(source, width - prefix.chars().count());
+        let visible = &lines[lines.len().saturating_sub(2)..];
+        visible
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let label = if index == 0 {
+                    prefix.to_owned()
+                } else {
+                    " ".repeat(prefix.chars().count())
+                };
+                format!("{label}{line}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     attribution.map_or(preview.clone(), |(speaker, timestamp, _)| {
         format!("{speaker}: {timestamp} {preview}")
     })
+}
+
+fn tail_preview(label: &str, source: &str, width: usize) -> String {
+    let prefix = format!("{label} · ");
+    if source.trim().is_empty() || prefix.chars().count() >= width {
+        return truncate_chars(label, width);
+    }
+    let content = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let visible = truncate_start_chars(&content, width.saturating_sub(prefix.chars().count()));
+    format!("{prefix}{visible}")
 }
 
 fn collapsed_activity_preview(
@@ -439,53 +489,13 @@ fn collapsed_activity_preview(
     })
 }
 
-/// Show the newest tool call and its latest rendered output line in one row.
-/// Full details stay in the source block for Ctrl+O.
+/// Match the thought preview: one labelled, tail-focused row for the newest call.
+/// Full retained history remains available through Ctrl+O.
 fn rolling_tool_preview(source: &str, width: usize) -> String {
-    let mut calls = Vec::new();
-    let mut current = Vec::new();
-    for line in source.lines() {
-        if line.starts_with('🔧') && !current.is_empty() {
-            calls.push(std::mem::take(&mut current));
-        }
-        current.push(line);
-    }
-    if !current.is_empty() {
-        calls.push(current);
-    }
-
-    let call = calls.last().cloned().unwrap_or_default();
-    let header = call.first().copied().unwrap_or("Tool").trim();
-    let detail = call
-        .iter()
-        .skip(1)
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if detail.is_empty() {
-        return truncate_chars(header, width);
-    }
-
-    let separator = " · ";
-    let header_budget = (width / 2).max(1);
-    let header = truncate_chars(header, header_budget);
-    let detail_width = width
-        .saturating_sub(header.chars().count() + separator.chars().count())
-        .max(1);
-    let detail_rows = wrap(&detail, detail_width);
-    let mut latest = detail_rows.last().cloned().unwrap_or_default();
-    if detail_rows.len() > 1
-        || call
-            .iter()
-            .skip(1)
-            .filter(|line| !line.trim().is_empty())
-            .count()
-            > 1
-    {
-        latest = truncate_chars(&format!("…{latest}"), detail_width);
-    }
-    truncate_chars(&format!("{header}{separator}{latest}"), width)
+    let latest = source
+        .rsplit_once("\n🔧")
+        .map_or(source, |(_, latest)| latest);
+    tail_preview("Tool", latest.trim_start_matches('🔧').trim(), width)
 }
 
 fn bounded_head_preview(label: &str, source: &str, width: usize, max_lines: usize) -> String {
@@ -668,7 +678,7 @@ mod tests {
             fixtures::five_thousand_word_reply(),
             true,
         );
-        assert_eq!(transcript.row_count(80), 1);
+        assert_eq!(transcript.row_count(80), 2);
         assert!(transcript.set_collapsed(id, false));
         assert!(transcript.row_count(80) > 100);
     }
@@ -682,15 +692,15 @@ mod tests {
             true,
         );
         let rows = transcript.viewport(40, 0, 10, 0);
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].text.starts_with("Thought · …"));
-        assert!(rows[0].text.ends_with("finished"));
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].text.starts_with("Thought · "));
+        assert!(rows[1].text.ends_with("finished"));
         assert!(!rows[0].text.contains("cargo build"));
         assert!(rows.iter().all(|row| !row.text.contains("Ctrl+O")));
     }
 
     #[test]
-    fn collapsed_thought_preview_uses_one_row_at_any_width() {
+    fn collapsed_thought_preview_uses_two_rows_at_any_width() {
         let mut transcript = Transcript::default();
         transcript.append(
             BlockKind::Thought,
@@ -698,11 +708,71 @@ mod tests {
             true,
         );
         for width in [20usize, 40, 80, 120] {
-            assert_eq!(transcript.row_count(width), 1);
+            assert_eq!(transcript.row_count(width), 2);
             let rows = transcript.viewport(width, 0, 10, 0);
-            assert_eq!(rows.len(), 1);
-            assert!(rows[0].text.chars().count() <= width, "overflow at {width}");
+            assert_eq!(rows.len(), 2);
+            assert!(
+                rows.iter().all(|row| row.text.chars().count() <= width),
+                "overflow at {width}"
+            );
         }
+    }
+
+    #[test]
+    fn thought_preview_scrolls_complete_lines_as_chunks_arrive() {
+        let mut transcript = Transcript::default();
+        let thought = transcript.append(BlockKind::Thought, "one two", true);
+        let text = |transcript: &mut Transcript, width| {
+            transcript
+                .viewport(width, 0, 10, 0)
+                .into_iter()
+                .map(|row| row.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(text(&mut transcript, 20), ["Thought · one two"]);
+        transcript.extend(thought, " three");
+        assert_eq!(
+            text(&mut transcript, 20),
+            ["Thought · one two", "          three"]
+        );
+        transcript.extend(thought, " four");
+        assert_eq!(
+            text(&mut transcript, 20),
+            ["Thought · one two", "          three four"]
+        );
+        transcript.extend(thought, " five");
+        assert_eq!(
+            text(&mut transcript, 20),
+            ["Thought · three four", "          five"]
+        );
+        assert_eq!(
+            text(&mut transcript, 30),
+            ["Thought · one two three four", "          five"]
+        );
+        assert_eq!(
+            text(&mut transcript, 20),
+            ["Thought · three four", "          five"]
+        );
+        assert!(
+            transcript
+                .source(thought)
+                .unwrap()
+                .contains("one two three four five")
+        );
+        transcript.set_collapsed(thought, false);
+        assert_eq!(text(&mut transcript, 20), ["one two three four", "five"]);
+        transcript.replace(thought, BlockKind::Thought, "new", true);
+        assert_eq!(text(&mut transcript, 20), ["Thought · new"]);
+        let mut streamed = Transcript::default();
+        let id = streamed.append(BlockKind::Thought, "", true);
+        for ch in "one two three four five".chars() {
+            streamed.extend(id, &ch.to_string());
+            assert!(streamed.row_count(20) <= 2);
+        }
+        assert_eq!(
+            text(&mut streamed, 20),
+            ["Thought · three four", "          five"]
+        );
     }
 
     #[test]
@@ -740,7 +810,7 @@ mod tests {
             .map(|row| row.text)
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(row.starts_with("Thought · …"), "row={row:?}");
+        assert!(row.starts_with("Thought · "), "row={row:?}");
         assert!(row.ends_with("word99"), "row={row:?}");
         assert!(!row.contains("word90 "), "row={row:?}");
     }
@@ -760,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn attributed_long_thought_uses_one_header_and_one_preview_row() {
+    fn attributed_long_thought_uses_one_header_and_two_preview_rows() {
         let mut transcript = Transcript::default();
         let thought = (0..30)
             .map(|index| format!("word{index}"))
@@ -773,10 +843,10 @@ mod tests {
         );
 
         let rows = transcript.viewport(80, 0, 10, 0);
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].text, "Codex: [12:05]");
         assert!(rows[1].text.starts_with("Thought · "));
-        assert!(rows[1].text.ends_with("word29"));
+        assert!(rows[2].text.ends_with("word29"));
     }
 
     #[test]
@@ -859,7 +929,7 @@ mod tests {
         let rows = transcript.viewport(48, 0, 10, 0);
         assert_eq!(rows[0].text, "Codex: [12:05]");
         assert_eq!(rows.len(), 2);
-        assert!(rows[1].text.starts_with("Run tests · running · …"));
+        assert!(rows[1].text.starts_with("Tool · …"));
         assert!(rows[1].text.ends_with("third output line"));
         assert!(rows[1..].iter().all(|row| row.kind == BlockKind::Tool));
     }
@@ -916,6 +986,42 @@ mod tests {
                     full.block_row(width, active)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn reordered_details_keep_stable_ids_and_cached_history() {
+        let mut transcript = fixtures::hundred_turn_transcript();
+        let thought = transcript.append(BlockKind::Thought, "Agent: [12:00] reasoning", true);
+        let tool = transcript.append(BlockKind::Tool, "Agent: [12:00] 🔧 Read · running", true);
+        for width in [80, 79] {
+            transcript.row_count(width);
+        }
+        let first_row = transcript.rows[0].text.as_ptr();
+        let answer = transcript.append(BlockKind::Agent, "Agent: [12:00] answer", false);
+        assert!(transcript.move_before(answer, thought));
+        assert!(!transcript.move_before(u64::MAX, thought));
+        assert!(!transcript.move_before(tool, u64::MAX));
+        transcript.row_count(79);
+        assert_eq!(transcript.rows[0].text.as_ptr(), first_row);
+        assert!(transcript.extend(answer, " continued"));
+        assert!(transcript.extend(thought, " newest"));
+        assert!(transcript.replace(
+            tool,
+            BlockKind::Tool,
+            "Agent: [12:00] 🔧 Read · completed",
+            true
+        ));
+        assert!(transcript.set_collapsed(thought, false));
+        for width in [80, 79, 30, 79] {
+            let mut full = transcript.clone();
+            full.invalidate_rows();
+            assert_eq!(
+                transcript.viewport(width, 0, usize::MAX, 0),
+                full.viewport(width, 0, usize::MAX, 0)
+            );
+            assert!(transcript.block_row(width, answer) < transcript.block_row(width, thought));
+            assert!(transcript.block_row(width, thought) < transcript.block_row(width, tool));
         }
     }
 

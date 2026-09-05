@@ -47,6 +47,7 @@ impl Theme {
         if self == Self::Terminal {
             return match color {
                 super::ACCENT => Cyan,
+                Cyan | LightCyan => Reset,
                 super::SECONDARY_TEXT => Reset,
                 super::THOUGHT_TEXT => DarkGray,
                 _ => super::AGENT_COLORS
@@ -65,14 +66,14 @@ impl Theme {
                     Rgb(20, 22, 26)
                 }
             }
-            Reset | White | Black => {
+            Reset | White | Black | Cyan | LightCyan => {
                 if light {
                     Rgb(28, 28, 30)
                 } else {
                     Rgb(230, 233, 239)
                 }
             }
-            super::ACCENT | Cyan | LightCyan => {
+            super::ACCENT => {
                 if light {
                     Rgb(0, 105, 100)
                 } else {

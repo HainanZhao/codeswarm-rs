@@ -101,11 +101,26 @@
   separate from this in-terminal presentation rule and remain supported.
 - `/settings` offers Terminal, Light, and Dark themes. Terminal uses the user's
   canvas and ANSI accents; explicit palettes retain readable text contrast.
-  Thought bodies and collapsed thought previews are an intentional exception:
+  Reserve teal exclusively for human input/messages and interface controls.
+  Agent output follows a Codex-inspired neutral hierarchy: ordinary foreground
+  for prose, headings, code and tables; bold emphasis and underlined links;
+  muted metadata and thoughts. Do not reuse teal/cyan for output formatting,
+  transcript notices, or diff hunk headers. Red/green diff semantics and the
+  distinct non-teal roster identity colors remain supported.
+  Within each agent turn, render message text before its thought and tool
+  details, regardless of adapter event order. Thoughts use a word-wrapped,
+  rolling two-line preview: a full bottom line moves up as a new line begins,
+  and only the newest two lines remain visible. Tools keep a one-line tail
+  preview. Both use faint gray italics. Put clickable 🔍 (expand) / 🔽
+  (collapse) controls in the existing two-column left gutter, one per visible
+  detail block; keep Ctrl+O as the keyboard shortcut. Controls must not consume
+  preview width, and hit targets must be rebuilt on redraw/scroll/resize.
+  Preserve stable block IDs and cached earlier turns when ordering details.
+  Thought and tool detail text/previews are an intentional exception:
   use faint muted gray and italics, visually lighter than normal messages.
-  Lower contrast is a deliberate user decision; do not raise thought contrast
+  Lower contrast is a deliberate user decision; do not raise detail contrast
   to satisfy the ordinary text contrast target or map it to the normal terminal
-  foreground. Keep this styling distinct from tool output and other UI text.
+  foreground. Keep other UI text at its normal contrast.
   Redraws follow input, adapter/index updates, and visible timer deadlines.
 - After two minutes without adapter activity during a turn, the status ribbon
   shows the silent duration and offers `Ctrl+C` cancellation or `/reload`.

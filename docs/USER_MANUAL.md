@@ -67,10 +67,11 @@ bounded to preserve tmux responsiveness.
 - On an empty single-line prompt, `Up`/`Down` browse the last 50 persisted prompts.
 - `Tab` completes a slash command; `F1` or `?` toggles help.
 - `Tab` also completes bounded workspace paths after `@`.
-- `Ctrl+O` expands or collapses the latest tool or thought detail. Collapsed
-  thoughts and tool calls keep a natural preview of up to two lines; other
-  details keep a one-line preview. Tool activity appears directly beneath its
-  agent's conversation header rather than in the footer.
+- Click 🔍 to expand a thought/tool detail, or 🔽 to collapse it. `Ctrl+O`
+  toggles the focused detail. Collapsed
+  thoughts show their newest two word-wrapped lines, scrolling up as each new
+  line begins. Tools show a single-line tail preview. Both follow the agent's
+  message and use faint gray italics.
 - `Ctrl+Enter` sends to the selected roster agent.
 - `Ctrl+C` cancels active work; while idle it exits.
 - `Esc` closes the active picker, help, permission, or settings surface.
@@ -139,13 +140,25 @@ make verify
 Renderer behavior is covered with deterministic Ratatui backends and bounded
 viewport tests.
 
+## Thought and tool appearance
+
+Thought and tool details follow their agent message. The clickable 🔍/🔽
+controls use the left margin, leaving the text width available. Thoughts use a rolling
+two-line preview: words fill a line, completed lines move up, and older lines
+leave the preview. Tools keep a single-line tail preview. Both use faint gray
+italics so they stay
+visually secondary to messages. Their lower contrast is intentional in all
+three themes; thought/tool details are exempt from the ordinary text contrast
+target.
+
+## Color roles
+
+Teal is reserved for human messages and interface controls. Agent output uses
+neutral text, bold headings, and underlined links, with faint italic thoughts.
+Diff additions and deletions stay green and red; roster identities keep their
+distinct non-teal colors. This Codex-inspired hierarchy applies to all themes.
+
 ## Privacy
 
 CodeSwarm collects no telemetry. Prompts, responses, tool calls, and terminal
 activity remain subject to the policies of the agent and provider you choose.
-
-### Thought appearance
-
-Thought bodies and collapsed previews use faint gray italics so they stay
-visually secondary to messages. Their lower contrast is intentional in all
-three themes; thoughts are exempt from the ordinary text contrast target.

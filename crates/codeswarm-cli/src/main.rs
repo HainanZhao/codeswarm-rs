@@ -3635,6 +3635,12 @@ fn run_terminal(
             }
             Event::Mouse(mouse)
                 if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && app.click_detail(mouse.column, mouse.row).is_some() =>
+            {
+                continue;
+            }
+            Event::Mouse(mouse)
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
                     && mouse.row == frame_area.bottom().saturating_sub(1)
                     && mouse.column >= frame_area.x
                     && mouse.column < frame_area.right() =>

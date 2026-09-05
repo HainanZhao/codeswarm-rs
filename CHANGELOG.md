@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-09-05
+
+### Changed
+
+- Thought and tool details follow their agent message in faint italics, with
+  clickable 🔍/🔽 expand/collapse controls in the left margin and Ctrl+O support.
+  Thoughts show a rolling two-line, word-wrapped preview;
+  tools show a single-line tail preview.
+- Reserved teal for human messages and interface controls. Agent Markdown now
+  uses neutral text, bold emphasis, and underlined references.
+
+### Fixed
+
+- Transcript wrapping reserves the message marker and indent columns, preventing
+  characters from being clipped at the right edge in normal and compact panes.
+
 ## [0.9.3] - 2026-09-05
 
 ### Added

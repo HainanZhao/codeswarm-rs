@@ -962,6 +962,7 @@ pub struct App {
     /// keeps the latest two calls and retains full details for Ctrl+O.
     tool_windows: BTreeMap<usize, ToolWindow>,
     focused_detail: Option<u64>,
+    detail_controls: Vec<(Rect, u64)>,
     /// Background workspace index used only by the optional `@path` picker.
     /// It is deliberately separate from transcript state so index updates do
     /// not invalidate the virtualized scroll cache.
@@ -1067,6 +1068,7 @@ impl Default for App {
             streaming_blocks: BTreeMap::new(),
             tool_windows: BTreeMap::new(),
             focused_detail: None,
+            detail_controls: Vec::new(),
             path_index: None,
             path_query: String::new(),
             path_matches: Vec::new(),
@@ -2926,6 +2928,15 @@ impl App {
                         false,
                     );
                     self.streaming_blocks.insert(key, id);
+                    let thought = self
+                        .streaming_blocks
+                        .get(&(*slot, crate::transcript::BlockKind::Thought))
+                        .copied();
+                    let tool = self.tool_windows.get(slot).map(|window| window.block_id);
+                    // Output stays above its live details even when thoughts/tools arrive first.
+                    for detail in thought.into_iter().chain(tool) {
+                        self.transcript.move_before(id, detail);
+                    }
                     id
                 });
                 self.transcript.extend(block, text);
@@ -2943,6 +2954,9 @@ impl App {
                         !self.show_thoughts,
                     );
                     self.streaming_blocks.insert(key, id);
+                    if let Some(window) = self.tool_windows.get(slot) {
+                        self.transcript.move_before(id, window.block_id);
+                    }
                     id
                 });
                 self.transcript.extend(id, text);
@@ -3131,7 +3145,8 @@ impl App {
     }
 
     pub fn scroll_by(&mut self, delta: isize, width: usize, height: usize) {
-        let content_width = width;
+        self.detail_controls.clear();
+        let content_width = transcript_text_width(width);
         let max_scroll = self
             .transcript
             .row_count(content_width)
@@ -3141,12 +3156,28 @@ impl App {
     }
 
     pub fn follow_tail(&mut self, width: usize, height: usize) {
-        let content_width = width;
+        let content_width = transcript_text_width(width);
         self.scroll_y = self
             .transcript
             .row_count(content_width)
             .saturating_sub(height);
         self.follow_tail = true;
+    }
+
+    /// Toggle the detail icon last rendered at this terminal coordinate.
+    pub fn click_detail(&mut self, column: u16, row: u16) -> Option<bool> {
+        if self.config_visible || self.store_visible {
+            return None;
+        }
+        let id = self
+            .detail_controls
+            .iter()
+            .find(|(area, _)| area.contains((column, row).into()))?
+            .1;
+        let collapsed = self.transcript.toggle_collapsed(id)?;
+        self.focused_detail = Some(id);
+        self.detail_controls.clear();
+        Some(collapsed)
     }
 
     pub fn toggle_focused_detail(&mut self) -> Option<bool> {
@@ -3352,6 +3383,7 @@ impl App {
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    app.detail_controls.clear();
     render_content(frame, app);
     let area = frame.area();
     app.theme.apply(frame.buffer_mut(), area);
@@ -3446,7 +3478,7 @@ fn render_content(frame: &mut Frame, app: &mut App) {
     ])
     .split(area);
     let content_height = usize::from(rows[0].height);
-    let content_width = usize::from(rows[0].width);
+    let content_width = transcript_text_width(usize::from(rows[0].width));
     if app.follow_tail {
         app.follow_tail(rows[0].width as usize, content_height);
     }
@@ -3622,51 +3654,6 @@ fn compact_cell_label(value: &str, width: usize) -> String {
     }
     label.push(ellipsis);
     label
-}
-
-fn compact_tail_cell_label(value: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if cell_width(value) <= width {
-        return value.to_owned();
-    }
-    let ellipsis = '…';
-    let content_budget = width.saturating_sub(cell_width(&ellipsis.to_string()));
-    let mut reversed = Vec::new();
-    let mut used = 0usize;
-    for character in value.chars().rev() {
-        let character_width = cell_width(&character.to_string());
-        if used.saturating_add(character_width) > content_budget {
-            break;
-        }
-        reversed.push(character);
-        used = used.saturating_add(character_width);
-    }
-    reversed.reverse();
-    format!("{ellipsis}{}", reversed.into_iter().collect::<String>())
-}
-
-fn actionable_detail_preview(value: &str, width: usize) -> String {
-    const HINT: &str = "Ctrl+O open";
-    let hint_width = cell_width(HINT);
-    if width <= hint_width {
-        return compact_cell_label(HINT, width);
-    }
-    let preview_budget = width.saturating_sub(hint_width + 1);
-    let preview = value.strip_prefix("Thought · ").map_or_else(
-        || compact_cell_label(value, preview_budget),
-        |content| {
-            const PREFIX: &str = "Thought · ";
-            let content =
-                compact_tail_cell_label(content, preview_budget.saturating_sub(cell_width(PREFIX)));
-            format!("{PREFIX}{content}")
-        },
-    );
-    let padding = width
-        .saturating_sub(cell_width(&preview) + hint_width)
-        .max(1);
-    format!("{preview}{}{HINT}", " ".repeat(padding))
 }
 
 fn compact_workspace_path(path: &std::path::Path, width: usize) -> String {
@@ -4030,7 +4017,7 @@ fn render_compact(frame: &mut Frame, app: &mut App, area: Rect) {
             area.height.saturating_sub(bottom_height),
         );
         let height = usize::from(transcript_area.height);
-        let width = usize::from(transcript_area.width);
+        let width = transcript_text_width(usize::from(transcript_area.width));
         if app.follow_tail {
             app.follow_tail(transcript_area.width as usize, height);
         }
@@ -4617,11 +4604,17 @@ fn render_permission(buffer: &mut Buffer, area: Rect, request: &PermissionPrompt
         .render(area, buffer);
 }
 
+// Each transcript row renders a two-cell marker or continuation indent.
+// Use the same text width for wrapping, scrolling, and following the tail.
+fn transcript_text_width(outer_width: usize) -> usize {
+    outer_width.saturating_sub(2).max(1)
+}
+
 fn render_transcript(
     buffer: &mut Buffer,
     area: Rect,
     rows: Vec<RenderRow>,
-    app: &App,
+    app: &mut App,
     diff_split: bool,
 ) {
     // Keep the initial workspace quiet. The prompt and status ribbon already
@@ -4642,27 +4635,32 @@ fn render_transcript(
         Vec::new()
     } else {
         let mut in_code = false;
-        let focused_detail = app
-            .focused_detail
-            .filter(|id| app.transcript.is_collapsed(*id) == Some(true));
-        let focused_hint_row = focused_detail.and_then(|id| {
-            rows.iter().rposition(|row| {
-                row.block_id == id
-                    && !(row.first_in_block && row.kind == crate::transcript::BlockKind::Agent)
-                    && !row.text.is_empty()
-            })
-        });
-        let row_width = usize::from(area.width);
+        let mut seen_details = std::collections::BTreeSet::new();
         rows.into_iter()
             .enumerate()
-            .map(|(row_index, mut row)| {
-                if focused_hint_row == Some(row_index) {
-                    row.text = actionable_detail_preview(&row.text, row_width.saturating_sub(2));
-                }
+            .map(|(row_index, row)| {
                 if row.first_in_block {
                     in_code = false;
                 }
-                let marker = if row.first_in_block {
+                let detail_icon = if area.width >= 2
+                    && matches!(
+                        row.kind,
+                        crate::transcript::BlockKind::Thought | crate::transcript::BlockKind::Tool
+                    )
+                    && seen_details.insert(row.block_id)
+                {
+                    let collapsed = app.transcript.is_collapsed(row.block_id) == Some(true);
+                    app.detail_controls.push((
+                        Rect::new(area.x, area.y + row_index as u16, 2, 1),
+                        row.block_id,
+                    ));
+                    Some(if collapsed { "🔍" } else { "🔽" })
+                } else {
+                    None
+                };
+                let marker = if let Some(icon) = detail_icon {
+                    icon
+                } else if row.first_in_block {
                     match row.kind {
                         crate::transcript::BlockKind::Human => "› ",
                         crate::transcript::BlockKind::Agent => "● ",
@@ -4805,7 +4803,7 @@ fn block_style(kind: crate::transcript::BlockKind) -> Style {
         }
         crate::transcript::BlockKind::Agent => Style::default().fg(PRIMARY_TEXT),
         crate::transcript::BlockKind::Thought => Style::default().fg(THOUGHT_TEXT).italic(),
-        crate::transcript::BlockKind::Tool => Style::default().fg(SECONDARY_TEXT),
+        crate::transcript::BlockKind::Tool => Style::default().fg(THOUGHT_TEXT).italic(),
         crate::transcript::BlockKind::Terminal => Style::default().fg(Color::Gray),
         crate::transcript::BlockKind::Diff => Style::default().fg(Color::Magenta),
         crate::transcript::BlockKind::Notice => Style::default().fg(SECONDARY_TEXT),
@@ -4814,9 +4812,9 @@ fn block_style(kind: crate::transcript::BlockKind) -> Style {
 
 fn marker_style(kind: crate::transcript::BlockKind, text: &str) -> Style {
     match kind {
-        crate::transcript::BlockKind::Tool => Style::default().fg(SECONDARY_TEXT).bold(),
+        crate::transcript::BlockKind::Tool => block_style(kind),
         crate::transcript::BlockKind::Terminal => Style::default().fg(Color::Yellow).bold(),
-        crate::transcript::BlockKind::Notice => Style::default().fg(ACCENT).bold(),
+        crate::transcript::BlockKind::Notice => Style::default().fg(SECONDARY_TEXT).bold(),
         _ => row_style(kind, text).bold(),
     }
 }
@@ -4830,7 +4828,7 @@ fn row_style(kind: crate::transcript::BlockKind, text: &str) -> Style {
     } else if text.starts_with('-') && !text.starts_with("---") {
         Style::default().fg(Color::Red)
     } else if text.starts_with("@@") {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(SECONDARY_TEXT)
     } else {
         block_style(kind)
     }
@@ -4840,13 +4838,11 @@ fn markdown_style(kind: crate::transcript::BlockKind, text: &str) -> Style {
     let base = block_style(kind);
     let trimmed = text.trim();
     if trimmed.starts_with('#') {
-        base.fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        base.add_modifier(Modifier::BOLD)
     } else if trimmed.starts_with("```") {
         base.fg(Color::Gray)
     } else if matches!(trimmed, "---" | "___" | "***") {
         base.fg(Color::DarkGray)
-    } else if trimmed.contains('|') && trimmed.split('|').count() >= 3 {
-        base.fg(Color::LightBlue)
     } else {
         base
     }
@@ -4858,7 +4854,10 @@ fn markdown_spans(
     in_code: &mut bool,
 ) -> Vec<Span<'static>> {
     let mut spans = markdown_content_spans(kind, text, in_code);
-    if kind == crate::transcript::BlockKind::Thought {
+    if matches!(
+        kind,
+        crate::transcript::BlockKind::Thought | crate::transcript::BlockKind::Tool
+    ) {
         for span in &mut spans {
             span.style = span
                 .style
@@ -4883,10 +4882,7 @@ fn markdown_content_spans(
         )];
     }
     if *in_code {
-        return vec![Span::styled(
-            text.to_owned(),
-            Style::default().fg(Color::LightCyan),
-        )];
+        return vec![Span::styled(text.to_owned(), block_style(kind))];
     }
     let base = markdown_style(kind, text);
     let mut spans = Vec::new();
@@ -4916,11 +4912,7 @@ fn markdown_content_spans(
             spans.push(Span::styled(text[..leading].to_owned(), base));
         }
         let marker_end = leading + marker_len;
-        let marker_style = if trimmed.starts_with("> ") {
-            base.fg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else {
-            base.fg(Color::LightYellow).add_modifier(Modifier::BOLD)
-        };
+        let marker_style = base.add_modifier(Modifier::BOLD);
         spans.push(Span::styled(
             text[leading..marker_end].to_owned(),
             marker_style,
@@ -4949,7 +4941,6 @@ fn markdown_content_spans(
         style = match delimiter {
             "**" => style.add_modifier(Modifier::BOLD),
             "*" => style.add_modifier(Modifier::ITALIC),
-            "`" => style.fg(Color::LightYellow),
             _ => style,
         };
         spans.push(Span::styled(
@@ -4965,7 +4956,7 @@ fn markdown_content_spans(
 /// target. Keeping the complete token visible is useful in a terminal, while
 /// the accent makes it obvious that the text is actionable/reference-like.
 fn inline_text_spans(base: Style, text: &str) -> Vec<Span<'static>> {
-    let link_style = base.fg(Color::LightCyan).add_modifier(Modifier::UNDERLINED);
+    let link_style = base.add_modifier(Modifier::UNDERLINED);
     let mut spans = Vec::new();
     let mut cursor = 0;
     while let Some(open_relative) = text[cursor..].find('[') {
@@ -5022,7 +5013,7 @@ fn file_reference_spans(base: Style, text: &str) -> Vec<Span<'static>> {
     if ranges.is_empty() {
         return vec![Span::styled(text.to_owned(), base)];
     }
-    let reference_style = base.fg(Color::LightCyan).add_modifier(Modifier::UNDERLINED);
+    let reference_style = base.add_modifier(Modifier::UNDERLINED);
     let mut spans = Vec::with_capacity(ranges.len() * 2 + 1);
     let mut cursor = 0;
     for (start, end) in ranges {
@@ -5097,11 +5088,10 @@ mod tests {
         ACCENT, AGENT_COLORS, App, CONFIG_SETTING_COUNT, ConfigAction, ConfigKey, FooterAction,
         LocalCommand, MAX_TOOL_HISTORY_ROWS, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PathPickerAction,
         PermissionAction, PermissionKey, PromptAction, PromptEditor, SECONDARY_TEXT, STATUS_BG,
-        StoreAction, StoreAgent, StoreKey, TRANSCRIPT_BG, actionable_detail_preview,
-        agent_header_color, agent_slot_color, block_style, cell_width, compact_cell_label,
-        compact_workspace_path, file_reference_spans, footer_agent_label, format_turn_elapsed,
-        markdown_spans, markdown_style, marker_style, render, render_prompt_separator, row_style,
-        selected_style,
+        StoreAction, StoreAgent, StoreKey, TRANSCRIPT_BG, agent_header_color, agent_slot_color,
+        block_style, cell_width, compact_cell_label, compact_workspace_path, file_reference_spans,
+        footer_agent_label, format_turn_elapsed, markdown_spans, markdown_style, marker_style,
+        render, render_prompt_separator, row_style, selected_style,
     };
 
     fn key(key: Key) -> Input {
@@ -5154,14 +5144,17 @@ mod tests {
             block_style(BlockKind::Thought).fg,
             Some(super::THOUGHT_TEXT)
         );
-        assert_eq!(block_style(BlockKind::Tool).fg, Some(SECONDARY_TEXT));
+        assert_eq!(block_style(BlockKind::Tool).fg, Some(super::THOUGHT_TEXT));
         assert_eq!(block_style(BlockKind::Terminal).fg, Some(Color::Gray));
         assert_eq!(block_style(BlockKind::Notice).fg, Some(SECONDARY_TEXT));
         assert_eq!(
             marker_style(BlockKind::Tool, "Run").fg,
+            Some(super::THOUGHT_TEXT)
+        );
+        assert_eq!(
+            marker_style(BlockKind::Notice, "Wait").fg,
             Some(SECONDARY_TEXT)
         );
-        assert_eq!(marker_style(BlockKind::Notice, "Wait").fg, Some(ACCENT));
         assert_eq!(selected_style().bg, None);
         assert!(selected_style().add_modifier.contains(Modifier::REVERSED));
     }
@@ -5538,7 +5531,7 @@ mod tests {
         assert_eq!(row_style(BlockKind::Diff, "-removed").fg, Some(Color::Red));
         assert_eq!(
             row_style(BlockKind::Diff, "@@ -1 +1 @@").fg,
-            Some(Color::Cyan)
+            Some(SECONDARY_TEXT)
         );
         assert_eq!(
             row_style(BlockKind::Diff, "+++ file").fg,
@@ -5550,7 +5543,7 @@ mod tests {
     fn markdown_headings_keep_lightweight_visual_hierarchy() {
         assert_eq!(
             markdown_style(BlockKind::Agent, "## Summary").fg,
-            Some(Color::Cyan)
+            Some(Color::Reset)
         );
         assert_eq!(
             markdown_style(BlockKind::Agent, "normal text").fg,
@@ -5569,17 +5562,17 @@ mod tests {
         assert!(
             spans
                 .iter()
-                .any(|span| span.content == "code" && span.style.fg == Some(Color::LightYellow))
+                .any(|span| span.content == "code" && span.style.fg == Some(Color::Reset))
         );
         let _ = markdown_spans(BlockKind::Agent, "```rust", &mut in_code);
         let code = markdown_spans(BlockKind::Agent, "let answer = 42;", &mut in_code);
-        assert_eq!(code[0].style.fg, Some(Color::LightCyan));
+        assert_eq!(code[0].style.fg, Some(Color::Reset));
         let mut in_code = false;
         let list = markdown_spans(BlockKind::Agent, "- item", &mut in_code);
         assert_eq!(list[0].content, "- ");
-        assert_eq!(list[0].style.fg, Some(Color::LightYellow));
+        assert_eq!(list[0].style.fg, Some(Color::Reset));
         let quote = markdown_spans(BlockKind::Agent, "> note", &mut in_code);
-        assert_eq!(quote[0].style.fg, Some(Color::Cyan));
+        assert_eq!(quote[0].style.fg, Some(Color::Reset));
         let numbered = markdown_spans(BlockKind::Agent, "1. step", &mut in_code);
         assert_eq!(numbered[0].content, "1. ");
     }
@@ -5598,7 +5591,7 @@ mod tests {
         }));
         assert_eq!(
             markdown_style(BlockKind::Agent, "| A | B |").fg,
-            Some(Color::LightBlue)
+            Some(Color::Reset)
         );
         assert_eq!(
             markdown_style(BlockKind::Agent, "---").fg,
@@ -5893,7 +5886,7 @@ mod tests {
         );
         app.transcript.append(BlockKind::Notice, "tail-ok", false);
         app.follow_tail(80, 8);
-        let tail = app.transcript.viewport(80, app.scroll_y, 8, 0);
+        let tail = app.transcript.viewport(78, app.scroll_y, 8, 0);
         assert!(
             tail.iter().any(|row| row.text.contains("tail-ok")),
             "tail={tail:?}, scroll={}",
@@ -5938,79 +5931,42 @@ mod tests {
     }
 
     #[test]
-    fn only_the_actionable_detail_advertises_ctrl_o() {
-        let backend = TestBackend::new(100, 9);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
+    fn detail_icons_toggle_the_clicked_block_and_preserve_preview_width() {
         let mut app = App::default();
-        app.transcript
-            .append(BlockKind::Thought, "old thought detail", true);
-        let current = app
+        let thought = app
             .transcript
-            .append(BlockKind::Thought, "current thought detail", true);
-        app.focused_detail = Some(current);
-
-        terminal
-            .draw(|frame| render(frame, &mut app))
-            .expect("draw collapsed details");
-        let rows = terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(100)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>();
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("old thought detail") && !row.contains("Ctrl+O"))
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("current thought detail") && row.contains("Ctrl+O open"))
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.contains("Ctrl+O open"))
-                .count(),
-            1
-        );
-
-        assert_eq!(app.toggle_focused_detail(), Some(false));
-        terminal
-            .draw(|frame| render(frame, &mut app))
-            .expect("draw opened detail");
-        let opened = terminal
-            .backend()
-            .buffer()
-            .content()
+            .append(BlockKind::Thought, "older thought", true);
+        let tool = app.transcript.append(BlockKind::Tool, "tool detail", true);
+        app.focused_detail = Some(tool);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.detail_controls.len(), 2);
+        let (area, id) = app.detail_controls[0];
+        assert_eq!(id, thought);
+        assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "🔍");
+        assert_eq!(app.click_detail(area.x + 2, area.y), None);
+        // Both cells of the emoji target the same stable block.
+        assert_eq!(app.click_detail(area.x + 1, area.y), Some(false));
+        assert_eq!(app.transcript.is_collapsed(tool), Some(true));
+        assert_eq!(app.focused_detail, Some(thought));
+        assert_eq!(app.click_detail(area.x, area.y), None);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let (area, _) = app
+            .detail_controls
             .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(!opened.contains("Ctrl+O open"));
-    }
-
-    #[test]
-    fn ctrl_o_hint_stays_right_aligned_as_thought_text_streams() {
-        let short = actionable_detail_preview("Thought · checking", 60);
-        let long = actionable_detail_preview(
-            "Thought · a much longer streaming thought preview that keeps changing",
-            60,
-        );
-        assert_eq!(cell_width(&short), 60);
-        assert_eq!(cell_width(&long), 60);
-        let hint_column =
-            |line: &str| cell_width(line.split_once("Ctrl+O open").expect("action hint").0);
-        assert_eq!(hint_column(&short), hint_column(&long));
-        assert!(short.ends_with("Ctrl+O open"));
-        assert!(long.ends_with("Ctrl+O open"));
-
-        let before = actionable_detail_preview("Thought · abcdefghijklmnopqrstuvwxyz", 40);
-        let after = actionable_detail_preview("Thought · abcdefghijklmnopqrstuvwxyzZ", 40);
-        let before_visible = before.split_once("Ctrl+O open").expect("hint").0.trim_end();
-        let after_visible = after.split_once("Ctrl+O open").expect("hint").0.trim_end();
-        assert_eq!(cell_width(before_visible), cell_width(after_visible));
-        assert!(before_visible.ends_with('z'));
-        assert!(after_visible.ends_with('Z'));
-        assert_ne!(before_visible, after_visible);
+            .find(|(_, id)| *id == thought)
+            .copied()
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "🔽");
+        assert_eq!(app.click_detail(area.x, area.y), Some(true));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.scroll_by(1, 60, 8);
+        assert_eq!(app.click_detail(area.x, area.y), None);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        app.open_config();
+        assert_eq!(app.click_detail(area.x, area.y), None);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(app.detail_controls.is_empty());
     }
 
     #[test]
@@ -7214,6 +7170,27 @@ mod tests {
     }
 
     #[test]
+    fn transcript_right_edge_keeps_characters_after_marker_and_indent() {
+        for width in [30, 50] {
+            for kind in [BlockKind::Agent, BlockKind::Human, BlockKind::Thought] {
+                let mut app = App::default();
+                let text_width = usize::from(width - 2);
+                let first_line = format!("{}!", "a".repeat(text_width - 1));
+                let second_line = format!("{}?", "b".repeat(text_width - 1));
+                // A single long word must wrap without losing either edge character.
+                app.transcript
+                    .append(kind, format!("{first_line}{second_line}Z"), false);
+                let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                assert_eq!(buffer[(width - 1, 0)].symbol(), "!", "{width} {kind:?}");
+                assert_eq!(buffer[(width - 1, 1)].symbol(), "?", "{width} {kind:?}");
+                assert_eq!(buffer[(2, 2)].symbol(), "Z", "{width} {kind:?}");
+            }
+        }
+    }
+
+    #[test]
     fn overflowing_transcript_has_no_scrollbar_and_still_scrolls() {
         for (width, height) in [(50, 12), (30, 6)] {
             let backend = TestBackend::new(width, height);
@@ -7781,7 +7758,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("● Codex 12:05")));
         assert!(
             rows.iter()
-                .any(|row| row.contains("  Thought · checking relay state"))
+                .any(|row| row.contains("Thought · checking relay state"))
         );
         assert!(
             rows.iter()
@@ -7826,6 +7803,109 @@ mod tests {
     }
 
     #[test]
+    fn teal_is_reserved_for_human_messages_and_controls_in_every_theme() {
+        for (theme, teal) in [
+            ("terminal", Color::Cyan),
+            ("light", Color::Rgb(0, 105, 100)),
+            ("dark", Color::Rgb(74, 210, 200)),
+        ] {
+            let mut app = App::default();
+            app.set_theme(theme);
+            app.transcript
+                .append(BlockKind::Human, "Human input", false);
+            app.transcript.append(BlockKind::Agent,
+                "# Heading\n> Quote\n- List item\n**Bold** and `code`\n```rust\nlet x = 1;\n```\n[Guide](https://example.test) src/main.rs:12\n| A | B |", false);
+            app.transcript
+                .append(BlockKind::Thought, "Quiet thought", false);
+            app.transcript.append(BlockKind::Tool, "Read file", false);
+            app.transcript.append(BlockKind::Notice, "Notice", false);
+            app.transcript
+                .append(BlockKind::Diff, "@@ -1 +1 @@\n-old\n+new", false);
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let mut human_seen = false;
+            let mut heading_seen = false;
+            for row in buffer.content().chunks(100).take(app.content_height(40)) {
+                let text = row.iter().map(|cell| cell.symbol()).collect::<String>();
+                if text.contains("Human input") {
+                    human_seen = true;
+                    assert!(row.iter().any(|cell| cell.fg == teal));
+                } else {
+                    assert!(row.iter().all(|cell| cell.fg != teal), "{theme}: {text}");
+                }
+                if text.contains("Heading") {
+                    heading_seen = true;
+                }
+            }
+            assert!(human_seen && heading_seen, "{theme}");
+        }
+    }
+
+    #[test]
+    fn live_details_follow_the_message_for_every_initial_event_order() {
+        let events = [
+            codeswarm_adapters::AgentEvent::Text {
+                slot: 0,
+                text: "answer".into(),
+            },
+            codeswarm_adapters::AgentEvent::Thought {
+                slot: 0,
+                text: "reasoning".into(),
+            },
+            codeswarm_adapters::AgentEvent::Tool {
+                slot: 0,
+                update: codeswarm_adapters::ToolUpdate {
+                    id: "read".into(),
+                    title: "Read file".into(),
+                    status: codeswarm_adapters::ToolStatus::Running,
+                    detail: None,
+                },
+            },
+        ];
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut app = App::default();
+            for index in order {
+                app.apply_event(&events[index]);
+                app.transcript.row_count(78);
+                app.transcript.row_count(77);
+            }
+            app.apply_event(&codeswarm_adapters::AgentEvent::Text {
+                slot: 0,
+                text: " continued".into(),
+            });
+            app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
+                slot: 0,
+                text: " latest".into(),
+            });
+            let rows = app.transcript.viewport(78, 0, 20, 0);
+            assert_eq!(rows[1].text, "answer continued", "{order:?}");
+            assert_eq!(rows[2].text, "Thought · reasoning latest");
+            assert!(rows[3].text.starts_with("Tool · Read file"));
+            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            for y in [2, 3] {
+                let cell = &terminal.backend().buffer()[(2, y)];
+                assert_eq!(cell.fg, Color::DarkGray);
+                assert!(cell.modifier.contains(Modifier::ITALIC));
+            }
+            app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
+            app.record_human_message("next task", false);
+            app.apply_event(&events[1]);
+            app.apply_event(&events[0]);
+            let later = app.transcript.viewport(78, 0, 30, 0);
+            assert_eq!(&later[..4], &rows[..4]);
+        }
+    }
+
+    #[test]
     fn thoughts_render_faint_and_italic_in_every_theme() {
         for (theme, expected) in [
             ("terminal", Color::DarkGray),
@@ -7866,6 +7946,26 @@ mod tests {
                 assert!(!span.style.add_modifier.contains(Modifier::BOLD));
             }
         }
+    }
+
+    #[test]
+    fn two_line_thought_tail_remains_visible_without_hint_clipping() {
+        let mut app = App::default();
+        app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
+            slot: 0,
+            text: "one two three four five".into(),
+        });
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
+            slot: 0,
+            text: "long answer ".repeat(100),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(22, 8)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| (2..22).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert_eq!(row(2), "Thought · three four");
+        assert_eq!(row(3), "          five      ");
+        assert!(buffer[(21, 2)].modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
@@ -7934,7 +8034,7 @@ mod tests {
         let preview = app.transcript.viewport(72, 0, 10, 0);
         assert_eq!(preview.len(), 2);
         assert!(preview[0].text.starts_with("Antigravity: ["));
-        assert!(preview[1].text.contains("Noisy three"));
+        assert!(preview[1].text.starts_with("Tool · …"));
         assert!(preview[1].text.contains("tool output"));
 
         terminal
@@ -7948,13 +8048,8 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>();
         assert!(rows.iter().any(|row| row.contains("Antigravity")));
-        assert_eq!(rows.iter().filter(|row| row.contains("Noisy")).count(), 1);
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.contains("Ctrl+O open"))
-                .count(),
-            1
-        );
+        assert_eq!(rows.iter().filter(|row| row.contains("Tool ·")).count(), 1);
+        assert_eq!(rows.iter().filter(|row| row.contains("🔍")).count(), 1);
         assert_eq!(app.toggle_focused_detail(), Some(false));
         let history = app.transcript.viewport(72, 0, 10, 0);
         assert_eq!(history.len(), 4);
@@ -8225,7 +8320,7 @@ mod tests {
         );
         app.follow_tail(80, 10);
         let tail = app.scroll_y;
-        assert_eq!(tail, app.transcript.row_count(80).saturating_sub(10));
+        assert_eq!(tail, app.transcript.row_count(78).saturating_sub(10));
         assert!(app.follow_tail);
         app.scroll_by(-1, 80, 10);
         assert!(!app.follow_tail);
@@ -8239,7 +8334,7 @@ mod tests {
         app.follow_tail(80, 10);
         assert_eq!(
             app.scroll_y,
-            app.transcript.row_count(80).saturating_sub(10)
+            app.transcript.row_count(78).saturating_sub(10)
         );
         let base_height = app.content_height(24);
         app.queue_prompt("queued", Some(1), false);
