@@ -47,6 +47,18 @@ pub struct Transcript {
     cached_width: Option<usize>,
     rows: Vec<RenderRow>,
     block_starts: BTreeMap<u64, usize>,
+    alternate_rows: Option<RowCache>,
+    valid_blocks: usize,
+    headers: Vec<Option<String>>,
+}
+
+#[derive(Clone, Debug)]
+struct RowCache {
+    width: usize,
+    rows: Vec<RenderRow>,
+    block_starts: BTreeMap<u64, usize>,
+    valid_blocks: usize,
+    headers: Vec<Option<String>>,
 }
 
 impl Transcript {
@@ -61,7 +73,7 @@ impl Transcript {
             source: source.into(),
             collapsed,
         });
-        self.invalidate_rows();
+        self.invalidate_from(self.blocks.len() - 1);
         id
     }
 
@@ -116,7 +128,7 @@ impl Transcript {
         };
         if block.collapsed != collapsed {
             block.collapsed = collapsed;
-            self.invalidate_rows();
+            self.invalidate_from(id as usize);
         }
         true
     }
@@ -152,7 +164,7 @@ impl Transcript {
             return false;
         };
         block.source.push_str(text);
-        self.invalidate_rows();
+        self.invalidate_from(id as usize);
         true
     }
 
@@ -173,7 +185,7 @@ impl Transcript {
         block.kind = kind;
         block.source = source.into();
         block.collapsed = collapsed;
-        self.invalidate_rows();
+        self.invalidate_from(id as usize);
         true
     }
 
@@ -209,21 +221,66 @@ impl Transcript {
     }
 
     fn invalidate_rows(&mut self) {
+        self.valid_blocks = 0;
+        self.headers.clear();
+        self.alternate_rows = None;
         self.cached_width = None;
         self.rows.clear();
         self.block_starts.clear();
     }
 
+    fn invalidate_from(&mut self, index: usize) {
+        // IDs are append-only indices, reset together with the blocks on clear.
+        self.valid_blocks = self.valid_blocks.min(index);
+        if let Some(cache) = &mut self.alternate_rows {
+            cache.valid_blocks = cache.valid_blocks.min(index);
+        }
+    }
+
     fn ensure_rows(&mut self, width: usize) {
         let width = width.max(1);
-        if self.cached_width == Some(width) {
+        if self.cached_width == Some(width) && self.valid_blocks == self.blocks.len() {
             return;
         }
 
-        self.rows.clear();
-        self.block_starts.clear();
-        let mut header_speaker: Option<String> = None;
-        for block in &self.blocks {
+        // The scrollbar probes the outer width before rendering one column
+        // narrower. Keep both layouts so each scroll does not rewrap history.
+        if self.cached_width != Some(width) {
+            let alternate = self.alternate_rows.take();
+            self.alternate_rows = self.cached_width.map(|width| RowCache {
+                width,
+                rows: std::mem::take(&mut self.rows),
+                block_starts: std::mem::take(&mut self.block_starts),
+                valid_blocks: self.valid_blocks,
+                headers: std::mem::take(&mut self.headers),
+            });
+            if let Some(cache) = alternate.filter(|cache| cache.width == width) {
+                self.cached_width = Some(width);
+                self.rows = cache.rows;
+                self.block_starts = cache.block_starts;
+                self.valid_blocks = cache.valid_blocks;
+                self.headers = cache.headers;
+            } else {
+                self.rows.clear();
+                self.block_starts.clear();
+                self.headers.clear();
+                self.valid_blocks = 0;
+            }
+        }
+
+        let mut header_speaker = self.headers.get(self.valid_blocks).cloned().flatten();
+        self.headers.truncate(self.valid_blocks);
+        if let Some(block) = self.blocks.get(self.valid_blocks) {
+            let row = self
+                .block_starts
+                .get(&block.id)
+                .copied()
+                .unwrap_or(self.rows.len());
+            self.rows.truncate(row);
+            self.block_starts.split_off(&block.id);
+        }
+        for block in self.blocks.iter().skip(self.valid_blocks) {
+            self.headers.push(header_speaker.clone());
             if block.kind == BlockKind::Human {
                 header_speaker = None;
             }
@@ -312,6 +369,8 @@ impl Transcript {
                 });
             }
         }
+        self.headers.push(header_speaker);
+        self.valid_blocks = self.blocks.len();
         self.cached_width = Some(width);
     }
 }
@@ -814,6 +873,80 @@ mod tests {
         let rows = transcript.viewport(12, 0, 1, 0);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text.chars().count(), 12);
+    }
+
+    #[test]
+    fn streaming_reuses_completed_rows_and_matches_full_layout_after_edits() {
+        let mut transcript = fixtures::hundred_turn_transcript();
+        let active = transcript.append(BlockKind::Agent, "Claude: [12:00] working", false);
+        transcript.row_count(80);
+        let original_text = transcript.rows[0].text.as_ptr();
+        transcript.row_count(79);
+        for _ in 0..50 {
+            transcript.extend(active, " more");
+            transcript.row_count(80);
+            assert_eq!(transcript.rows[0].text.as_ptr(), original_text);
+            transcript.row_count(79);
+        }
+        for (id, kind, text, collapsed) in [
+            (
+                active,
+                BlockKind::Thought,
+                "Codex: [12:01] another speaker",
+                true,
+            ),
+            (0, BlockKind::Human, "replacement user message", false),
+            (1, BlockKind::Terminal, "hidden terminal", false),
+            (
+                active,
+                BlockKind::Agent,
+                "Claude: [12:02] final answer",
+                false,
+            ),
+        ] {
+            transcript.replace(id, kind, text, collapsed);
+            let mut full = transcript.clone();
+            full.invalidate_rows();
+            for width in [80, 79, 20, 0, 79] {
+                assert_eq!(
+                    transcript.viewport(width, 0, usize::MAX, 0),
+                    full.viewport(width, 0, usize::MAX, 0)
+                );
+                assert_eq!(
+                    transcript.block_row(width, active),
+                    full.block_row(width, active)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scrollbar_width_probes_reuse_both_layouts_and_invalidate_on_changes() {
+        let mut transcript = fixtures::hundred_turn_transcript();
+        transcript.row_count(80);
+        let wide = transcript.rows.as_ptr();
+        transcript.row_count(79);
+        let narrow = transcript.rows.as_ptr();
+        for _ in 0..100 {
+            transcript.row_count(80);
+            assert_eq!(transcript.rows.as_ptr(), wide);
+            transcript.row_count(79);
+            assert_eq!(transcript.rows.as_ptr(), narrow);
+        }
+        transcript.clear();
+        let id = transcript.append(BlockKind::Agent, "replacement", false);
+        for width in [79, 80] {
+            assert_eq!(transcript.viewport(width, 0, 10, 0)[0].text, "replacement");
+        }
+        assert!(transcript.extend(id, " streamed"));
+        for width in [80, 79, 40, 0, 79] {
+            let mut expected = Transcript::default();
+            expected.append(BlockKind::Agent, "replacement streamed", false);
+            assert_eq!(
+                transcript.viewport(width, 0, 100, 0),
+                expected.viewport(width, 0, 100, 0)
+            );
+        }
     }
 
     #[test]

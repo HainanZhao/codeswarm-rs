@@ -97,6 +97,7 @@ pub struct Relay {
     steering: VecDeque<QueuedPrompt>,
     direct: VecDeque<QueuedPrompt>,
     previous_slot: Option<RosterSlot>,
+    participated: Vec<bool>,
     context: CollaborationContext,
     strategy: CollaborationStrategy,
     pair_partner: Option<RosterSlot>,
@@ -118,6 +119,7 @@ impl Relay {
             steering: VecDeque::new(),
             direct: VecDeque::new(),
             previous_slot: None,
+            participated: vec![false; roster_size],
             context: CollaborationContext::new(roster_size),
             strategy: CollaborationStrategy::Roster,
             pair_partner: None,
@@ -197,6 +199,7 @@ impl Relay {
     pub fn reactivate(&mut self, slot: RosterSlot) -> Result<(), &'static str> {
         let active = self.active.get_mut(slot).ok_or("slot out of range")?;
         *active = true;
+        self.participated[slot] = false;
         self.context.rewind(slot);
         Ok(())
     }
@@ -258,6 +261,7 @@ impl Relay {
         swap_option(&mut self.pair_partner, first, second);
         self.active.swap(first, second);
         self.limited.swap(first, second);
+        self.participated.swap(first, second);
         self.context.swap_agents(first, second);
         Ok(())
     }
@@ -330,6 +334,7 @@ impl Relay {
     pub fn add_agent(&mut self) {
         self.active.push(true);
         self.limited.push(false);
+        self.participated.push(false);
         self.context.add_agent();
     }
 
@@ -394,8 +399,17 @@ impl Relay {
         // responder must not be allowed to terminate the batch with the safe
         // word. Only an automatic handoff after another agent's response is
         // eligible to review-stop.
-        let can_stop =
-            !direct && !human_prompt && self.previous_slot.is_some_and(|previous| previous != slot);
+        if human_prompt {
+            self.participated.fill(false);
+        }
+        let roster_reviewed = self.strategy != CollaborationStrategy::Roster
+            || self.active_slots().all(|candidate| {
+                candidate == slot || !self.routable(candidate) || self.participated[candidate]
+            });
+        let can_stop = !direct
+            && !human_prompt
+            && roster_reviewed
+            && self.previous_slot.is_some_and(|previous| previous != slot);
         self.last_active = slot;
         self.rounds += 1;
         RelayDecision::Dispatch {
@@ -412,6 +426,7 @@ impl Relay {
         self.next = Some(self.next_active(slot));
         if !direct {
             self.previous_slot = Some(slot);
+            self.participated[slot] = true;
         }
         if accepted_stop && self.direct.is_empty() && self.steering.is_empty() {
             self.stopped = true;
@@ -504,10 +519,45 @@ mod tests {
             second,
             RelayDecision::Dispatch {
                 slot: 1,
+                can_stop: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn roster_stop_tracks_replacement_missing_and_reordered_agents() {
+        let mut relay = Relay::new(4, 100);
+        relay.begin("task", 0);
+        relay.finish(0, false, false);
+        relay.swap_agents(0, 2).unwrap();
+        assert_eq!(relay.participated, [false, false, true, false]);
+        assert!(relay.reactivate(99).is_err());
+        relay.tombstone(3).unwrap();
+        relay.mark_limited(0).unwrap();
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch {
+                slot: 1,
                 can_stop: true,
                 ..
             }
         ));
+        relay.finish(1, false, false);
+        relay.reactivate(3).unwrap();
+        relay.clear_limited(0).unwrap();
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch {
+                slot: 2,
+                can_stop: false,
+                ..
+            }
+        ));
+        relay.finish(2, false, false);
+        assert!(relay.enqueue_human("new task", Some(1)));
+        relay.begin("", 0);
+        assert!(relay.participated.iter().all(|seen| !seen));
     }
 
     #[test]

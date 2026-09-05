@@ -411,7 +411,14 @@ impl SessionMetadataStore {
     /// only at lifecycle boundaries; atomic writes and fsync therefore never
     /// block terminal input or rendering.
     pub fn buffered(&self) -> std::io::Result<BufferedSessionMetadataStore> {
-        BufferedSessionMetadataStore::open(self.path.clone())
+        self.buffered_with_errors(|_| {})
+    }
+
+    pub fn buffered_with_errors(
+        &self,
+        on_error: impl Fn(String) + Send + 'static,
+    ) -> std::io::Result<BufferedSessionMetadataStore> {
+        BufferedSessionMetadataStore::open(self.path.clone(), Box::new(on_error))
     }
 }
 
@@ -442,11 +449,11 @@ impl std::fmt::Debug for BufferedSessionMetadataStore {
 }
 
 impl BufferedSessionMetadataStore {
-    fn open(path: PathBuf) -> std::io::Result<Self> {
+    fn open(path: PathBuf, on_error: Box<dyn Fn(String) + Send>) -> std::io::Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
             .name("codeswarm-session-metadata".into())
-            .spawn(move || metadata_worker(path, receiver))?;
+            .spawn(move || metadata_worker(path, receiver, on_error))?;
         Ok(Self {
             sender,
             worker: Some(worker),
@@ -502,25 +509,67 @@ impl Drop for BufferedSessionMetadataStore {
 fn metadata_worker(
     path: PathBuf,
     receiver: Receiver<MetadataCommand>,
+    on_error: Box<dyn Fn(String) + Send>,
 ) -> Result<(), PersistenceError> {
     let store = SessionMetadataStore::open(path);
     let mut first_error = None;
-    while let Ok(command) = receiver.recv() {
+    let mut pending = None;
+    loop {
+        let command = if pending.is_some() {
+            match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(command) => command,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(metadata) = &pending
+                        && store.write(metadata).is_ok()
+                    {
+                        pending = None;
+                        first_error = None;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match receiver.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            }
+        };
         match command {
-            MetadataCommand::Write(metadata) => {
-                if first_error.is_none()
-                    && let Err(error) = store.write(&metadata)
-                {
+            MetadataCommand::Write(metadata) => match store.write(&metadata) {
+                Ok(()) => {
+                    pending = None;
+                    first_error = None;
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        on_error(error.to_string());
+                    }
+                    pending = Some(metadata);
                     first_error = Some(error);
                 }
-            }
+            },
             MetadataCommand::Flush(reply) => {
+                if let Some(metadata) = &pending {
+                    match store.write(metadata) {
+                        Ok(()) => {
+                            pending = None;
+                            first_error = None;
+                        }
+                        Err(error) => {
+                            first_error = Some(error);
+                        }
+                    }
+                }
                 let _ = reply.send(match first_error.take() {
                     Some(error) => Err(error),
                     None => Ok(()),
                 });
             }
             MetadataCommand::Shutdown(reply) => {
+                if let Some(metadata) = &pending {
+                    first_error = store.write(metadata).err();
+                }
                 let result = first_error.take();
                 let _ = reply.send(());
                 return result.map_or(Ok(()), Err);
@@ -771,6 +820,70 @@ mod tests {
         assert_eq!(loaded.get("owner"), Some(&json!("Claude")));
         assert_eq!(loaded.get("roster"), None);
         std::fs::remove_dir_all(path.parent().expect("parent")).expect("cleanup");
+    }
+
+    #[test]
+    fn failed_metadata_snapshot_is_retained_and_newer_writes_recover() {
+        let root = temp_path("recovery");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("metadata");
+        std::fs::create_dir(&path).unwrap(); // A directory cannot be replaced by a JSON file.
+        let (sender, errors) = std::sync::mpsc::channel();
+        let store = SessionMetadataStore::open(&path);
+        let writer = store
+            .buffered_with_errors(move |error| {
+                let _ = sender.send(error);
+            })
+            .unwrap();
+        let snapshot = |value| {
+            SessionMetadata::new(serde_json::Map::from_iter([("value".into(), json!(value))]))
+        };
+        writer.write(snapshot(1)).unwrap();
+        assert!(
+            errors
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok()
+        );
+        std::fs::remove_dir(&path).unwrap();
+        writer.write(snapshot(2)).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(
+            store.read().unwrap().unwrap().metadata.get("value"),
+            Some(&json!(2))
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        writer.write(snapshot(3)).unwrap();
+        assert!(
+            errors
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok()
+        );
+        std::fs::remove_dir(&path).unwrap();
+        writer.flush().unwrap(); // Retries the retained snapshot without another write.
+        assert_eq!(
+            store.read().unwrap().unwrap().metadata.get("value"),
+            Some(&json!(3))
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        writer.write(snapshot(4)).unwrap();
+        assert!(
+            errors
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok()
+        );
+        std::fs::remove_dir(&path).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !path.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            store.read().unwrap().unwrap().metadata.get("value"),
+            Some(&json!(4))
+        );
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

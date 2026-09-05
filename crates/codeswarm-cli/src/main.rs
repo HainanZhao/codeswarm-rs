@@ -79,6 +79,52 @@ fn apply_mouse_scroll(app: &mut App, kind: MouseEventKind, width: usize, height:
     true
 }
 
+const WHEEL_SCROLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_WHEEL_EVENTS_PER_FRAME: usize = 256;
+
+#[derive(Default)]
+struct WheelScroll {
+    last_applied: Option<Instant>,
+}
+
+impl WheelScroll {
+    fn apply(
+        &mut self,
+        app: &mut App,
+        kind: MouseEventKind,
+        width: usize,
+        height: usize,
+        now: Instant,
+    ) -> bool {
+        if mouse_scroll_delta(kind).is_none()
+            || self
+                .last_applied
+                .is_some_and(|last| now.saturating_duration_since(last) < WHEEL_SCROLL_INTERVAL)
+        {
+            return false;
+        }
+        self.last_applied = Some(now);
+        apply_mouse_scroll(app, kind, width, height)
+    }
+}
+
+// Collapse queued wheel input without swallowing the next key/click/resize.
+// Bound draining so continuous input still gives adapter updates a turn.
+fn coalesce_wheel_input(
+    mut kind: MouseEventKind,
+    mut read_ready: impl FnMut() -> std::io::Result<Option<Event>>,
+) -> std::io::Result<(MouseEventKind, Option<Event>)> {
+    for _ in 1..MAX_WHEEL_EVENTS_PER_FRAME {
+        match read_ready()? {
+            Some(Event::Mouse(mouse)) if mouse_scroll_delta(mouse.kind).is_some() => {
+                kind = mouse.kind
+            }
+            event => return Ok((kind, event)),
+        }
+    }
+    Ok((kind, None))
+}
+
 fn apply_navigation_scroll(app: &mut App, key: KeyCode, width: usize, height: usize) -> bool {
     let delta = match key {
         KeyCode::Up => -1,
@@ -87,6 +133,22 @@ fn apply_navigation_scroll(app: &mut App, key: KeyCode, width: usize, height: us
     };
     app.scroll_by(delta, width, height);
     true
+}
+
+fn request_agent_reload(
+    app: &mut App,
+    controls: &tokio::sync::mpsc::UnboundedSender<AdapterControl>,
+    now: Instant,
+) {
+    if let Some(slot) = app.inactive_agent(now) {
+        app.request_turn_cancellation();
+        let _ = controls.send(AdapterControl::Cancel);
+        let _ = controls.send(AdapterControl::Reload(slot));
+    } else if let Some(slot) = app.failed_agent() {
+        let _ = controls.send(AdapterControl::Reload(slot));
+    } else {
+        app.status = "no silent or crashed agent to reload".into();
+    }
 }
 
 fn restore_mouse_after_selection_window(
@@ -261,6 +323,7 @@ impl Drop for TerminalSession {
 
 #[derive(Debug)]
 enum AdapterControl {
+    Goal(codeswarm_adapters::goal::GoalCommand, Option<usize>),
     Prompt(String),
     /// Untargeted human input submitted while a turn was active. Unlike a
     /// fresh prompt, this returns to the agent that was working.
@@ -604,8 +667,8 @@ Options:
   -h, --help                      Show this help
   -v, --version                   Show the version
 
-Prompt commands include /help, /config, /cancel, /reload, /to, /select,
-/export, /clear, and /close."#
+Prompt commands include /help, /settings, /goal, /cancel, /reload, /agent, /select,
+/export, /clear, and /exit."#
     );
 }
 
@@ -1120,12 +1183,23 @@ fn queue_standalone_metadata(
     identity: &str,
     command: &str,
     adapter: &dyn AgentAdapter,
+    goal: Option<&codeswarm_adapters::goal::Goal>,
 ) {
     if let Some(writer) = writer {
-        let _ = writer.write(standalone_session_metadata(
-            cwd, name, identity, command, adapter,
-        ));
+        let mut metadata = standalone_session_metadata(cwd, name, identity, command, adapter);
+        metadata.insert("goal", serde_json::to_value(goal).expect("goal serializes"));
+        let _ = writer.write(metadata);
     }
+}
+
+fn load_goal(cwd: &Path, resume: bool) -> Option<codeswarm_adapters::goal::Goal> {
+    if !resume {
+        return None;
+    }
+    let metadata = SessionMetadataStore::open(session_metadata_path_for(cwd))
+        .read()
+        .ok()??;
+    codeswarm_adapters::goal::Goal::from_metadata(metadata.metadata.get("goal")?)
 }
 
 fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std::io::Result<()> {
@@ -1443,6 +1517,7 @@ fn load_ui_preferences(app: &mut App) {
         app.set_collapse_details(collapsed);
     }
     apply_notification_preferences(app, &value);
+    apply_theme_preference(app, &value);
     if let Some(enabled) = value
         .get("notifications")
         .and_then(|notifications| notifications.get("enable_sounds"))
@@ -1762,10 +1837,24 @@ fn apply_notification_preferences(app: &mut App, value: &serde_json::Value) {
     }
 }
 
+fn apply_theme_preference(app: &mut App, value: &serde_json::Value) {
+    app.set_theme(
+        value
+            .get("ui")
+            .and_then(|ui| ui.get("theme"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("terminal"),
+    );
+}
+
 fn save_ui_preferences(app: &App) -> std::io::Result<()> {
     let Some(path) = settings_path() else {
         return Ok(());
     };
+    save_ui_preferences_at(&path, app)
+}
+
+fn save_ui_preferences_at(path: &Path, app: &App) -> std::io::Result<()> {
     settings::update(path, |settings| {
         {
             let ui = settings
@@ -1777,6 +1866,7 @@ fn save_ui_preferences(app: &App) -> std::io::Result<()> {
             ui["follow_output"] = serde_json::Value::Bool(app.follow_tail);
             ui["prompt_message"] = serde_json::Value::String(app.prompt_message().into());
             ui["density"] = serde_json::Value::String(app.density().into());
+            ui["theme"] = serde_json::Value::String(app.theme().into());
             ui["scrollbar"] = serde_json::Value::String(
                 if app.scrollbar_visible() {
                     "normal"
@@ -2065,6 +2155,73 @@ fn finish_pending_cancellation(app: &mut App, error_text: &str) -> bool {
     cancelled
 }
 
+fn runtime_metadata_writer(
+    cwd: &Path,
+    sender: &Sender<AdapterResult<AgentEvent>>,
+) -> Option<codeswarm_adapters::persistence::BufferedSessionMetadataStore> {
+    let notifications = sender.clone();
+    let result = SessionMetadataStore::open(session_metadata_path_for(cwd)).buffered_with_errors(
+        move |detail| {
+            let _ = notifications.send(Ok(AgentEvent::RosterUpdated {
+                update: codeswarm_adapters::RosterUpdate::Rejected {
+                    action: "save session metadata (retrying)".into(),
+                    detail,
+                },
+            }));
+        },
+    );
+    match result {
+        Ok(writer) => Some(writer),
+        Err(error) => {
+            let _ = sender.send(Ok(AgentEvent::RosterUpdated {
+                update: codeswarm_adapters::RosterUpdate::Rejected {
+                    action: "start session metadata writer".into(),
+                    detail: error.to_string(),
+                },
+            }));
+            None
+        }
+    }
+}
+
+async fn start_standalone(adapter: &mut impl AgentAdapter) -> AdapterResult<()> {
+    adapter.start().await?;
+    if adapter.capabilities().supports_modes {
+        adapter
+            .set_mode(codeswarm_adapters::policy::DEFAULT_POLICY_ID.into())
+            .await?;
+    }
+    Ok(())
+}
+
+async fn await_startup(
+    startup: impl std::future::Future<Output = AdapterResult<()>>,
+    controls: &mut tokio::sync::mpsc::UnboundedReceiver<AdapterControl>,
+) -> AdapterResult<VecDeque<AdapterControl>> {
+    await_startup_before(startup, controls, Duration::from_secs(90)).await
+}
+
+async fn await_startup_before(
+    startup: impl std::future::Future<Output = AdapterResult<()>>,
+    controls: &mut tokio::sync::mpsc::UnboundedReceiver<AdapterControl>,
+    timeout: Duration,
+) -> AdapterResult<VecDeque<AdapterControl>> {
+    let mut deferred = VecDeque::new();
+    tokio::pin!(startup);
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            result = &mut startup => { result?; return Ok(deferred); }
+            _ = &mut deadline => return Err(AdapterError::Transport("agent startup timed out".into())),
+            command = controls.recv() => match command {
+                Some(AdapterControl::Cancel | AdapterControl::Stop) | None => return Err(AdapterError::Transport("agent startup cancelled".into())),
+                Some(command) => deferred.push_back(command),
+            }
+        }
+    }
+}
+
 fn run_agy_task(
     sender: Sender<AdapterResult<AgentEvent>>,
     mut controls: tokio::sync::mpsc::UnboundedReceiver<AdapterControl>,
@@ -2096,22 +2253,15 @@ fn run_agy_task(
             || AgyAdapter::new(0, cwd.clone(), command.clone()),
             |session_id| AgyAdapter::with_session_id(0, cwd.clone(), command.clone(), session_id),
         );
-        let metadata_writer = SessionMetadataStore::open(session_metadata_path_for(&cwd))
-            .buffered()
-            .ok();
-        if let Err(error) = adapter.start().await {
-            let _ = sender.send(Err(error));
-            return;
-        }
-        if adapter.capabilities().supports_modes
-            && let Err(error) = adapter
-                .set_mode(codeswarm_adapters::policy::DEFAULT_POLICY_ID.into())
-                .await
-        {
-            let _ = sender.send(Err(error));
-            let _ = adapter.stop().await;
-            return;
-        }
+        let metadata_writer = runtime_metadata_writer(&cwd, &sender);
+        let mut goal = load_goal(&cwd, resume);
+        if goal.is_some() { let _ = sender.send(Ok(AgentEvent::GoalUpdated { goal: goal.clone() })); }
+        let mut turn_running = prompt.is_some();
+        let mut pending_goals = VecDeque::new();
+        let mut startup_commands = match await_startup(start_standalone(&mut adapter), &mut controls).await {
+            Ok(commands) => commands,
+            Err(error) => { let _ = adapter.stop().await; let _ = sender.send(Err(error)); return; }
+        };
         queue_standalone_metadata(
             metadata_writer.as_ref(),
             &cwd,
@@ -2119,9 +2269,10 @@ fn run_agy_task(
             &identity,
             &command,
             &adapter,
+            goal.as_ref(),
         );
         if let Some(prompt) = prompt {
-            if let Err(error) = adapter.send_prompt(prompt).await {
+            if let Err(error) = adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt)).await {
                 let _ = sender.send(Err(error));
                 let _ = adapter.stop().await;
                 if let Some(writer) = &metadata_writer {
@@ -2139,7 +2290,11 @@ fn run_agy_task(
                         match event {
                             Ok(event) => {
                                 let turn_complete =
-                                    matches!(&event, AgentEvent::TurnComplete { .. });
+                                    matches!(&event, AgentEvent::TurnComplete { .. } | AgentEvent::Failed { .. } | AgentEvent::UsageLimitReached { .. });
+                                if turn_complete {
+                                    turn_running = false;
+                                    while let Some(command) = pending_goals.pop_back() { startup_commands.push_front(AdapterControl::Goal(command, None)); }
+                                }
                                 for event in sanitize_direct_event(event, &mut response_tail) {
                                     if sender.send(Ok(event)).is_err() {
                                         break 'events;
@@ -2153,11 +2308,14 @@ fn run_agy_task(
                                         &identity,
                                         &command,
                                         &adapter,
+                                        goal.as_ref(),
                                     );
                                 }
                             }
                             Err(error) => {
                                 response_tail.clear();
+                                turn_running = false;
+                                while let Some(command) = pending_goals.pop_back() { startup_commands.push_front(AdapterControl::Goal(command, None)); }
                                 if sender.send(Err(error)).is_err() {
                                     break 'events;
                                 }
@@ -2166,16 +2324,35 @@ fn run_agy_task(
                     }
                     None => break,
                 },
-                command = controls.recv() => match command {
+                control = async { match startup_commands.pop_front() { Some(command) => Some(command), None => controls.recv().await } } => match control {
                     Some(AdapterControl::Prompt(prompt) | AdapterControl::FollowUp(prompt)) => {
-                        if let Err(error) = adapter.send_prompt(prompt).await {
+                        if let Err(error) = adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt)).await {
                             let _ = sender.send(Err(error));
                         } else {
+                            turn_running = true;
                             let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 }));
                         }
                     }
                     Some(AdapterControl::Cancel) => {
                         cancel_standalone_turn(&mut adapter, &sender, &mut response_tail).await;
+                        turn_running = false;
+                        while let Some(command) = pending_goals.pop_back() { startup_commands.push_front(AdapterControl::Goal(command, None)); }
+                    }
+                    Some(AdapterControl::Goal(goal_command, _)) => {
+                        if turn_running { pending_goals.push_back(goal_command); continue; }
+                        match codeswarm_adapters::goal::apply(&mut goal, goal_command) {
+                            Ok(task) => {
+                                let _ = sender.send(Ok(AgentEvent::GoalUpdated { goal: goal.clone() }));
+                                queue_standalone_metadata(metadata_writer.as_ref(), &cwd, &name, &identity, &command, &adapter, goal.as_ref());
+                                if let Some(task) = task {
+                                    match adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &task)).await {
+                                        Ok(()) => { turn_running = true; let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 })); }
+                                        Err(error) => { let _ = sender.send(Err(error)); }
+                                    }
+                                }
+                            }
+                            Err(detail) => { let _ = sender.send(Ok(AgentEvent::RosterUpdated { update: codeswarm_adapters::RosterUpdate::Rejected { action: "update goal".into(), detail } })); }
+                        }
                     }
                     Some(AdapterControl::Permission { request_id, answer, .. }) => {
                         if let Err(error) = adapter.answer_permission(request_id, answer).await {
@@ -2201,6 +2378,8 @@ fn run_agy_task(
                         }
                     }
                     Some(AdapterControl::Reload(_)) => {
+                        turn_running = false;
+                        while let Some(command) = pending_goals.pop_back() { startup_commands.push_front(AdapterControl::Goal(command, None)); }
                         if let Err(error) = adapter.reload().await {
                             let _ = sender.send(Err(error));
                         }
@@ -2292,22 +2471,15 @@ fn run_acp_task(
                 )
             },
         );
-        let metadata_writer = SessionMetadataStore::open(session_metadata_path_for(&cwd))
-            .buffered()
-            .ok();
-        if let Err(error) = adapter.start().await {
-            let _ = sender.send(Err(error));
-            return;
-        }
-        if adapter.capabilities().supports_modes
-            && let Err(error) = adapter
-                .set_mode(codeswarm_adapters::policy::DEFAULT_POLICY_ID.into())
-                .await
-        {
-            let _ = sender.send(Err(error));
-            let _ = adapter.stop().await;
-            return;
-        }
+        let metadata_writer = runtime_metadata_writer(&cwd, &sender);
+        let mut goal = load_goal(&cwd, resume);
+        if goal.is_some() { let _ = sender.send(Ok(AgentEvent::GoalUpdated { goal: goal.clone() })); }
+        let mut turn_running = prompt.is_some();
+        let mut pending_goals = VecDeque::new();
+        let mut startup_commands = match await_startup(start_standalone(&mut adapter), &mut controls).await {
+            Ok(commands) => commands,
+            Err(error) => { let _ = adapter.stop().await; let _ = sender.send(Err(error)); return; }
+        };
         queue_standalone_metadata(
             metadata_writer.as_ref(),
             &cwd,
@@ -2315,9 +2487,10 @@ fn run_acp_task(
             &identity,
             &command,
             &adapter,
+            goal.as_ref(),
         );
         if let Some(prompt) = prompt {
-            if let Err(error) = adapter.send_prompt(prompt).await {
+            if let Err(error) = adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt)).await {
                 let _ = sender.send(Err(error));
                 let _ = adapter.stop().await;
                 if let Some(writer) = &metadata_writer {
@@ -2335,7 +2508,11 @@ fn run_acp_task(
                         match event {
                             Ok(event) => {
                                 let turn_complete =
-                                    matches!(&event, AgentEvent::TurnComplete { .. });
+                                    matches!(&event, AgentEvent::TurnComplete { .. } | AgentEvent::Failed { .. } | AgentEvent::UsageLimitReached { .. });
+                                if turn_complete {
+                                    turn_running = false;
+                                    while let Some(command) = pending_goals.pop_back() { startup_commands.push_front(AdapterControl::Goal(command, None)); }
+                                }
                                 for event in sanitize_direct_event(event, &mut response_tail) {
                                     if sender.send(Ok(event)).is_err() {
                                         break 'events;
@@ -2349,11 +2526,14 @@ fn run_acp_task(
                                         &identity,
                                         &command,
                                         &adapter,
+                                        goal.as_ref(),
                                     );
                                 }
                             }
                             Err(error) => {
                                 response_tail.clear();
+                                turn_running = false;
+                                while let Some(command) = pending_goals.pop_back() { startup_commands.push_front(AdapterControl::Goal(command, None)); }
                                 if sender.send(Err(error)).is_err() {
                                     break 'events;
                                 }
@@ -2362,16 +2542,35 @@ fn run_acp_task(
                     }
                     None => break,
                 },
-                command = controls.recv() => match command {
+                control = async { match startup_commands.pop_front() { Some(command) => Some(command), None => controls.recv().await } } => match control {
                     Some(AdapterControl::Prompt(prompt) | AdapterControl::FollowUp(prompt)) => {
-                        if let Err(error) = adapter.send_prompt(prompt).await {
+                        if let Err(error) = adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt)).await {
                             let _ = sender.send(Err(error));
                         } else {
+                            turn_running = true;
                             let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 }));
                         }
                     }
                     Some(AdapterControl::Cancel) => {
                         cancel_standalone_turn(&mut adapter, &sender, &mut response_tail).await;
+                        turn_running = false;
+                        while let Some(command) = pending_goals.pop_back() { startup_commands.push_front(AdapterControl::Goal(command, None)); }
+                    }
+                    Some(AdapterControl::Goal(goal_command, _)) => {
+                        if turn_running { pending_goals.push_back(goal_command); continue; }
+                        match codeswarm_adapters::goal::apply(&mut goal, goal_command) {
+                            Ok(task) => {
+                                let _ = sender.send(Ok(AgentEvent::GoalUpdated { goal: goal.clone() }));
+                                queue_standalone_metadata(metadata_writer.as_ref(), &cwd, &name, &identity, &command, &adapter, goal.as_ref());
+                                if let Some(task) = task {
+                                    match adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &task)).await {
+                                        Ok(()) => { turn_running = true; let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 })); }
+                                        Err(error) => { let _ = sender.send(Err(error)); }
+                                    }
+                                }
+                            }
+                            Err(detail) => { let _ = sender.send(Ok(AgentEvent::RosterUpdated { update: codeswarm_adapters::RosterUpdate::Rejected { action: "update goal".into(), detail } })); }
+                        }
                     }
                     Some(AdapterControl::Permission { request_id, answer, .. }) => {
                         if let Err(error) = adapter.answer_permission(request_id, answer).await {
@@ -2397,6 +2596,8 @@ fn run_acp_task(
                         }
                     }
                     Some(AdapterControl::Reload(_)) => {
+                        turn_running = false;
+                        while let Some(command) = pending_goals.pop_back() { startup_commands.push_front(AdapterControl::Goal(command, None)); }
                         if let Err(error) = adapter.reload().await {
                             let _ = sender.send(Err(error));
                         }
@@ -2615,6 +2816,7 @@ fn run_relay_task(
                 (protocol.to_owned(), agent_spec_command(spec).to_owned())
             })
             .collect::<Vec<_>>();
+        let restored_goal = load_goal(&cwd, session_ids.iter().any(Option::is_some));
         let hosts = specs
             .into_iter()
             .enumerate()
@@ -2680,39 +2882,67 @@ fn run_relay_task(
         relay.set_roster_identities(identities);
         relay.set_roster_launch_specs(roster_launch_specs);
         relay.set_session_metadata_workspace(cwd.display().to_string());
-        if let Ok(writer) = SessionMetadataStore::open(session_metadata_path_for(&cwd)).buffered() {
+        if let Some(writer) = runtime_metadata_writer(&cwd, &sender) {
             relay.set_session_metadata_writer(writer);
         }
         let event_sender = sender.clone();
         relay.set_event_sink(move |event| {
             let _ = event_sender.send(Ok(event));
         });
-        if let Err(error) = relay.start().await {
-            let _ = sender.send(Err(error));
-            return;
+        if restored_goal.is_some() {
+            relay.restore_goal(restored_goal);
         }
-        for (slot, model) in models.into_iter().enumerate() {
-            if let Some(model) = model
-                && let Err(error) = relay.set_model(slot, model).await
-            {
-                let _ = sender.send(Ok(AgentEvent::RosterUpdated {
-                    update: codeswarm_adapters::RosterUpdate::Rejected {
-                        action: format!("set model for agent {slot}"),
-                        detail: error.to_string(),
-                    },
-                }));
+        let mut pending_commands = match await_startup(
+            async {
+                relay.start().await?;
+                for (slot, model) in models.into_iter().enumerate() {
+                    if let Some(model) = model
+                        && let Err(error) = relay.set_model(slot, model).await
+                    {
+                        let _ = sender.send(Ok(AgentEvent::RosterUpdated {
+                            update: codeswarm_adapters::RosterUpdate::Rejected {
+                                action: format!("set model for agent {slot}"),
+                                detail: error.to_string(),
+                            },
+                        }));
+                    }
+                }
+                Ok(())
+            },
+            &mut controls,
+        )
+        .await
+        {
+            Ok(commands) => commands,
+            Err(error) => {
+                let _ = relay.stop().await;
+                let _ = sender.send(Err(error));
+                return;
             }
-        }
-        let mut pending_commands = VecDeque::new();
+        };
         if let Some(prompt) = prompt {
-            let (stopping, deferred) = run_relay_sequence_with_controls(
-                &mut relay,
-                &mut controls,
-                &sender,
-                prompt,
-                first_slot,
-            )
-            .await;
+            let (stopping, deferred) = if pending_commands.is_empty() {
+                run_relay_sequence_with_controls(
+                    &mut relay,
+                    &mut controls,
+                    &sender,
+                    prompt,
+                    first_slot,
+                )
+                .await
+            } else {
+                // Startup input belongs at the first turn boundary, before
+                // automatic reviews can consume the rest of the batch.
+                let (stopping, deferred, _) = run_relay_turn_with_controls(
+                    &mut relay,
+                    &mut controls,
+                    &sender,
+                    prompt,
+                    first_slot,
+                )
+                .await;
+                (stopping, deferred)
+            };
             if stopping {
                 let _ = relay.stop().await;
                 return;
@@ -2725,6 +2955,46 @@ fn run_relay_task(
                 None => controls.recv().await,
             };
             match command {
+                Some(AdapterControl::Goal(command, selected)) => match relay.apply_goal(command) {
+                    Ok(Some(task)) => {
+                        let slot = selected
+                            .filter(|slot| {
+                                relay.relay().active_slots().any(|active| active == *slot)
+                            })
+                            .or_else(|| relay.relay().routable_slots().next())
+                            .unwrap_or(first_slot);
+                        if !relay.relay_mut().enqueue_human(task, Some(slot)) {
+                            let _ = sender.send(Ok(AgentEvent::RosterUpdated {
+                                update: codeswarm_adapters::RosterUpdate::Rejected {
+                                    action: "start goal".into(),
+                                    detail: "no available agent or prompt queue is full".into(),
+                                },
+                            }));
+                            continue;
+                        }
+                        let (stopping, deferred) = run_relay_sequence_with_controls(
+                            &mut relay,
+                            &mut controls,
+                            &sender,
+                            "".into(),
+                            slot,
+                        )
+                        .await;
+                        pending_commands.extend(deferred);
+                        if stopping {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(detail) => {
+                        let _ = sender.send(Ok(AgentEvent::RosterUpdated {
+                            update: codeswarm_adapters::RosterUpdate::Rejected {
+                                action: "update goal".into(),
+                                detail,
+                            },
+                        }));
+                    }
+                },
                 Some(AdapterControl::Prompt(prompt)) => {
                     // Every fresh unaddressed human task begins with the first
                     // active roster member. The ring cursor is batch-local.
@@ -2980,12 +3250,10 @@ fn run_terminal(
     // between unrelated projects.
     let history_project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     app.load_prompt_history(load_prompt_history(&history_project_root));
-    let completion_candidates = [
-        "/cancel", "/clear", "/close", "/config", "/export", "/help", "/reload", "/select", "/to",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect::<Vec<_>>();
+    let completion_candidates = codeswarm::tui::LOCAL_COMMANDS
+        .iter()
+        .map(|spec| spec.name.to_owned())
+        .collect::<Vec<_>>();
     app.set_prompt_completions(completion_candidates);
     let mut selected_slot = selected_slot;
     let event_log = event_log().ok();
@@ -3004,11 +3272,19 @@ fn run_terminal(
     let mut turn_active = false;
     let mut cancel_requested_at: Option<Instant> = None;
     let mut title_blink_at = Instant::now();
+    let mut wheel_scroll = WheelScroll::default();
+    let mut pending_input = None;
     let mut last_terminal_title = String::new();
     let manage_terminal_title = terminal_capture_enabled();
+    let mut redraw = codeswarm::tui::frame_scheduler::RedrawSchedule::default();
+    let mut frame_area = ratatui::layout::Rect::default();
     loop {
+        if app.poll_path_index() {
+            redraw.invalidate();
+        }
         if app.config_visible() && config_input.take_expired_escape(Instant::now()) {
             let _ = app.handle_config_key(ConfigKey::Cancel);
+            redraw.invalidate();
             continue;
         }
         if !app.config_visible() {
@@ -3021,14 +3297,17 @@ fn run_terminal(
         )? {
             app.set_mouse_selection_mode(false);
             app.status = "mouse scrolling restored".into();
+            redraw.invalidate();
         }
         selected_slot = normalize_selected_slot(app, selected_slot);
         app.set_selected_agent(selected_slot);
         if let Some(events) = &events {
             for event in next_event_batch(events) {
+                redraw.invalidate();
                 match event {
                     Ok(event) => {
                         match &event {
+                            AgentEvent::GoalUpdated { .. } => {}
                             AgentEvent::RosterUpdated { update } => match update {
                                 codeswarm_adapters::RosterUpdate::Added {
                                     slot, identity, ..
@@ -3247,12 +3526,21 @@ fn run_terminal(
         }
         if app.take_full_repaint_request() {
             terminal.clear()?;
+            redraw.invalidate();
         }
-        let frame_area = terminal.draw(|frame| render(frame, app))?.area;
-        if !event::poll(Duration::from_millis(50))? {
+        if redraw.needs_draw(Instant::now()) {
+            frame_area = terminal.draw(|frame| render(frame, app))?.area;
+            redraw.did_draw(app.next_visual_deadline(Instant::now()));
+        }
+        if pending_input.is_none() && !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        match event::read()? {
+        let input = match pending_input.take() {
+            Some(input) => input,
+            None => event::read()?,
+        };
+        redraw.invalidate();
+        match input {
             Event::FocusGained => {
                 app.set_terminal_focused(true);
                 continue;
@@ -3262,11 +3550,20 @@ fn run_terminal(
                 continue;
             }
             Event::Mouse(mouse) if mouse_scroll_delta(mouse.kind).is_some() => {
-                let _ = apply_mouse_scroll(
+                let (kind, next) = coalesce_wheel_input(mouse.kind, || {
+                    if event::poll(Duration::ZERO)? {
+                        event::read().map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })?;
+                pending_input = next;
+                let _ = wheel_scroll.apply(
                     app,
-                    mouse.kind,
+                    kind,
                     frame_area.width as usize,
                     app.content_height(frame_area.height as usize),
+                    Instant::now(),
                 );
                 continue;
             }
@@ -3595,8 +3892,39 @@ fn run_terminal(
                                 app.status = "local shell commands are not supported".into();
                             } else if let Some(local) = app.handle_local_command(&prompt) {
                                 match local {
+                                    LocalCommand::Goal(command) => {
+                                        if let Some(controls) = &controls {
+                                            if controls
+                                                .send(AdapterControl::Goal(
+                                                    command.clone(),
+                                                    app.next_agent_slot(),
+                                                ))
+                                                .is_ok()
+                                            {
+                                                if let codeswarm_adapters::goal::GoalCommand::Set(
+                                                    objective,
+                                                ) = command
+                                                {
+                                                    app.record_human_message(
+                                                        &format!("Goal: {objective}"),
+                                                        false,
+                                                    );
+                                                }
+                                                app.status = if turn_active {
+                                                    "goal change queued for the turn boundary"
+                                                } else {
+                                                    "updating goal"
+                                                }
+                                                .into();
+                                            } else {
+                                                app.status = "unable to update goal: agent connection closed".into();
+                                            }
+                                        } else {
+                                            app.apply_local_goal(command);
+                                        }
+                                    }
                                     LocalCommand::Handled => {}
-                                    LocalCommand::Close => {
+                                    LocalCommand::Exit => {
                                         if let Some(controls) = &controls {
                                             let _ = controls.send(AdapterControl::Stop);
                                         }
@@ -3614,12 +3942,8 @@ fn run_terminal(
                                         }
                                     }
                                     LocalCommand::Reload => {
-                                        if let Some(slot) = app.failed_agent()
-                                            && let Some(controls) = &controls
-                                        {
-                                            let _ = controls.send(AdapterControl::Reload(slot));
-                                        } else {
-                                            app.status = "no crashed agent to reload".into();
+                                        if let Some(controls) = &controls {
+                                            request_agent_reload(app, controls, Instant::now());
                                         }
                                     }
                                     LocalCommand::SelectAgent(slot) => {
@@ -3977,6 +4301,223 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn theme_preferences_round_trip_and_invalid_replacements_use_terminal_defaults() {
+        let root = std::env::temp_dir().join(format!(
+            "codeswarm-theme-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("settings.json");
+        let mut app = App::default();
+        app.set_theme("dark");
+        super::save_ui_preferences_at(&path, &app).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["ui"]["theme"], "dark");
+        app.set_theme("light");
+        super::apply_theme_preference(&mut app, &saved);
+        assert_eq!(app.theme(), "dark");
+        for replacement in [
+            serde_json::json!({}),
+            serde_json::json!({"ui":{"theme":42}}),
+            serde_json::json!({"ui":{"theme":"missing"}}),
+        ] {
+            app.set_theme("light");
+            super::apply_theme_preference(&mut app, &replacement);
+            assert_eq!(app.theme(), "terminal");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_deadline_interrupts_a_real_silent_adapter() {
+        let mut adapter = super::AcpAdapter::new(
+            0,
+            std::env::current_dir().unwrap(),
+            "sh",
+            vec!["-c".into(), "read _; read _".into()],
+        );
+        let (_sender, mut controls) = tokio::sync::mpsc::unbounded_channel();
+        let result =
+            super::await_startup_before(adapter.start(), &mut controls, Duration::from_millis(20))
+                .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("startup timed out")
+        );
+        tokio::time::timeout(Duration::from_secs(2), adapter.stop())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn goals_restore_only_for_resume_and_reject_invalid_saved_state() {
+        use codeswarm_adapters::goal::{Goal, GoalStatus};
+        let root = std::env::temp_dir().join(format!(
+            "codeswarm-goal-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = SessionMetadataStore::open(super::session_metadata_path_for(&root));
+        let mut metadata = codeswarm_adapters::persistence::SessionMetadata::empty();
+        let goal = Goal {
+            objective: "Ship login".into(),
+            status: GoalStatus::Active,
+        };
+        metadata.insert("goal", serde_json::to_value(&goal).unwrap());
+        store.write(&metadata).unwrap();
+        assert_eq!(super::load_goal(&root, true), Some(goal));
+        assert_eq!(super::load_goal(&root, false), None);
+        metadata.insert(
+            "goal",
+            serde_json::json!({"objective":"bad", "status":"unknown"}),
+        );
+        store.write(&metadata).unwrap();
+        assert_eq!(super::load_goal(&root, true), None);
+        std::fs::remove_file(store.path()).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn goal_changes_wait_for_the_active_relay_turn_boundary() {
+        let host = AdapterHost::new(
+            Box::new(YieldingAdapter {
+                slot: 0,
+                yielded: false,
+                events: std::collections::VecDeque::from([
+                    AgentEvent::Text {
+                        slot: 0,
+                        text: "finished current turn".into(),
+                    },
+                    AgentEvent::TurnComplete { slot: 0 },
+                ]),
+            }),
+            None,
+        );
+        let peer = AdapterHost::new(
+            Box::new(ScriptedAdapter::new(
+                1,
+                AgentCapabilities::default(),
+                [AgentEvent::TurnComplete { slot: 1 }],
+            )),
+            None,
+        );
+        let mut relay = RelayHost::new(vec![host, peer], 10).unwrap();
+        relay.start().await.unwrap();
+        let (control, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        control
+            .send(AdapterControl::Goal(
+                codeswarm_adapters::goal::GoalCommand::Set("new objective".into()),
+                Some(1),
+            ))
+            .unwrap();
+        let (sender, _) = std::sync::mpsc::channel();
+        let (_, deferred) = run_relay_sequence_with_controls(
+            &mut relay,
+            &mut receiver,
+            &sender,
+            "original task".into(),
+            0,
+        )
+        .await;
+        assert_eq!(relay.dispatches().len(), 1);
+        assert!(
+            !relay.dispatches()[0]
+                .1
+                .contains("Active shared goal: new objective")
+        );
+        let Some(AdapterControl::Goal(command, _)) = deferred.into_iter().next() else {
+            panic!("goal deferred")
+        };
+        let task = relay.apply_goal(command).unwrap().unwrap();
+        relay.relay_mut().enqueue_human(task, Some(1));
+        relay.run_turn("", 1).await.unwrap();
+        assert!(
+            relay.dispatches()[1]
+                .1
+                .contains("Active shared goal: new objective")
+        );
+    }
+
+    #[test]
+    fn redraws_stop_when_idle_and_resume_for_events_and_timer_deadlines() {
+        use codeswarm::tui::frame_scheduler::RedrawSchedule;
+        let now = Instant::now();
+        let mut schedule = RedrawSchedule::default();
+        assert!(schedule.needs_draw(now));
+        schedule.did_draw(None);
+        assert!(!schedule.needs_draw(now + Duration::from_secs(3600)));
+        schedule.invalidate();
+        assert!(schedule.needs_draw(now));
+        schedule.did_draw(Some(now + Duration::from_secs(1)));
+        assert!(!schedule.needs_draw(now + Duration::from_millis(999)));
+        assert!(schedule.needs_draw(now + Duration::from_secs(1)));
+        schedule.did_draw(None);
+        assert!(!schedule.needs_draw(now + Duration::from_secs(2)));
+    }
+
+    #[tokio::test]
+    async fn startup_can_be_cancelled_without_losing_queued_input_on_success() {
+        let (sender, mut controls) = tokio::sync::mpsc::unbounded_channel();
+        sender.send(AdapterControl::Cancel).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            super::await_startup(std::future::pending(), &mut controls),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("startup cancelled")
+        );
+        sender
+            .send(AdapterControl::Prompt("queued task".into()))
+            .unwrap();
+        let deferred = super::await_startup(
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(())
+            },
+            &mut controls,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(deferred.front(), Some(AdapterControl::Prompt(task)) if task == "queued task")
+        );
+        let timeout = super::await_startup_before(
+            std::future::pending(),
+            &mut controls,
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(
+            timeout
+                .unwrap_err()
+                .to_string()
+                .contains("startup timed out")
+        );
+        drop(sender);
+        assert!(
+            super::await_startup(std::future::pending(), &mut controls)
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
     fn event_batches_leave_excess_adapter_updates_for_the_next_frame() {
         let (sender, receiver) = std::sync::mpsc::channel();
         for value in 0..=MAX_EVENTS_PER_FRAME {
@@ -4191,6 +4732,103 @@ mod tests {
             None
         );
         assert!(decoder.take_expired_escape(now + Duration::from_millis(700)));
+    }
+
+    #[test]
+    fn wheel_bursts_are_capped_on_a_long_transcript_and_resume_without_backlog() {
+        let mut app = App::default();
+        app.transcript = codeswarm::transcript::fixtures::hundred_turn_transcript();
+        app.follow_tail(80, 10);
+        let tail = app.scroll_y;
+        let mut wheel = super::WheelScroll::default();
+        let now = Instant::now();
+        for _ in 0..1000 {
+            wheel.apply(&mut app, MouseEventKind::ScrollUp, 80, 10, now);
+        }
+        assert_eq!(app.scroll_y, tail - 3);
+        assert!(!wheel.apply(
+            &mut app,
+            MouseEventKind::ScrollUp,
+            80,
+            10,
+            now + Duration::from_millis(19)
+        ));
+        assert!(wheel.apply(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            80,
+            10,
+            now + super::WHEEL_SCROLL_INTERVAL
+        ));
+        assert_eq!(app.scroll_y, tail);
+        assert!(app.follow_tail);
+        app.transcript.clear();
+        wheel.apply(
+            &mut app,
+            MouseEventKind::ScrollUp,
+            40,
+            4,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(app.scroll_y, 0);
+    }
+
+    #[test]
+    fn wheel_coalescing_preserves_other_input_and_bounds_draining() {
+        use crossterm::event::{Event, MouseEvent};
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        for next in [
+            Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            Event::Resize(40, 10),
+            mouse(MouseEventKind::Moved),
+        ] {
+            let mut events = std::collections::VecDeque::from([
+                mouse(MouseEventKind::ScrollUp),
+                mouse(MouseEventKind::ScrollDown),
+                next.clone(),
+            ]);
+            let (kind, pending) =
+                super::coalesce_wheel_input(MouseEventKind::ScrollUp, || Ok(events.pop_front()))
+                    .unwrap();
+            assert_eq!(kind, MouseEventKind::ScrollDown);
+            assert_eq!(pending, Some(next));
+            assert!(events.is_empty());
+        }
+        let mut reads = 0;
+        super::coalesce_wheel_input(MouseEventKind::ScrollUp, || {
+            reads += 1;
+            Ok(Some(mouse(MouseEventKind::ScrollUp)))
+        })
+        .unwrap();
+        assert_eq!(reads, super::MAX_WHEEL_EVENTS_PER_FRAME - 1);
+        assert!(
+            super::coalesce_wheel_input(MouseEventKind::ScrollUp, || Err(std::io::Error::other(
+                "input failed"
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reload_silent_agent_cancels_before_restarting_and_leaves_active_agents_alone() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Claude");
+        app.apply_event(&AgentEvent::TurnStarted { slot: 0 });
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        super::request_agent_reload(&mut app, &sender, Instant::now());
+        assert!(receiver.try_recv().is_err());
+        super::request_agent_reload(&mut app, &sender, Instant::now() + Duration::from_secs(121));
+        assert!(matches!(receiver.try_recv(), Ok(AdapterControl::Cancel)));
+        assert!(matches!(receiver.try_recv(), Ok(AdapterControl::Reload(0))));
+        assert!(receiver.try_recv().is_err());
+        assert!(app.cancellation_pending());
     }
 
     #[test]

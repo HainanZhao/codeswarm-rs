@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-05
+
+### Added
+
+- `/goal` sets, shows, resumes, completes, and clears a persistent shared
+  objective. All adapters receive the goal through ordinary prompt context;
+  updates take effect at turn boundaries and resume restores saved goals.
+- Two-minute inactivity warnings with cancellation and reload controls.
+- Terminal, Light, and Dark themes, including persisted selection and
+  contrast-tested explicit palettes.
+
+### Changed
+
+- Commands now use `/exit`, `/settings`, and `/agent SLOT`. The old `/close`,
+  `/quit`, `/config`, and `/to` names are no longer local commands.
+- Roster review stops wait until every available roster member participates.
+- Footer timers are compact; wheel bursts are coalesced and speed-limited.
+- Rendering is event-driven, and streamed updates preserve completed-block
+  layout caches instead of rebuilding the entire transcript.
+
+### Fixed
+
+- Malformed ACP file-write requests cannot silently erase existing files.
+- ACP control requests and startup have deadlines and cancellable startup.
+- Failed metadata writes retain the newest snapshot, retry, and report errors.
+- Replacement agents retain the original task after public-journal pruning.
+- Command help, completion, argument validation, and documentation agree.
+
 ## [0.8.12] - 2026-09-04
 
 ### Fixed

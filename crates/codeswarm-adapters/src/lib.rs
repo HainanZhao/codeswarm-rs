@@ -16,6 +16,7 @@ pub mod agents;
 pub mod collaboration;
 pub mod contract;
 pub mod details;
+pub mod goal;
 pub mod history;
 pub mod launcher;
 pub mod persistence;
@@ -131,6 +132,9 @@ pub enum RosterUpdate {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AgentEvent {
+    GoalUpdated {
+        goal: Option<goal::Goal>,
+    },
     RosterUpdated {
         update: RosterUpdate,
     },
@@ -248,6 +252,8 @@ impl Default for AgentSlot {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionState {
+    #[serde(default)]
+    pub goal: Option<goal::Goal>,
     pub slots: Vec<AgentSlot>,
     pub active_slot: Option<RosterSlot>,
     pub queued_prompts: VecDeque<(RosterSlot, String)>,
@@ -261,6 +267,7 @@ impl SessionState {
             active_slot: None,
             queued_prompts: VecDeque::new(),
             public_text: Vec::new(),
+            goal: None,
         }
     }
 }
@@ -269,6 +276,10 @@ impl SessionState {
 /// never performed in the reducer.
 pub fn reduce(state: &mut SessionState, event: AgentEvent) -> Vec<Effect> {
     match event {
+        AgentEvent::GoalUpdated { goal } => {
+            state.goal = goal;
+            vec![Effect::Render]
+        }
         AgentEvent::RosterUpdated { .. } => vec![Effect::Render],
         AgentEvent::Ready { slot, capabilities } => {
             if let Some(agent) = state.slots.get_mut(slot) {

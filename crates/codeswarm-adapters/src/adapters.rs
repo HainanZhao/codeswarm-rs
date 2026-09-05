@@ -417,6 +417,7 @@ impl std::fmt::Debug for SlotMappedAdapter {
 
 fn map_event_slot(event: AgentEvent, slot: RosterSlot) -> AgentEvent {
     match event {
+        AgentEvent::GoalUpdated { goal } => AgentEvent::GoalUpdated { goal },
         AgentEvent::RosterUpdated { update } => AgentEvent::RosterUpdated { update },
         AgentEvent::Ready { capabilities, .. } => AgentEvent::Ready { slot, capabilities },
         AgentEvent::TurnStarted { .. } => AgentEvent::TurnStarted { slot },
@@ -698,6 +699,7 @@ impl AdapterHost {
 /// Sequential multi-adapter runner. It intentionally never polls two
 /// adapters concurrently: the next prompt depends on the prior response.
 pub struct RelayHost {
+    goal: Option<crate::goal::Goal>,
     hosts: Vec<AdapterHost>,
     relay: Relay,
     introduced: Vec<bool>,
@@ -895,6 +897,7 @@ impl RelayHost {
             metadata_workspace: None,
             hosts,
             dispatches: Vec::new(),
+            goal: None,
             event_sink: None,
             cancel_requested: Arc::new(AtomicBool::new(false)),
             cancel_notify: Arc::new(Notify::new()),
@@ -948,6 +951,10 @@ impl RelayHost {
     pub fn session_metadata(&self) -> SessionMetadata {
         let active = self.relay.active_slots().collect::<Vec<_>>();
         let mut data = serde_json::Map::new();
+        data.insert(
+            "goal".into(),
+            serde_json::to_value(&self.goal).expect("goal serializes"),
+        );
         if let Some(workspace) = &self.metadata_workspace {
             data.insert("cwd".into(), serde_json::Value::String(workspace.clone()));
         }
@@ -1012,6 +1019,30 @@ impl RelayHost {
                 .map_err(|error| AdapterError::Transport(error.to_string()))?;
         }
         Ok(())
+    }
+
+    pub fn restore_goal(&mut self, goal: Option<crate::goal::Goal>) {
+        self.goal = goal;
+        if let Some(sink) = &self.event_sink {
+            sink(AgentEvent::GoalUpdated {
+                goal: self.goal.clone(),
+            });
+        }
+    }
+
+    pub fn apply_goal(
+        &mut self,
+        command: crate::goal::GoalCommand,
+    ) -> Result<Option<String>, String> {
+        let task = crate::goal::apply(&mut self.goal, command)?;
+        if let Some(sink) = &self.event_sink {
+            sink(AgentEvent::GoalUpdated {
+                goal: self.goal.clone(),
+            });
+        }
+        self.queue_session_metadata()
+            .map_err(|error| error.to_string())?;
+        Ok(task)
     }
 
     pub fn roster_names(&self) -> &[String] {
@@ -1365,9 +1396,6 @@ impl RelayHost {
         first_slot: RosterSlot,
         mut permissions: Option<&mut tokio::sync::mpsc::UnboundedReceiver<RelayPermissionAnswer>>,
     ) -> AdapterResult<RelayDecision> {
-        if self.relay.shared_task().is_none() {
-            self.relay.set_shared_task(task.clone());
-        }
         let decision = self.relay.begin(task, first_slot);
         let RelayDecision::Dispatch {
             slot,
@@ -1391,6 +1419,9 @@ impl RelayHost {
         // adapter I/O also preserves the job when the selected turn is
         // cancelled.
         if !*direct && !prompt.trim().is_empty() {
+            if self.relay.shared_task().is_none() {
+                self.relay.set_shared_task(prompt.clone());
+            }
             self.relay
                 .record_public(public_context_speaker("User"), prompt.clone());
         }
@@ -1414,9 +1445,15 @@ impl RelayHost {
                     format!("{}. {name}{role}", candidate.saturating_add(1))
                 })
                 .collect::<Vec<_>>();
+            let shared_task = self
+                .relay
+                .shared_task()
+                .filter(|task| *task != prompt)
+                .map(|task| format!("\n\nShared task:\n{task}"))
+                .unwrap_or_default();
             format!(
                 "You are {self_name}.\nCodeSwarm roster (ordered):\n{}\n\
-                 Turns relay sequentially through this roster. Treat the user request as the shared task; use timestamped public updates as conversation context.",
+                 Turns relay sequentially through this roster. Treat the user request as the shared task; use timestamped public updates as conversation context.{shared_task}",
                 roster.join("\n")
             )
         } else {
@@ -1440,6 +1477,7 @@ impl RelayHost {
             .hosts
             .get_mut(*slot)
             .ok_or_else(|| AdapterError::Transport("relay selected missing adapter".into()))?;
+        let prompt = crate::goal::prompt(self.goal.as_ref(), &prompt);
         if let Err(error) = host.send_prompt(prompt.clone()).await {
             let limited =
                 report_relay_failure(&mut self.relay, &event_sink, *slot, true, error.to_string());
@@ -2281,6 +2319,26 @@ impl AcpAdapter {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> AdapterResult<Value> {
+        self.request_with_timeout(method, params, std::time::Duration::from_secs(30))
+            .await
+    }
+
+    async fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: std::time::Duration,
+    ) -> AdapterResult<Value> {
+        tokio::time::timeout(deadline, self.request_inner(method, params))
+            .await
+            .map_err(|_| {
+                AdapterError::Transport(format!(
+                    "ACP {method} timed out; reload the agent to retry"
+                ))
+            })?
+    }
+
+    async fn request_inner(&mut self, method: &str, params: Value) -> AdapterResult<Value> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         self.write_json(serde_json::json!({
@@ -2307,7 +2365,10 @@ impl AcpAdapter {
             if self.handle_client_request(&value).await? {
                 continue;
             }
-            if value.get("id").and_then(Value::as_u64) == Some(request_id) {
+            if value
+                .get("id")
+                .is_some_and(|id| rpc_id_to_string(id) == request_id.to_string())
+            {
                 if let Some(error) = value.get("error") {
                     return Err(AdapterError::Protocol(error.to_string()));
                 }
@@ -2445,6 +2506,20 @@ impl AcpAdapter {
         } else {
             Ok(selected)
         }
+    }
+
+    fn write_workspace_text(&self, params: &Value) -> Result<(), String> {
+        let path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or("path must be a non-empty string")?;
+        let content = params
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or("content must be a string")?;
+        let path = self.workspace_path(path)?;
+        std::fs::write(path, content).map_err(|error| error.to_string())
     }
 
     async fn terminal_create(&mut self, params: &Value) -> Result<Value, String> {
@@ -2628,11 +2703,7 @@ impl AcpAdapter {
                 }
             }
             "fs/write_text_file" => {
-                let path = params.get("path").and_then(Value::as_str).unwrap_or("");
-                let content = params.get("content").and_then(Value::as_str).unwrap_or("");
-                let result = self.workspace_path(path).and_then(|path| {
-                    std::fs::write(path, content).map_err(|error| error.to_string())
-                });
+                let result = self.write_workspace_text(&params);
                 match result {
                     Ok(()) => serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {}}),
                     Err(message) => serde_json::json!({
@@ -3568,6 +3639,183 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("{stem}-{}-{nonce}.{extension}", std::process::id()))
+    }
+
+    #[test]
+    fn malformed_file_writes_preserve_existing_content() {
+        let root = unique_test_path("codeswarm-write-validation", "dir");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("keep.txt");
+        std::fs::write(&file, "valuable content").unwrap();
+        let adapter = AcpAdapter::new(0, root.clone(), "unused", Vec::new());
+        for content in [
+            Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(42),
+            serde_json::json!([]),
+        ] {
+            assert!(
+                adapter
+                    .write_workspace_text(
+                        &serde_json::json!({"path":"keep.txt", "content": content})
+                    )
+                    .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "valuable content");
+        }
+        assert!(
+            adapter
+                .write_workspace_text(&serde_json::json!({"path":"keep.txt"}))
+                .is_err()
+        );
+        assert!(
+            adapter
+                .write_workspace_text(&serde_json::json!({"path": null, "content":"replacement"}))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "valuable content");
+        adapter
+            .write_workspace_text(&serde_json::json!({"path":"keep.txt", "content":"replacement"}))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "replacement");
+        adapter
+            .write_workspace_text(&serde_json::json!({"path":"keep.txt", "content":""}))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn silent_acp_control_request_times_out_and_transport_can_be_stopped() {
+        let script = r#"read _; echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{}}}'; read _; echo '{"jsonrpc":"2.0","id":"2","result":{"sessionId":"s"}}'; read _; read _"#;
+        let mut adapter = AcpAdapter::new(
+            0,
+            std::env::current_dir().unwrap(),
+            "sh",
+            vec!["-c".into(), script.into()],
+        );
+        adapter.start().await.unwrap();
+        let error = adapter
+            .request_with_timeout(
+                "session/set_mode",
+                serde_json::json!({}),
+                std::time::Duration::from_millis(10),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("session/set_mode timed out"));
+        adapter.stop().await.unwrap();
+        assert!(adapter.child.is_none());
+    }
+
+    #[tokio::test]
+    async fn goals_reach_every_roster_slot_without_native_goal_support() {
+        use crate::goal::GoalCommand;
+        let hosts = (0..3)
+            .map(|slot| {
+                AdapterHost::new(
+                    Box::new(ScriptedAdapter::new(
+                        slot,
+                        AgentCapabilities::default(),
+                        [
+                            AgentEvent::TurnComplete { slot },
+                            AgentEvent::TurnComplete { slot },
+                        ],
+                    )),
+                    None,
+                )
+            })
+            .collect();
+        let mut relay = RelayHost::new(hosts, 10).unwrap();
+        relay.start().await.unwrap();
+        let task = relay
+            .apply_goal(GoalCommand::Set("Ship the settings screen".into()))
+            .unwrap()
+            .unwrap();
+        relay.relay_mut().enqueue_human(task, Some(0));
+        for slot in 0..3 {
+            relay.run_turn("", 0).await.unwrap();
+            let (actual, prompt) = relay.dispatches().last().unwrap();
+            assert_eq!(*actual, slot);
+            assert!(prompt.contains("Active shared goal: Ship the settings screen"));
+        }
+        let snapshot = relay.session_metadata();
+        let restored = crate::goal::Goal::from_metadata(snapshot.get("goal").unwrap());
+        assert!(restored.is_some());
+        relay.restore_goal(restored);
+        relay.reload(0).await.unwrap();
+        relay.run_turn("", 0).await.unwrap();
+        assert!(
+            relay
+                .dispatches()
+                .last()
+                .unwrap()
+                .1
+                .contains("Active shared goal: Ship the settings screen")
+        );
+        relay.apply_goal(GoalCommand::Done).unwrap();
+        relay.run_turn("", 0).await.unwrap();
+        assert!(
+            relay
+                .dispatches()
+                .last()
+                .unwrap()
+                .1
+                .contains("No active shared goal")
+        );
+        relay.apply_goal(GoalCommand::Clear).unwrap();
+        assert!(relay.session_metadata().get("goal").unwrap().is_null());
+    }
+
+    #[tokio::test]
+    async fn replacement_agent_receives_task_after_public_journal_pruning() {
+        let hosts = (0..2)
+            .map(|slot| {
+                AdapterHost::new(
+                    Box::new(ScriptedAdapter::new(
+                        slot,
+                        AgentCapabilities::default(),
+                        [
+                            AgentEvent::Text {
+                                slot,
+                                text: "progress".into(),
+                            },
+                            AgentEvent::TurnComplete { slot },
+                            AgentEvent::Text {
+                                slot,
+                                text: "more progress".into(),
+                            },
+                            AgentEvent::TurnComplete { slot },
+                        ],
+                    )),
+                    None,
+                )
+            })
+            .collect();
+        let mut relay = RelayHost::new(hosts, 10).unwrap();
+        relay.start().await.unwrap();
+        relay
+            .relay_mut()
+            .enqueue_human("Fix the login bug", Some(0));
+        relay.run_turn("", 0).await.unwrap();
+        relay.run_turn("", 0).await.unwrap();
+        relay.run_turn("", 0).await.unwrap();
+        relay.reload(1).await.unwrap();
+        assert!(
+            !relay
+                .relay_mut()
+                .unseen_context(1)
+                .contains("Fix the login bug")
+        );
+        relay.run_turn("", 0).await.unwrap();
+        assert!(
+            relay
+                .dispatches()
+                .last()
+                .unwrap()
+                .1
+                .contains("Shared task:\nFix the login bug")
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -5417,6 +5665,39 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn codex_stop_does_not_skip_later_roster_reviewers() {
+        let hosts = (0..3)
+            .map(|slot| {
+                AdapterHost::new(
+                    Box::new(ScriptedAdapter::new(
+                        slot,
+                        AgentCapabilities::default(),
+                        [
+                            AgentEvent::Text {
+                                slot,
+                                text: STOP_TOKEN.into(),
+                            },
+                            AgentEvent::TurnComplete { slot },
+                        ],
+                    )),
+                    None,
+                )
+            })
+            .collect();
+        let mut relay = RelayHost::new(hosts, 10).expect("relay");
+        relay.set_roster_names(vec!["Claude".into(), "Codex".into(), "Qwen".into()]);
+        relay.start().await.expect("start");
+        for expected in 0..3 {
+            assert!(matches!(relay.run_turn("task", 0).await.expect("turn"),
+                RelayDecision::Dispatch { slot, can_stop, .. } if slot == expected && can_stop == (expected == 2)));
+        }
+        assert_eq!(
+            relay.run_turn("", 0).await.expect("complete"),
+            RelayDecision::Complete
+        );
     }
 
     #[tokio::test]

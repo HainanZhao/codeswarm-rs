@@ -6,6 +6,36 @@
 
 use std::time::{Duration, Instant};
 
+/// The synchronous frontend redraws only on input/state changes or a visible
+/// timer deadline. Polling background channels does not itself dirty a frame.
+#[derive(Clone, Debug)]
+pub struct RedrawSchedule {
+    dirty: bool,
+    deadline: Option<Instant>,
+}
+
+impl Default for RedrawSchedule {
+    fn default() -> Self {
+        Self {
+            dirty: true,
+            deadline: None,
+        }
+    }
+}
+
+impl RedrawSchedule {
+    pub fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+    pub fn needs_draw(&self, now: Instant) -> bool {
+        self.dirty || self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+    pub fn did_draw(&mut self, deadline: Option<Instant>) {
+        self.dirty = false;
+        self.deadline = deadline;
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Frame {
     pub bytes: Vec<u8>,

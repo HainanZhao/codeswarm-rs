@@ -71,28 +71,28 @@ bounded to preserve tmux responsiveness.
 ## Slash commands
 
 - `/help` — show the complete keyboard and command guide.
-- `/config` — open settings.
-- `/agents` — open roster settings without stopping the session.
-- `/add AGENT`, `/add agy:COMMAND`, or `/add acp:COMMAND` — append a live peer
-  without restarting the current conversation.
+- `/goal OBJECTIVE` — set a shared goal and start work. `/goal` shows its status;
+  `/goal run` resumes an active goal, `/goal done` marks it complete, and
+  `/goal clear` removes it. Goal changes apply at the next turn boundary.
+- `/settings` — open settings, including the roster, modes, and theme.
 - `/export` — write the retained transcript to a timestamped Markdown file.
-- `/diff split` and `/diff unified` — choose side-by-side or inline diff rows.
-- `/mode` — focus mode settings; `/mode chat` selects chat mode.
-- `/collab` — focus collaboration settings;
-  `/collab roster`, `/collab manual`, and `/collab pair` select a strategy.
-- `/reload` — retry the most recently crashed adapter in place.
-- `/drop` — remove the most recently crashed peer; `/drop SLOT` removes a
-  peer by zero-based roster slot (slot 0 is the owner).
-- `/promote SLOT` — transfer ownership to an active peer without restarting
-  it; the former owner remains in its stable slot and is tombstoned.
-- `/swap A B` — reorder two active roster slots without restarting their
-  adapters; queued work follows the agents.
-- `/to SLOT` — select any active roster slot for the next message.
+- `/reload` — cancel and restart a silent adapter, or retry a crashed adapter
+  in place. Two minutes without activity shows a warning in the status ribbon;
+  silence never cancels a turn automatically.
+- `/agent SLOT` — select an active agent by zero-based roster slot for the next message.
+- `/select` — temporarily enable terminal text selection.
 - `/clear` — clear the local transcript.
 - `/cancel` — cancel the active turn when an adapter supports cancellation.
-- `/close`, `/quit`, and `/exit` — leave the session.
+- `/exit` — leave the session.
 
-Unknown slash commands are reported locally and are never sent to an agent.
+Extra arguments to commands that take none show a usage hint.
+Agent-advertised commands are sent to the agent; unrecognized
+slash commands are reported locally.
+
+Goals are sent as plain-text context to each roster agent, including adapters
+without native goal support. They preserve permissions and the relay turn
+limit. Mark completion explicitly with `/goal done`. Session resume restores
+the goal without starting work automatically; a fresh launch has no goal.
 
 The configuration panel includes a slot-based roster. The same catalog agent
 can occupy multiple slots, and each running slot can select and persist a

@@ -25,10 +25,12 @@ use tui_textarea::{TextArea, WrapMode};
 
 pub mod frame_scheduler;
 pub mod path_index;
+pub mod theme;
 pub use path_index::{
     MAX_INDEX_ENTRIES, MAX_PATH_RESULTS, MIN_PATH_QUERY_CHARS, PathCandidate, PathIndex,
     PathIndexUpdate, PathMatch, completion_values, insertion_text, rank_matches, scan_workspace,
 };
+pub use theme::Theme;
 
 const MAX_QUEUED_PROMPTS: usize = 100;
 // Theme-adaptive chrome: let the terminal own its canvas and text colors,
@@ -96,13 +98,79 @@ pub enum PermissionAction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalCommand {
+    Goal(codeswarm_adapters::goal::GoalCommand),
     Handled,
-    Close,
+    Exit,
     Cancel,
     Export,
     Reload,
     SelectAgent(usize),
     SelectText,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub usage: &'static str,
+}
+
+/// One canonical vocabulary for parsing, completion, and command help.
+pub const LOCAL_COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "/goal",
+        description: "Set, view, or manage the shared goal",
+        usage: codeswarm_adapters::goal::GOAL_USAGE,
+    },
+    CommandSpec {
+        name: "/agent",
+        description: "Choose the next agent",
+        usage: "/agent SLOT",
+    },
+    CommandSpec {
+        name: "/cancel",
+        description: "Cancel active work",
+        usage: "/cancel",
+    },
+    CommandSpec {
+        name: "/clear",
+        description: "Clear the local transcript",
+        usage: "/clear",
+    },
+    CommandSpec {
+        name: "/exit",
+        description: "Exit CodeSwarm",
+        usage: "/exit",
+    },
+    CommandSpec {
+        name: "/export",
+        description: "Export conversation Markdown",
+        usage: "/export",
+    },
+    CommandSpec {
+        name: "/help",
+        description: "Show keyboard and command help",
+        usage: "/help",
+    },
+    CommandSpec {
+        name: "/reload",
+        description: "Restart a silent or crashed agent",
+        usage: "/reload",
+    },
+    CommandSpec {
+        name: "/select",
+        description: "Temporarily enable text selection",
+        usage: "/select",
+    },
+    CommandSpec {
+        name: "/settings",
+        description: "Open settings",
+        usage: "/settings",
+    },
+];
+
+fn local_command_spec(command: &str) -> Option<&'static CommandSpec> {
+    LOCAL_COMMANDS.iter().find(|spec| spec.name == command)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -772,6 +840,7 @@ impl PermissionPrompt {
 
 #[derive(Clone, Debug)]
 struct ConfigSnapshot {
+    theme: Theme,
     follow_tail: bool,
     collapse_details: bool,
     notification_policy: NotificationPolicy,
@@ -821,6 +890,8 @@ const MAX_TOOL_HISTORY_ROWS: usize = 20;
 
 #[derive(Debug)]
 pub struct App {
+    goal: Option<codeswarm_adapters::goal::Goal>,
+    theme: Theme,
     pub transcript: Transcript,
     pub scroll_y: usize,
     pub follow_tail: bool,
@@ -872,6 +943,8 @@ pub struct App {
     agent_commands: BTreeMap<usize, Vec<AgentCommand>>,
     agent_usage: BTreeMap<usize, UsageUpdate>,
     agent_turn_started: BTreeMap<usize, Instant>,
+    agent_last_activity: BTreeMap<usize, Instant>,
+    inactivity_warning: Option<String>,
     cancelling_agents: BTreeSet<usize>,
     failed_agent: Option<usize>,
     queued_prompts: VecDeque<QueuedPrompt>,
@@ -896,10 +969,11 @@ pub struct App {
     next_agent: Option<usize>,
 }
 
-const CONFIG_SETTING_COUNT: usize = 13;
+const CONFIG_SETTING_COUNT: usize = 14;
 
 fn agent_event_slot(event: &AgentEvent) -> Option<usize> {
     match event {
+        AgentEvent::GoalUpdated { .. } => None,
         AgentEvent::Ready { slot, .. }
         | AgentEvent::TurnStarted { slot }
         | AgentEvent::ModesReplaced { slot, .. }
@@ -924,6 +998,8 @@ fn agent_event_slot(event: &AgentEvent) -> Option<usize> {
 impl Default for App {
     fn default() -> Self {
         Self {
+            goal: None,
+            theme: Theme::default(),
             transcript: Transcript::default(),
             scroll_y: 0,
             follow_tail: true,
@@ -975,6 +1051,8 @@ impl Default for App {
             agent_commands: BTreeMap::new(),
             agent_usage: BTreeMap::new(),
             agent_turn_started: BTreeMap::new(),
+            agent_last_activity: BTreeMap::new(),
+            inactivity_warning: None,
             cancelling_agents: BTreeSet::new(),
             failed_agent: None,
             queued_prompts: VecDeque::new(),
@@ -997,6 +1075,17 @@ impl Default for App {
 }
 
 impl App {
+    pub fn apply_local_goal(&mut self, command: codeswarm_adapters::goal::GoalCommand) {
+        match codeswarm_adapters::goal::apply(&mut self.goal, command) {
+            Ok(_) => {
+                self.status = self
+                    .goal
+                    .as_ref()
+                    .map_or_else(|| "Goal cleared".into(), |goal| goal.summary())
+            }
+            Err(error) => self.status = error,
+        }
+    }
     /// Return the configured empty-composer hint.
     pub fn prompt_message(&self) -> &str {
         &self.prompt_message
@@ -1012,16 +1101,43 @@ impl App {
     pub fn handle_local_command(&mut self, input: &str) -> Option<LocalCommand> {
         let mut parts = input.split_whitespace();
         let command = parts.next()?.to_ascii_lowercase();
-        let argument = parts.collect::<Vec<_>>().join(" ");
-        let result = match command.as_str() {
-            "/close" => LocalCommand::Close,
+        let argument = input
+            .trim_start()
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, rest)| rest.trim());
+        let spec = local_command_spec(&command);
+        if let Some(spec) = spec
+            && spec.name != "/agent"
+            && spec.name != "/goal"
+            && !argument.is_empty()
+        {
+            self.status = format!("usage: {}", spec.usage);
+            return Some(LocalCommand::Handled);
+        }
+        let canonical = spec.map_or(command.as_str(), |spec| spec.name);
+        let result = match canonical {
+            "/goal" => match codeswarm_adapters::goal::GoalCommand::parse(argument) {
+                Ok(codeswarm_adapters::goal::GoalCommand::Show) => {
+                    self.status = self.goal.as_ref().map_or_else(
+                        || "No goal set. Use /goal OBJECTIVE to start work.".into(),
+                        |goal| goal.summary(),
+                    );
+                    LocalCommand::Handled
+                }
+                Ok(command) => LocalCommand::Goal(command),
+                Err(error) => {
+                    self.status = error;
+                    LocalCommand::Handled
+                }
+            },
+            "/exit" => LocalCommand::Exit,
             "/cancel" => LocalCommand::Cancel,
             "/export" => LocalCommand::Export,
             "/reload" => LocalCommand::Reload,
-            "/to" => match argument.parse::<usize>() {
+            "/agent" => match argument.parse::<usize>() {
                 Ok(slot) => LocalCommand::SelectAgent(slot),
                 Err(_) => {
-                    self.status = "usage: /to SLOT".into();
+                    self.status = "usage: /agent SLOT".into();
                     LocalCommand::Handled
                 }
             },
@@ -1044,7 +1160,7 @@ impl App {
                 self.status = "conversation cleared".into();
                 LocalCommand::Handled
             }
-            "/config" => {
+            "/settings" => {
                 self.open_config();
                 LocalCommand::Handled
             }
@@ -1081,6 +1197,7 @@ impl App {
     fn begin_config(&mut self) {
         if !self.config_visible {
             self.config_snapshot = Some(ConfigSnapshot {
+                theme: self.theme,
                 follow_tail: self.follow_tail,
                 collapse_details: self.collapse_details,
                 notification_policy: self.notification_policy,
@@ -1389,6 +1506,7 @@ impl App {
                 self.config_visible = false;
                 self.full_repaint_requested = true;
                 if let Some(snapshot) = self.config_snapshot.take() {
+                    self.theme = snapshot.theme;
                     self.follow_tail = snapshot.follow_tail;
                     self.collapse_details = snapshot.collapse_details;
                     self.notification_policy = snapshot.notification_policy;
@@ -1637,7 +1755,8 @@ impl App {
                             self.terminal_title_blink = false;
                         }
                     }
-                    12 => {}
+                    12 => self.theme = self.theme.next(),
+                    13 => {}
                     _ => return ConfigAction::Ignored,
                 }
                 self.status = "configuration updated".into();
@@ -1648,6 +1767,15 @@ impl App {
 
     pub fn collapse_details(&self) -> bool {
         self.collapse_details
+    }
+
+    pub fn theme(&self) -> &'static str {
+        self.theme.as_str()
+    }
+
+    pub fn set_theme(&mut self, theme: &str) {
+        self.theme = Theme::from_setting(theme);
+        self.full_repaint_requested = true;
     }
 
     pub fn set_collapse_details(&mut self, collapsed: bool) {
@@ -1965,6 +2093,9 @@ impl App {
     }
 
     fn mark_agent_turn_started(&mut self, slot: usize) {
+        if !self.agent_turn_started.contains_key(&slot) {
+            self.agent_last_activity.insert(slot, Instant::now());
+        }
         self.next_agent = Some(slot);
         self.cancelling_agents.remove(&slot);
         self.agent_turn_started
@@ -1980,6 +2111,20 @@ impl App {
 
     pub fn cancellation_pending(&self) -> bool {
         !self.cancelling_agents.is_empty()
+    }
+
+    /// A silent turn remains live; this only exposes a recovery target.
+    pub fn inactive_agent(&self, now: Instant) -> Option<usize> {
+        self.agent_turn_started.keys().copied().find(|slot| {
+            !self.cancelling_agents.contains(slot)
+                && !self
+                    .permission
+                    .as_ref()
+                    .is_some_and(|request| request.slot == *slot)
+                && self.agent_last_activity.get(slot).is_some_and(|last| {
+                    now.saturating_duration_since(*last) >= Duration::from_secs(120)
+                })
+        })
     }
 
     pub fn finish_turn_cancellation(&mut self) {
@@ -2182,6 +2327,14 @@ impl App {
         if let Some(second_timer) = second_timer {
             self.agent_turn_started.insert(first, second_timer);
         }
+        let first_activity = self.agent_last_activity.remove(&first);
+        let second_activity = self.agent_last_activity.remove(&second);
+        if let Some(activity) = first_activity {
+            self.agent_last_activity.insert(second, activity);
+        }
+        if let Some(activity) = second_activity {
+            self.agent_last_activity.insert(first, activity);
+        }
         self.refresh_prompt_completions();
         if self.failed_agent == Some(first) {
             self.failed_agent = Some(second);
@@ -2205,6 +2358,17 @@ impl App {
     }
 
     fn refresh_status_banner(&mut self, now: Instant) {
+        self.inactivity_warning = self.inactive_agent(now).map(|slot| {
+            let seconds = now
+                .saturating_duration_since(self.agent_last_activity[&slot])
+                .as_secs();
+            format!(
+                "{}: no activity for {}:{:02} · Ctrl+C cancel · /reload restart",
+                self.agent_name(slot),
+                seconds / 60,
+                seconds % 60
+            )
+        });
         if self
             .status_banner
             .as_ref()
@@ -2357,6 +2521,9 @@ impl App {
             } else {
                 format!("/{name}")
             };
+            if local_command_spec(&value.to_ascii_lowercase()).is_some() {
+                continue;
+            }
             if !candidates.iter().any(|candidate| candidate == &value) {
                 candidates.push(value);
             }
@@ -2466,7 +2633,8 @@ impl App {
 
     /// Drain background index messages without waiting.  This is safe to call
     /// once per terminal frame and intentionally ignores stale queries.
-    pub fn poll_path_index(&mut self) {
+    pub fn poll_path_index(&mut self) -> bool {
+        let mut changed = false;
         let generation = self.path_index.as_ref().map(PathIndex::generation);
         let updates = self
             .path_index
@@ -2490,6 +2658,7 @@ impl App {
                     query,
                     matches,
                 } if Some(update_generation) == generation && query == self.path_query => {
+                    changed |= self.path_matches != matches;
                     self.path_matches = matches;
                     self.path_selection = self
                         .path_selection
@@ -2498,6 +2667,17 @@ impl App {
                 PathIndexUpdate::Matches { .. } => {}
             }
         }
+        changed
+    }
+
+    pub fn next_visual_deadline(&self, now: Instant) -> Option<Instant> {
+        let timer = (!self.agent_turn_started.is_empty()).then_some(now + Duration::from_secs(1));
+        self.status_banner
+            .as_ref()
+            .map(|banner| banner.expires_at)
+            .into_iter()
+            .chain(timer)
+            .min()
     }
 
     /// Return whether the compact file picker should be rendered.
@@ -2625,7 +2805,18 @@ impl App {
         }) {
             return;
         }
+        if let Some(slot) = agent_event_slot(event)
+            && self.agent_turn_started.contains_key(&slot)
+        {
+            self.agent_last_activity.insert(slot, Instant::now());
+        }
         match event {
+            AgentEvent::GoalUpdated { goal } => {
+                self.goal = goal.clone();
+                self.status = goal
+                    .as_ref()
+                    .map_or_else(|| "Goal cleared".into(), |goal| goal.summary());
+            }
             AgentEvent::RosterUpdated { update } => match update {
                 codeswarm_adapters::RosterUpdate::Added {
                     slot,
@@ -2905,7 +3096,7 @@ impl App {
                 }
                 let name = self.agent_name(*slot);
                 self.status = format!(
-                    "{name} out of credits — routed around · /reload in /config once recharged ({detail})"
+                    "{name} out of credits — routed around · /reload or manage agents in /settings once recharged ({detail})"
                 );
             }
             AgentEvent::Failed {
@@ -2936,7 +3127,7 @@ impl App {
                 }
                 self.failed_agent = Some(*slot);
                 self.status = if *started {
-                    format!("crashed: {detail} · /reload or remove in /config")
+                    format!("crashed: {detail} · /reload or remove in /settings")
                 } else {
                     format!("failed to start: {detail}")
                 };
@@ -3155,6 +3346,8 @@ impl App {
                     option,
                     option_id,
                 };
+                self.agent_last_activity
+                    .insert(request.slot, Instant::now());
                 self.permission = None;
                 self.status = "permission answered".into();
                 action
@@ -3164,6 +3357,8 @@ impl App {
                     slot: request.slot,
                     request_id: request.request_id.clone(),
                 };
+                self.agent_last_activity
+                    .insert(request.slot, Instant::now());
                 self.permission = None;
                 self.status = "permission cancelled".into();
                 action
@@ -3173,6 +3368,12 @@ impl App {
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    render_content(frame, app);
+    let area = frame.area();
+    app.theme.apply(frame.buffer_mut(), area);
+}
+
+fn render_content(frame: &mut Frame, app: &mut App) {
     app.sync_prompt_editor();
     app.poll_path_index();
     app.refresh_status_banner(Instant::now());
@@ -3638,7 +3839,7 @@ fn footer_agent_label(app: &App, slot: usize, active_count: usize) -> String {
     } else {
         app.agent_turn_started
             .get(&slot)
-            .map(|started| format!(" · {}", format_turn_elapsed(*started)))
+            .map(|started| format_turn_elapsed(*started))
             .unwrap_or_default()
     };
     format!("{arrow}{marker} {}{timer}", app.agent_name(slot))
@@ -3718,18 +3919,7 @@ fn render_path_picker(buffer: &mut Buffer, area: Rect, app: &App) {
 }
 
 fn command_description(command: &str) -> &'static str {
-    match command {
-        "/cancel" => "Stop active work",
-        "/clear" => "Clear this transcript",
-        "/close" => "Close CodeSwarm",
-        "/config" => "Open settings",
-        "/export" => "Export conversation Markdown",
-        "/help" => "Show keyboard and command help",
-        "/reload" => "Restart a crashed agent",
-        "/select" => "Temporarily enable text selection",
-        "/to" => "Choose the next agent",
-        _ => "Agent command",
-    }
+    local_command_spec(command).map_or("Agent command", |spec| spec.description)
 }
 
 fn render_command_palette(buffer: &mut Buffer, area: Rect, app: &App) {
@@ -3778,15 +3968,16 @@ fn render_status_banner(buffer: &mut Buffer, area: Rect, app: &App) {
     Paragraph::new("")
         .style(Style::default().bg(TRANSCRIPT_BG))
         .render(area, buffer);
-    let Some(banner) = &app.status_banner else {
-        return;
-    };
-    let (marker, color) = match banner.kind {
-        BannerKind::Info => ("·", ACCENT),
-        BannerKind::Error => ("!", Color::LightRed),
+    let (message, marker, color) = match (&app.status_banner, &app.inactivity_warning) {
+        (Some(banner), _) if banner.kind == BannerKind::Error => {
+            (banner.message.as_str(), "!", Color::LightRed)
+        }
+        (_, Some(warning)) => (warning.as_str(), "!", Color::Yellow),
+        (Some(banner), _) => (banner.message.as_str(), "·", ACCENT),
+        _ => return,
     };
     let message = compact_label(
-        &banner.message.replace(['\n', '\r', '\t'], " "),
+        &message.replace(['\n', '\r', '\t'], " "),
         area.width.saturating_sub(4) as usize,
     );
     Paragraph::new(Line::from(vec![
@@ -4110,8 +4301,8 @@ fn render_keyboard_help(buffer: &mut Buffer, area: Rect) {
         " Scroll: wheel or PgUp/PgDn · Ctrl+↑/↓ fine · End follow tail",
         " Input: Enter send · Shift+Enter newline · Tab complete",
         " Turn: Ctrl+Enter direct · Ctrl+C cancel · Ctrl+K cancel queued",
-        " Agents: /to SLOT /reload",
-        " Session: /config /clear /export /select /close",
+        " Agents: /agent SLOT /reload · Goal: /goal [objective|run|done|clear]",
+        " Session: /settings /clear /export /select /exit",
     ];
     Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>())
         .style(Style::default().fg(Color::Gray).bg(PANEL_BG))
@@ -4191,6 +4382,7 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
             if app.blink_title { "On" } else { "Off" },
             true,
         ),
+        ("Theme", app.theme.label(), true),
         ("Roster", "Space toggle · Alt/Shift+↑/↓ or [ ] order", false),
     ];
     let total_rows = rows.len().saturating_add(app.config_agents.len());
@@ -5096,7 +5288,7 @@ mod tests {
     #[test]
     fn prompt_editor_cycles_slash_command_completions() {
         let mut editor = PromptEditor::from_text("/h");
-        editor.set_completion_candidates(["/help", "/history", "/quit"]);
+        editor.set_completion_candidates(["/help", "/history", "/exit"]);
         assert!(editor.completion_matches().is_empty());
         assert_eq!(
             editor.handle_input(key(Key::Tab)),
@@ -6013,6 +6205,107 @@ mod tests {
     }
 
     #[test]
+    fn silent_turn_warning_uses_ribbon_and_clears_on_activity_and_reload() {
+        use codeswarm_adapters::AgentEvent;
+        let mut app = App::default();
+        app.set_agent_name(0, "Claude");
+        app.apply_event(&AgentEvent::TurnStarted { slot: 0 });
+        let now = std::time::Instant::now();
+        assert_eq!(
+            app.inactive_agent(now + std::time::Duration::from_secs(119)),
+            None
+        );
+        app.agent_last_activity
+            .insert(0, now - std::time::Duration::from_secs(1800));
+        let mut terminal = Terminal::new(TestBackend::new(120, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Claude: no activity for 30:00"), "{screen}");
+        assert!(screen.contains("Ctrl+C cancel · /reload restart"));
+        assert_eq!(app.transcript.len(), 0);
+        assert_eq!(app.agent_states[&0], "working");
+        assert!(!app.cancellation_pending());
+        app.apply_event(&AgentEvent::Thought {
+            slot: 0,
+            text: "checking".into(),
+        });
+        app.refresh_status_banner(std::time::Instant::now());
+        assert!(app.inactivity_warning.is_none());
+        app.agent_last_activity
+            .insert(0, now - std::time::Duration::from_secs(120));
+        assert_eq!(app.inactive_agent(now), Some(0));
+        app.mark_agent_reloaded(0);
+        assert_eq!(app.inactive_agent(now), None);
+        app.apply_event(&AgentEvent::TurnStarted { slot: 0 });
+        assert_eq!(app.inactive_agent(std::time::Instant::now()), None);
+        app.mark_agent_dropped(0);
+        app.apply_event(&AgentEvent::TurnStarted { slot: 0 });
+        assert_eq!(
+            app.inactive_agent(now + std::time::Duration::from_secs(3600)),
+            None
+        );
+    }
+
+    #[test]
+    fn permission_wait_is_not_inactivity_and_answer_restarts_the_clock() {
+        let mut app = App::default();
+        app.apply_event(&codeswarm_adapters::AgentEvent::Permission {
+            slot: 0,
+            request: codeswarm_adapters::PermissionRequest {
+                id: "approve".into(),
+                title: "Run command".into(),
+                options: vec!["Allow".into()],
+                option_ids: vec!["allow".into()],
+            },
+        });
+        let now = std::time::Instant::now();
+        app.agent_last_activity
+            .insert(0, now - std::time::Duration::from_secs(1800));
+        assert_eq!(app.inactive_agent(now), None);
+        assert!(matches!(
+            app.handle_permission_key(PermissionKey::Confirm),
+            PermissionAction::Answer { .. }
+        ));
+        assert_eq!(app.inactive_agent(std::time::Instant::now()), None);
+        app.agent_last_activity
+            .insert(0, now - std::time::Duration::from_secs(1800));
+        app.status = "unable to save settings".into();
+        app.refresh_status_banner(now);
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 120, 1));
+        super::render_status_banner(&mut buffer, ratatui::layout::Rect::new(0, 0, 120, 1), &app);
+        let text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("unable to save settings"));
+        assert!(!text.contains("no activity"));
+    }
+
+    #[test]
+    fn silence_tracking_follows_roster_swaps_and_excludes_cancellation() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Claude");
+        app.set_agent_name(1, "Codex");
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnStarted { slot: 0 });
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(121);
+        assert_eq!(app.inactive_agent(later), Some(0));
+        assert!(!app.swap_agents(0, 99));
+        assert!(app.swap_agents(0, 1));
+        assert_eq!(app.inactive_agent(later), Some(1));
+        app.request_turn_cancellation();
+        assert_eq!(app.inactive_agent(later), None);
+        app.finish_turn_cancellation();
+        assert_eq!(app.inactive_agent(later), None);
+    }
+
+    #[test]
     fn footer_timer_covers_the_whole_turn_and_wait_stays_out_of_transcript() {
         let mut app = App::default();
         app.set_agent_name(0, "Codex");
@@ -6028,7 +6321,23 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(65),
         );
         assert_eq!(format_turn_elapsed(app.agent_turn_started[&0]), "1:05");
-        assert!(footer_agent_label(&app, 0, 1).contains("Codex · 1:05"));
+        assert!(footer_agent_label(&app, 0, 1).contains("Codex1:05"));
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render");
+        let footer = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(120)
+            .last()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(footer.contains("Codex1:05"), "{footer}");
+        assert!(!footer.contains("Codex ·"), "{footer}");
         let blocks_before_wait = app.transcript.len();
 
         for status in [
@@ -6046,7 +6355,7 @@ mod tests {
             });
         }
         assert_eq!(app.transcript.len(), blocks_before_wait);
-        assert!(footer_agent_label(&app, 0, 1).contains("· 1:05"));
+        assert!(footer_agent_label(&app, 0, 1).contains("Codex1:05"));
         assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
 
         app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
@@ -6090,7 +6399,7 @@ mod tests {
             slot: 0,
             text: "working".into(),
         });
-        assert!(footer_agent_label(&app, 0, 1).contains("· 0:00"));
+        assert!(footer_agent_label(&app, 0, 1).contains("Codex0:00"));
 
         app.request_turn_cancellation();
         assert!(app.cancellation_pending());
@@ -6233,8 +6542,14 @@ mod tests {
             .find(|cell| cell.symbol() == "G")
             .map(|cell| cell.fg)
             .expect("Gemini footer/header cell");
-        assert_eq!(footer_color, agent_slot_color(1));
-        assert_ne!(footer_color, agent_slot_color(0));
+        assert_eq!(footer_color, Color::Yellow);
+        assert!(cells.iter().filter(|cell| cell.symbol() == "G").count() >= 2);
+        assert!(
+            cells
+                .iter()
+                .filter(|cell| cell.symbol() == "G")
+                .all(|cell| cell.fg == footer_color)
+        );
     }
 
     #[test]
@@ -6255,7 +6570,7 @@ mod tests {
     fn local_commands_do_not_become_agent_prompts() {
         let mut app = App::default();
         assert_eq!(
-            app.handle_local_command("/config"),
+            app.handle_local_command("/settings"),
             Some(LocalCommand::Handled)
         );
         assert_eq!(app.status, "configuration");
@@ -6269,17 +6584,151 @@ mod tests {
             app.handle_config_key(ConfigKey::Cancel),
             ConfigAction::Cancel
         );
-        assert_eq!(
-            app.handle_local_command("/close"),
-            Some(LocalCommand::Close)
-        );
+        assert_eq!(app.handle_local_command("/exit"), Some(LocalCommand::Exit));
         assert_eq!(app.handle_local_command("ordinary text"), None);
+    }
+
+    #[test]
+    fn goal_commands_preserve_objectives_and_show_state_in_the_ribbon() {
+        use codeswarm_adapters::goal::{Goal, GoalCommand, GoalStatus};
+        let mut app = App::default();
+        assert_eq!(
+            app.handle_local_command("/goal"),
+            Some(LocalCommand::Handled)
+        );
+        assert!(app.status.contains("No goal set"));
+        assert_eq!(
+            app.handle_local_command("/goal Fix login\n  keep sessions"),
+            Some(LocalCommand::Goal(GoalCommand::Set(
+                "Fix login\n  keep sessions".into()
+            )))
+        );
+        assert_eq!(
+            app.handle_local_command("/goal run extra"),
+            Some(LocalCommand::Handled)
+        );
+        assert!(app.status.starts_with("usage:"));
+        app.apply_event(&codeswarm_adapters::AgentEvent::GoalUpdated {
+            goal: Some(Goal {
+                objective: "Fix login".into(),
+                status: GoalStatus::Active,
+            }),
+        });
+        app.handle_local_command("/goal");
+        let mut terminal = Terminal::new(TestBackend::new(96, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Goal active: Fix login"));
+        app.apply_local_goal(GoalCommand::Done);
+        app.handle_local_command("/goal");
+        assert!(app.status.contains("completed"));
+        app.apply_local_goal(GoalCommand::Clear);
+        app.handle_local_command("/goal");
+        assert!(app.status.contains("No goal set"));
+    }
+
+    #[test]
+    fn canonical_command_names_are_case_insensitive_and_validate_arguments() {
+        for command in ["/exit", " /EXIT "] {
+            let mut app = App::default();
+            assert_eq!(app.handle_local_command(command), Some(LocalCommand::Exit));
+        }
+        let mut app = App::default();
+        for command in ["/settings", "/SETTINGS"] {
+            assert_eq!(
+                app.handle_local_command(command),
+                Some(LocalCommand::Handled)
+            );
+            assert!(app.config_visible());
+            app.handle_config_key(ConfigKey::Cancel);
+        }
+        for command in ["/agent 2", "/AGENT 2"] {
+            assert_eq!(
+                app.handle_local_command(command),
+                Some(LocalCommand::SelectAgent(2))
+            );
+        }
+        for command in ["/agent", "/agent -1", "/agent two", "/agent 1 extra"] {
+            assert_eq!(
+                app.handle_local_command(command),
+                Some(LocalCommand::Handled)
+            );
+            assert_eq!(app.status, "usage: /agent SLOT");
+        }
+        app.transcript.append(BlockKind::Agent, "keep this", false);
+        for command in ["/exit extra", "/clear extra"] {
+            assert_eq!(
+                app.handle_local_command(command),
+                Some(LocalCommand::Handled)
+            );
+            assert!(app.status.starts_with("usage: /"));
+            assert_eq!(app.transcript.len(), 1);
+        }
+    }
+
+    #[test]
+    fn command_palette_uses_canonical_names_with_replaced_provider_catalogs() {
+        let mut app = App::default();
+        app.set_prompt_completions(super::LOCAL_COMMANDS.iter().map(|spec| spec.name));
+        for commands in [
+            vec!["/exit", "review", "/settings"],
+            vec!["review-new"],
+            vec![],
+        ] {
+            app.apply_event(&codeswarm_adapters::AgentEvent::CommandsReplaced {
+                slot: 0,
+                commands: commands
+                    .iter()
+                    .map(|name| codeswarm_adapters::AgentCommand {
+                        name: (*name).into(),
+                    })
+                    .collect(),
+            });
+            app.prompt = "/".into();
+            app.sync_prompt_editor();
+            let suggestions = app.prompt_editor.slash_suggestions();
+            assert!(suggestions.contains(&"/exit"));
+            assert!(
+                !suggestions
+                    .iter()
+                    .any(|command| matches!(*command, "/close" | "/quit" | "/config" | "/to"))
+            );
+            assert_eq!(
+                app.handle_local_command("/review-new").is_none(),
+                commands.contains(&"review-new")
+            );
+        }
+        app.prompt = "/ex".into();
+        let mut terminal = Terminal::new(TestBackend::new(96, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            screen.contains("/exit") && screen.contains("Exit CodeSwarm"),
+            "{screen}"
+        );
+        assert!(!screen.contains("/close"));
     }
 
     #[test]
     fn canonical_commands_remain_and_config_duplicates_are_rejected() {
         let mut app = App::default();
         for removed in [
+            "/close",
+            "/quit",
+            "/config",
+            "/to 2",
             "/mode chat",
             "/collab manual",
             "/agents",
@@ -6288,8 +6737,6 @@ mod tests {
             "/diff split",
             "/drop",
             "/drop 2",
-            "/quit",
-            "/exit",
         ] {
             assert_eq!(
                 app.handle_local_command(removed),
@@ -6298,7 +6745,7 @@ mod tests {
             assert!(app.status.starts_with("unknown command:"), "{removed}");
         }
         assert_eq!(
-            app.handle_local_command("/to 12"),
+            app.handle_local_command("/agent 12"),
             Some(LocalCommand::SelectAgent(12))
         );
         assert_eq!(
@@ -6310,7 +6757,7 @@ mod tests {
     #[test]
     fn cancelling_configuration_restores_mode_and_collaboration() {
         let mut app = App::default();
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         app.handle_config_key(ConfigKey::Confirm);
         assert!(!app.follow_tail);
         for _ in 0..3 {
@@ -6341,7 +6788,7 @@ mod tests {
             .expect("draw baseline");
         let baseline = terminal.backend().buffer().clone();
 
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         terminal
             .draw(|frame| render(frame, &mut app))
             .expect("draw config");
@@ -6376,7 +6823,7 @@ mod tests {
             ],
             current_mode: Some("full-access".into()),
         });
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         app.handle_config_key(ConfigKey::Down);
         app.handle_config_key(ConfigKey::Down);
         app.handle_config_key(ConfigKey::Down);
@@ -6414,7 +6861,7 @@ mod tests {
                 model: None,
             },
         ]);
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         for _ in 0..15 {
             app.handle_config_key(ConfigKey::Down);
         }
@@ -6699,7 +7146,7 @@ mod tests {
     #[test]
     fn notification_preference_is_a_persistent_config_value() {
         let mut app = App::default();
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         app.handle_config_key(ConfigKey::Down);
         app.handle_config_key(ConfigKey::Down);
         assert!(app.notifications_enabled());
@@ -6765,7 +7212,7 @@ mod tests {
     fn blink_title_is_a_persistent_config_toggle() {
         let mut app = App::default();
         assert!(app.blink_title_enabled());
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         for _ in 0..11 {
             app.handle_config_key(ConfigKey::Down);
         }
@@ -6782,7 +7229,7 @@ mod tests {
     #[test]
     fn detail_preferences_control_thought_and_tool_initial_visibility() {
         let mut app = App::default();
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         for _ in 0..6 {
             app.handle_config_key(ConfigKey::Down);
         }
@@ -6817,7 +7264,7 @@ mod tests {
     #[test]
     fn scrollbar_preference_toggles_the_cached_indicator() {
         let mut app = App::default();
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         for _ in 0..9 {
             app.handle_config_key(ConfigKey::Down);
         }
@@ -6873,7 +7320,7 @@ mod tests {
         let mut app = App::default();
         assert!(app.sounds_enabled());
         assert!(app.notifications_enabled());
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         for _ in 0..10 {
             app.handle_config_key(ConfigKey::Down);
         }
@@ -6966,7 +7413,7 @@ mod tests {
             selected: true,
             model: None,
         }]);
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         terminal
             .draw(|frame| render(frame, &mut app))
             .expect("draw config");
@@ -7013,7 +7460,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("/export"), "rendered={rendered:?}");
-        assert!(rendered.contains("/config"), "rendered={rendered:?}");
+        assert!(rendered.contains("/settings"), "rendered={rendered:?}");
         assert!(!rendered.contains("/collab"), "rendered={rendered:?}");
         assert!(!rendered.contains("/mode"), "rendered={rendered:?}");
         assert!(rendered.contains("/clear"), "rendered={rendered:?}");
@@ -7180,11 +7627,42 @@ mod tests {
     }
 
     #[test]
+    fn theme_selection_renders_and_discard_restores_the_previous_palette() {
+        let mut app = App::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        for theme in ["light", "dark", "terminal", "invalid"] {
+            app.set_theme(theme);
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let background = terminal.backend().buffer()[(0, 0)].bg;
+            assert_eq!(
+                background,
+                match theme {
+                    "light" => Color::Rgb(250, 250, 250),
+                    "dark" => Color::Rgb(20, 22, 26),
+                    _ => Color::Reset,
+                }
+            );
+        }
+        app.set_theme("light");
+        app.open_config();
+        app.config_selected = 12;
+        app.handle_config_key(ConfigKey::Confirm);
+        assert_eq!(app.theme(), "dark");
+        app.handle_config_key(ConfigKey::Cancel);
+        assert_eq!(app.theme(), "light");
+        app.open_config();
+        app.config_selected = 12;
+        app.handle_config_key(ConfigKey::Confirm);
+        app.handle_config_key(ConfigKey::Save);
+        assert_eq!(app.theme(), "dark");
+    }
+
+    #[test]
     fn compact_config_and_store_surfaces_fit_a_mobile_sized_pane() {
         let backend = TestBackend::new(32, 8);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
-        app.handle_local_command("/config");
+        app.handle_local_command("/settings");
         terminal
             .draw(|frame| render(frame, &mut app))
             .expect("draw compact config");
@@ -7198,7 +7676,7 @@ mod tests {
         assert!(config.contains("Follow"), "rendered={config:?}");
         assert!(config.contains("Ctrl+S Save"), "rendered={config:?}");
         assert!(config.contains("Esc Discard"), "rendered={config:?}");
-        for _ in 0..12 {
+        for _ in 0..CONFIG_SETTING_COUNT - 1 {
             app.handle_config_key(ConfigKey::Down);
         }
         terminal
@@ -7786,7 +8264,7 @@ mod tests {
         app.set_agent_name(0, "Codex");
         app.transcript.append(
             BlockKind::Agent,
-            (0..400)
+            (0..50_000)
                 .map(|index| format!("word{index}"))
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -7808,10 +8286,14 @@ mod tests {
             .collect::<String>();
 
         let content_height = app.content_height(10);
-        app.scroll_by(-3, 60, content_height);
-        terminal
-            .draw(|frame| render(frame, &mut app))
-            .expect("draw scrolled transcript");
+        let tail = app.scroll_y;
+        for _ in 0..10 {
+            app.scroll_by(-3, 60, content_height);
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .expect("draw scrolled transcript");
+        }
+        assert_eq!(app.scroll_y, tail - 30);
         let footer_after = terminal
             .backend()
             .buffer()

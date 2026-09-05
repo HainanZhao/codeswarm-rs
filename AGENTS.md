@@ -36,8 +36,15 @@
 - Each agent receives the ordered public human and agent-message updates it has
   not seen since its previous turn. Only streamed message text enters this
   journal; tool calls, thoughts, terminal output, and UI history stay local.
+- `/goal OBJECTIVE` sets and starts a coordinator-owned session goal; bare
+  `/goal` shows it, `run` resumes, `done` marks completion, and `clear` removes
+  it. Goals travel as ordinary prompt context to all adapter types, change at
+  turn boundaries, and persist only through explicit session resume. They do
+  not override permissions, turn limits, or current user instructions.
 - Each agent's first prompt includes a brief roster introduction identifying
   itself and its active collaborators.
+- Replacement adapters also receive the retained original public task, even
+  after its journal entry has been pruned. Private prompts never replace it.
 - Untagged human messages submitted while an agent is working are queued back
   to that same agent, in FIFO order, before the relay advances. The next agent
   receives the active agent's latest response as context. An explicit roster
@@ -48,7 +55,9 @@
   the next normal relay message. Duplicate names display their roster number.
 - `[CODESWARM:STOP]` is the safe word, but only an agent reviewing a different
   agent's response may use it. The first responder after any human message and
-  direct/private turns cannot stop peer review. An eligible reviewer with
+  direct/private turns cannot stop peer review. In roster routing, stopping
+  also requires every currently routable member to have participated in the
+  batch, including the current reviewer. An eligible reviewer with
   nothing meaningful to add may send an emoji followed by the token; a
   token-only response is displayed as `👍`. CodeSwarm always hides the token.
 - While work is active, the first `Ctrl+C` requests cancellation and a second
@@ -85,6 +94,14 @@
   notification style over the conversation UI.
 - Optional operating-system notifications sent through `system_notify()` are
   separate from this in-terminal presentation rule and remain supported.
+- `/settings` offers Terminal, Light, and Dark themes. Terminal uses the user's
+  canvas and ANSI accents; explicit palettes retain readable text contrast.
+  Redraws follow input, adapter/index updates, and visible timer deadlines.
+- After two minutes without adapter activity during a turn, the status ribbon
+  shows the silent duration and offers `Ctrl+C` cancellation or `/reload`.
+  Silence does not cancel work automatically. Pending permissions and
+  cancellation suppress the warning; new activity clears it. Reloading a
+  silent agent cancels its current turn before restarting that roster slot.
 
 ## Verification
 
