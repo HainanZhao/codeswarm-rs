@@ -415,8 +415,21 @@ impl std::fmt::Debug for SlotMappedAdapter {
     }
 }
 
+fn restored_history_event(event: AgentEvent) -> AgentEvent {
+    use crate::HistoryContent;
+    let (slot, content) = match event {
+        AgentEvent::UserText { slot, text } => (slot, HistoryContent::UserText(text)),
+        AgentEvent::Text { slot, text } => (slot, HistoryContent::Text(text)),
+        AgentEvent::Thought { slot, text } => (slot, HistoryContent::Thought(text)),
+        AgentEvent::Tool { slot, update } => (slot, HistoryContent::Tool(update)),
+        other => return other,
+    };
+    AgentEvent::History { slot, content }
+}
+
 fn map_event_slot(event: AgentEvent, slot: RosterSlot) -> AgentEvent {
     match event {
+        AgentEvent::History { content, .. } => AgentEvent::History { slot, content },
         AgentEvent::GoalUpdated { goal } => AgentEvent::GoalUpdated { goal },
         AgentEvent::RosterUpdated { update } => AgentEvent::RosterUpdated { update },
         AgentEvent::Ready { capabilities, .. } => AgentEvent::Ready { slot, capabilities },
@@ -2375,6 +2388,11 @@ impl AcpAdapter {
                     .ok_or_else(|| AdapterError::Protocol("response has no result".into()));
             }
             if let Some(event) = parse_acp_notification(self.slot, &line)? {
+                let event = if method == "session/load" {
+                    restored_history_event(event)
+                } else {
+                    event
+                };
                 self.queued_events.push_back(Ok(event));
             }
         }
@@ -4960,6 +4978,54 @@ mod tests {
             adapter.next_event().await,
             Some(Err(super::AdapterError::Protocol(detail))) if detail.contains("capacity")
         ));
+    }
+
+    #[tokio::test]
+    async fn acp_load_replays_history_without_starting_a_turn() {
+        let script = r#"
+read _
+echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}'
+read request
+case "$request" in *session/load*) ;; *) exit 2;; esac
+echo '{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"old question"}}}}'
+echo '{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"old answer"}}}}'
+echo '{"method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"old reasoning"}}}}'
+echo '{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"old-tool","title":"Read","status":"in_progress"}}}'
+echo '{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"old-tool","title":"Read","status":"completed"}}}'
+echo '{"jsonrpc":"2.0","id":2,"result":{}}'
+read request
+case "$request" in *session/prompt*) ;; *) exit 3;; esac
+echo '{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"new answer"}}}}'
+echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+"#;
+        let mut adapter = AcpAdapter::with_session_id(
+            2,
+            std::env::current_dir().unwrap(),
+            "sh",
+            vec!["-c".into(), script.into()],
+            "saved",
+        );
+        adapter.start().await.unwrap();
+        let mut state = crate::SessionState::new(3);
+        for _ in 0..5 {
+            let event = adapter.next_event().await.unwrap().unwrap();
+            assert!(matches!(&event, AgentEvent::History { slot: 2, .. }));
+            crate::reduce(&mut state, event);
+            assert_eq!(state.active_slot, None);
+        }
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Ready { slot: 2, .. }))
+        ));
+        adapter.send_prompt("new question".into()).await.unwrap();
+        assert!(
+            matches!(adapter.next_event().await, Some(Ok(AgentEvent::Text { text, .. })) if text == "new answer")
+        );
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::TurnComplete { slot: 2 }))
+        ));
+        adapter.stop().await.unwrap();
     }
 
     #[tokio::test]

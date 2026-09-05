@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-09-05
+
+### Fixed
+
+- Resuming ACP history no longer starts agent timers or blocks new prompts.
+  Replayed messages and tools are display-only; work starts on a new human prompt.
+
 ## [0.9.4] - 2026-09-05
 
 ### Changed

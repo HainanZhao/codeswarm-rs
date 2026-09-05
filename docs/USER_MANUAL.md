@@ -27,6 +27,7 @@ for the project when the previous owner supports session loading. A normal
 
 Inside chat, `/resume` restores the project session saved before the current
 session started, including its roster, provider handles, and shared goal.
+Restored messages are history only: agents stay idle until you send a new prompt.
 Cancel active work and clear queued prompts before switching. If no saved
 session can be loaded, the status ribbon explains why and the current chat
 stays open. `/resume` takes no arguments; use `codeswarm resume PATH` from the

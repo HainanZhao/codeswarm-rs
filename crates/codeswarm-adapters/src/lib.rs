@@ -130,8 +130,21 @@ pub enum RosterUpdate {
     },
 }
 
+/// Display-only updates replayed while restoring a provider conversation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum HistoryContent {
+    UserText(String),
+    Text(String),
+    Thought(String),
+    Tool(ToolUpdate),
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AgentEvent {
+    History {
+        slot: RosterSlot,
+        content: HistoryContent,
+    },
     GoalUpdated {
         goal: Option<goal::Goal>,
     },
@@ -276,6 +289,7 @@ impl SessionState {
 /// never performed in the reducer.
 pub fn reduce(state: &mut SessionState, event: AgentEvent) -> Vec<Effect> {
     match event {
+        AgentEvent::History { .. } => vec![Effect::Render],
         AgentEvent::GoalUpdated { goal } => {
             state.goal = goal;
             vec![Effect::Render]

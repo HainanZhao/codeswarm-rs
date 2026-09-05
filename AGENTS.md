@@ -69,6 +69,9 @@
   local help/completion, accepts no arguments, and rejects active work, pending
   permissions, or queued prompts via the status ribbon. Fresh startup metadata
   must never replace the retained resume target.
+  Resume is history-only until a new human prompt: ACP session/load replay is
+  display-only history, never live activity. It must not start timers, set a
+  busy turn, queue input behind phantom work, or automatically dispatch agents.
 - The relay defaults to 100 automated turns and can be adjusted with
   `--max-rounds N`. This is a runaway-safety limit, not a per-agent budget —
   it does not scale with roster size.

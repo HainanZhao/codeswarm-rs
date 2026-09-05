@@ -3369,7 +3369,7 @@ fn run_terminal(
                 match event {
                     Ok(event) => {
                         match &event {
-                            AgentEvent::GoalUpdated { .. } => {}
+                            AgentEvent::History { .. } | AgentEvent::GoalUpdated { .. } => {}
                             AgentEvent::RosterUpdated { update } => match update {
                                 codeswarm_adapters::RosterUpdate::Added {
                                     slot, identity, ..

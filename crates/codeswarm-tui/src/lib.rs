@@ -961,6 +961,8 @@ pub struct App {
     /// One compact rolling tool window per active agent turn. Each window
     /// keeps the latest two calls and retains full details for Ctrl+O.
     tool_windows: BTreeMap<usize, ToolWindow>,
+    history_blocks: BTreeMap<usize, (crate::transcript::BlockKind, u64)>,
+    history_tools: BTreeMap<(usize, String), u64>,
     focused_detail: Option<u64>,
     detail_controls: Vec<(Rect, u64)>,
     /// Background workspace index used only by the optional `@path` picker.
@@ -981,7 +983,8 @@ const CONFIG_SETTING_COUNT: usize = 13;
 fn agent_event_slot(event: &AgentEvent) -> Option<usize> {
     match event {
         AgentEvent::GoalUpdated { .. } => None,
-        AgentEvent::Ready { slot, .. }
+        AgentEvent::History { slot, .. }
+        | AgentEvent::Ready { slot, .. }
         | AgentEvent::TurnStarted { slot }
         | AgentEvent::ModesReplaced { slot, .. }
         | AgentEvent::ModeUpdated { slot, .. }
@@ -1067,6 +1070,8 @@ impl Default for App {
             keyboard_help: false,
             streaming_blocks: BTreeMap::new(),
             tool_windows: BTreeMap::new(),
+            history_blocks: BTreeMap::new(),
+            history_tools: BTreeMap::new(),
             focused_detail: None,
             detail_controls: Vec::new(),
             path_index: None,
@@ -2787,6 +2792,58 @@ impl App {
         }
     }
 
+    fn apply_history(&mut self, slot: usize, content: &codeswarm_adapters::HistoryContent) {
+        use crate::transcript::BlockKind;
+        use codeswarm_adapters::HistoryContent;
+        let (kind, text) = match content {
+            HistoryContent::UserText(text) => (BlockKind::Human, text),
+            HistoryContent::Text(text) => (BlockKind::Agent, text),
+            HistoryContent::Thought(text) => (BlockKind::Thought, text),
+            HistoryContent::Tool(update) => {
+                self.history_blocks.remove(&slot);
+                let key = (slot, update.id.clone());
+                let source = format!(
+                    "{}🔧 {} · {}{}",
+                    agent_message_prefix(&self.agent_name(slot)),
+                    update.title,
+                    tool_status_label(update.status),
+                    update
+                        .detail
+                        .as_ref()
+                        .map(|detail| format!("\n{detail}"))
+                        .unwrap_or_default()
+                );
+                if let Some(id) = self.history_tools.get(&key).copied() {
+                    let collapsed = self.transcript.is_collapsed(id) != Some(false);
+                    self.transcript
+                        .replace(id, BlockKind::Tool, source, collapsed);
+                } else {
+                    let id = self.transcript.append(BlockKind::Tool, source, true);
+                    self.history_tools.insert(key, id);
+                }
+                return;
+            }
+        };
+        let id = match self.history_blocks.get(&slot).copied() {
+            Some((previous, id)) if previous == kind => id,
+            _ => {
+                let prefix = if kind == BlockKind::Human {
+                    "You: ".to_owned()
+                } else {
+                    agent_message_prefix(&self.agent_name(slot))
+                };
+                let id = self.transcript.append(
+                    kind,
+                    prefix,
+                    kind == BlockKind::Thought && !self.show_thoughts,
+                );
+                self.history_blocks.insert(slot, (kind, id));
+                id
+            }
+        };
+        self.transcript.extend(id, text);
+    }
+
     /// Apply normalized adapter state without exposing protocol-specific
     /// objects to the renderer. Text chunks are coalesced into one transcript
     /// block per active agent turn.
@@ -2802,12 +2859,17 @@ impl App {
         }) {
             return;
         }
+        if let AgentEvent::History { slot, content } = event {
+            self.apply_history(*slot, content);
+            return;
+        }
         if let Some(slot) = agent_event_slot(event)
             && self.agent_turn_started.contains_key(&slot)
         {
             self.agent_last_activity.insert(slot, Instant::now());
         }
         match event {
+            AgentEvent::History { .. } => unreachable!("history handled without live state"),
             AgentEvent::GoalUpdated { goal } => {
                 self.goal = goal.clone();
                 self.status = goal
@@ -2839,6 +2901,9 @@ impl App {
                 }
             },
             AgentEvent::Ready { slot, capabilities } => {
+                self.history_blocks.remove(slot);
+                self.history_tools
+                    .retain(|(history_slot, _), _| history_slot != slot);
                 self.active_agent = self.agent_name(*slot);
                 self.agent_states.insert(*slot, "ready".into());
                 if !capabilities.supports_models {
@@ -6176,6 +6241,55 @@ mod tests {
         assert_eq!(app.inactive_agent(later), None);
         app.finish_turn_cancellation();
         assert_eq!(app.inactive_agent(later), None);
+    }
+
+    #[test]
+    fn restored_roster_history_keeps_timers_stopped_and_input_idle() {
+        use codeswarm_adapters::HistoryContent;
+        let mut app = App::default();
+        for slot in 0..3 {
+            app.set_agent_name(slot, format!("Agent {slot}"));
+        }
+        app.set_selected_agent(Some(1));
+        let next = app.next_agent_slot();
+        for slot in [2, 0, 1] {
+            for content in [
+                HistoryContent::UserText("old question".into()),
+                HistoryContent::Text("old answer".into()),
+                HistoryContent::Thought("old thought".into()),
+                HistoryContent::UserText("another question".into()),
+                HistoryContent::Text("another answer".into()),
+                HistoryContent::Tool(codeswarm_adapters::ToolUpdate {
+                    id: "old-tool".into(),
+                    title: "Read".into(),
+                    status: codeswarm_adapters::ToolStatus::Running,
+                    detail: None,
+                }),
+            ] {
+                app.apply_event(&codeswarm_adapters::AgentEvent::History { slot, content });
+                assert!(app.agent_turn_started.is_empty());
+                assert_eq!(app.next_agent_slot(), next);
+                assert!(!app.cancellation_pending());
+            }
+            app.apply_event(&codeswarm_adapters::AgentEvent::Ready {
+                slot,
+                capabilities: Default::default(),
+            });
+            assert_eq!(app.agent_states[&slot], "ready");
+        }
+        assert!(app.export_markdown().contains("old answer"));
+        assert!(app.export_markdown().contains("another answer"));
+        assert!(app.streaming_blocks.is_empty());
+        assert!(app.tool_windows.is_empty());
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnStarted { slot: 1 });
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
+            slot: 1,
+            text: "fresh response".into(),
+        });
+        assert_eq!(app.agent_turn_started.len(), 1);
+        assert!(app.agent_turn_started.contains_key(&1));
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 1 });
+        assert!(app.agent_turn_started.is_empty());
     }
 
     #[test]
