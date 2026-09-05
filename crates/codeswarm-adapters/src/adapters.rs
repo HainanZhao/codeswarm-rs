@@ -20,7 +20,7 @@ use crate::{
     reduce,
     relay::{
         CollaborationStrategy, DEFAULT_STOP_ACKNOWLEDGMENT, Relay, RelayDecision, STOP_TOKEN,
-        is_usage_limit_response, strip_stop_token,
+        is_usage_limit_response, stop_token_visible_end, strip_stop_token,
     },
     resources,
 };
@@ -1640,17 +1640,14 @@ impl RelayHost {
                 _ => {}
             }
             if let AgentEvent::Text { .. } = &update.event {
-                // Hold a short suffix until the next chunk so a stop token
-                // split across stream messages never leaks into the UI.
-                let visible_end = response
-                    .find(STOP_TOKEN)
-                    .unwrap_or_else(|| response.len().saturating_sub(STOP_TOKEN.len() - 1));
-                let visible_end = floor_char_boundary(&response, visible_end);
+                // Only a possible split marker needs to wait for another chunk.
+                let visible_response = response.replace(STOP_TOKEN, "");
+                let visible_end = stop_token_visible_end(&visible_response);
                 if emitted_text < visible_end {
                     if let Some(sink) = &self.event_sink {
                         sink(AgentEvent::Text {
                             slot: *slot,
-                            text: response[emitted_text..visible_end].to_owned(),
+                            text: visible_response[emitted_text..visible_end].to_owned(),
                         });
                     }
                     emitted_text = visible_end;
@@ -5750,6 +5747,91 @@ mod tests {
         assert_eq!(
             relay.run_turn("", 0).await.expect("complete"),
             RelayDecision::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_stream_emits_text_and_thought_endings_before_tools() {
+        let tool = AgentEvent::Tool {
+            slot: 0,
+            update: crate::ToolUpdate {
+                id: "read".into(),
+                title: "Read file".into(),
+                status: ToolStatus::Running,
+                detail: None,
+            },
+        };
+        let updates = vec![
+            AgentEvent::Thought {
+                slot: 0,
+                text: "Check the buffer. ✈".into(),
+            },
+            AgentEvent::Text {
+                slot: 0,
+                text: "Let me check.".into(),
+            },
+            tool.clone(),
+            AgentEvent::Text {
+                slot: 0,
+                text: "[CODE".into(),
+            },
+            AgentEvent::Text {
+                slot: 0,
+                text: " is ordinary.".into(),
+            },
+            AgentEvent::Text {
+                slot: 0,
+                text: "[CODESWARM:".into(),
+            },
+            AgentEvent::Text {
+                slot: 0,
+                text: "STOP] Done.".into(),
+            },
+            tool,
+            AgentEvent::TurnComplete { slot: 0 },
+        ];
+        let first = ScriptedAdapter::new(0, AgentCapabilities::default(), updates.clone());
+        let reviewer = ScriptedAdapter::new(1, AgentCapabilities::default(), []);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = std::sync::Arc::clone(&events);
+        let mut relay = RelayHost::new(
+            vec![
+                AdapterHost::new(Box::new(first), None),
+                AdapterHost::new(Box::new(reviewer), None),
+            ],
+            2,
+        )
+        .expect("relay");
+        relay.set_event_sink(move |event| captured.lock().unwrap().push(event));
+        relay.start().await.unwrap();
+        relay.run_turn("task", 0).await.unwrap();
+        let captured = events.lock().unwrap();
+        let visible: Vec<_> = captured
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::Text { .. } | AgentEvent::Thought { .. } | AgentEvent::Tool { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            visible,
+            vec![
+                updates[0].clone(),
+                updates[1].clone(),
+                updates[2].clone(),
+                AgentEvent::Text {
+                    slot: 0,
+                    text: "[CODE is ordinary.".into()
+                },
+                AgentEvent::Text {
+                    slot: 0,
+                    text: " Done.".into()
+                },
+                updates[7].clone(),
+            ]
         );
     }
 

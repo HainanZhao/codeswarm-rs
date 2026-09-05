@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-05
+
+### Fixed
+
+- Streamed message text no longer holds back sentence endings while tools run.
+  Standalone and relay sessions retain only possible fragments of the hidden
+  stop marker, preserving split-marker filtering without delaying ordinary text.
+
 ## [0.9.0] - 2026-09-05
 
 ### Added

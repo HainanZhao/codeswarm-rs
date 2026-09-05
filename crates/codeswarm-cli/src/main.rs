@@ -2091,7 +2091,6 @@ fn sanitize_direct_event(event: AgentEvent, response_tail: &mut String) -> Vec<A
         AgentEvent::Text { slot, text } => {
             response_tail.push_str(&text);
             let token = codeswarm_adapters::relay::STOP_TOKEN;
-            let keep = token.len().saturating_sub(1);
             loop {
                 if let Some(index) = response_tail.find(token) {
                     let prefix = response_tail[..index].to_owned();
@@ -2101,11 +2100,8 @@ fn sanitize_direct_event(event: AgentEvent, response_tail: &mut String) -> Vec<A
                     *response_tail = response_tail[index + token.len()..].replace(token, "");
                     continue;
                 }
-                if response_tail.len() > keep {
-                    let mut boundary = response_tail.len() - keep;
-                    while boundary > 0 && !response_tail.is_char_boundary(boundary) {
-                        boundary -= 1;
-                    }
+                let boundary = codeswarm_adapters::relay::stop_token_visible_end(response_tail);
+                if boundary > 0 {
                     let prefix = response_tail[..boundary].to_owned();
                     if !prefix.is_empty() {
                         visible.push(AgentEvent::Text { slot, text: prefix });
@@ -6234,6 +6230,105 @@ mod tests {
             direct: true,
         };
         assert!(!dispatch_queued_prompt(Some(&sender), &prompt));
+    }
+
+    #[test]
+    fn standalone_stream_emits_sentence_endings_before_tools() {
+        let mut tail = String::new();
+        for text in [
+            "Let me check",
+            " the buffer. ✈",
+            "[CODE",
+            " is ordinary text.",
+        ] {
+            let expected = format!("{tail}{text}");
+            let output = sanitize_direct_event(
+                AgentEvent::Text {
+                    slot: 0,
+                    text: text.into(),
+                },
+                &mut tail,
+            );
+            if text == "[CODE" {
+                assert!(output.is_empty());
+            } else {
+                assert_eq!(
+                    output,
+                    vec![AgentEvent::Text {
+                        slot: 0,
+                        text: expected
+                    }]
+                );
+                assert!(tail.is_empty());
+            }
+        }
+        let tool = AgentEvent::Tool {
+            slot: 0,
+            update: codeswarm_adapters::ToolUpdate {
+                id: "read".into(),
+                title: "Read file".into(),
+                status: codeswarm_adapters::ToolStatus::Running,
+                detail: None,
+            },
+        };
+        assert_eq!(sanitize_direct_event(tool.clone(), &mut tail), vec![tool]);
+    }
+
+    #[test]
+    fn standalone_stream_retains_only_possible_marker_prefixes() {
+        let token = codeswarm_adapters::relay::STOP_TOKEN;
+        for split in 1..token.len() {
+            let mut tail = String::new();
+            assert_eq!(
+                sanitize_direct_event(
+                    AgentEvent::Text {
+                        slot: 0,
+                        text: format!("Ready. ✈{}", &token[..split]),
+                    },
+                    &mut tail
+                ),
+                vec![AgentEvent::Text {
+                    slot: 0,
+                    text: "Ready. ✈".into()
+                }]
+            );
+            assert_eq!(tail, token[..split]);
+            assert_eq!(
+                sanitize_direct_event(
+                    AgentEvent::Text {
+                        slot: 0,
+                        text: format!("{} Next.", &token[split..]),
+                    },
+                    &mut tail
+                ),
+                vec![AgentEvent::Text {
+                    slot: 0,
+                    text: " Next.".into()
+                }]
+            );
+            assert!(tail.is_empty());
+        }
+        let mut tail = String::new();
+        assert!(
+            sanitize_direct_event(
+                AgentEvent::Text {
+                    slot: 0,
+                    text: "[CODE".into()
+                },
+                &mut tail
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            sanitize_direct_event(AgentEvent::TurnComplete { slot: 0 }, &mut tail),
+            vec![
+                AgentEvent::Text {
+                    slot: 0,
+                    text: "[CODE".into()
+                },
+                AgentEvent::TurnComplete { slot: 0 },
+            ]
+        );
     }
 
     #[test]

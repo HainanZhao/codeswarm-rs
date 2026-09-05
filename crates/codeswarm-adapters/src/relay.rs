@@ -12,6 +12,16 @@ pub const MAX_QUEUED_PROMPTS: usize = 100;
 pub const STOP_TOKEN: &str = "[CODESWARM:STOP]";
 pub const DEFAULT_STOP_ACKNOWLEDGMENT: &str = "👍";
 
+/// End of text safe to display after complete stop markers have been removed.
+/// Retain only a suffix that could become a marker in a later stream chunk.
+pub fn stop_token_visible_end(text: &str) -> usize {
+    let pending = (1..STOP_TOKEN.len())
+        .rev()
+        .find(|&len| text.ends_with(&STOP_TOKEN[..len]))
+        .unwrap_or(0);
+    text.len() - pending
+}
+
 /// Recognize a provider usage-limit reply (for example an exhausted Codex
 /// plan). Kept deliberately narrow so ordinary conversation mentioning
 /// "limits" is never misclassified.
