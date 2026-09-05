@@ -25,6 +25,13 @@ compatibility with the previous launcher. `codeswarm --help` and
 for the project when the previous owner supports session loading. A normal
 `codeswarm` launch always starts a fresh provider session.
 
+Inside chat, `/resume` restores the project session saved before the current
+session started, including its roster, provider handles, and shared goal.
+Cancel active work and clear queued prompts before switching. If no saved
+session can be loaded, the status ribbon explains why and the current chat
+stays open. `/resume` takes no arguments; use `codeswarm resume PATH` from the
+terminal to resume another project.
+
 The store reads custom agents from
 `$XDG_CONFIG_HOME/codeswarm/codeswarm.json` (default:
 `~/.config/codeswarm/codeswarm.json`). Add an `agents` array or object with
@@ -136,3 +143,9 @@ viewport tests.
 
 CodeSwarm collects no telemetry. Prompts, responses, tool calls, and terminal
 activity remain subject to the policies of the agent and provider you choose.
+
+### Thought appearance
+
+Thought bodies and collapsed previews use faint gray italics so they stay
+visually secondary to messages. Their lower contrast is intentional in all
+three themes; thoughts are exempt from the ordinary text contrast target.

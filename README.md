@@ -34,6 +34,8 @@ codeswarm
 codeswarm resume
 ```
 
+Inside chat, `/resume` restores the previous saved project session.
+
 The first launch opens agent selection. A saved roster is restored on later
 launches. For a deterministic preview or smoke test:
 

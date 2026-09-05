@@ -40,7 +40,9 @@ const TRANSCRIPT_BG: Color = Color::Reset;
 const STATUS_BG: Color = Color::Reset;
 const PANEL_BG: Color = Color::Reset;
 const PRIMARY_TEXT: Color = Color::Reset;
-const THOUGHT_TEXT: Color = Color::Rgb(142, 142, 147);
+// Thoughts intentionally use lower contrast than ordinary text (see AGENTS.md).
+const THOUGHT_TEXT: Color = Color::Rgb(128, 128, 133);
+const SECONDARY_TEXT: Color = Color::Rgb(142, 142, 147);
 const ACCENT: Color = Color::Rgb(36, 184, 176);
 const SEPARATOR: Color = Color::Gray;
 const PROMPT_RULE: Color = Color::DarkGray;
@@ -104,6 +106,7 @@ pub enum LocalCommand {
     Cancel,
     Export,
     Reload,
+    Resume,
     SelectAgent(usize),
     SelectText,
 }
@@ -156,6 +159,11 @@ pub const LOCAL_COMMANDS: &[CommandSpec] = &[
         name: "/reload",
         description: "Restart a silent or crashed agent",
         usage: "/reload",
+    },
+    CommandSpec {
+        name: "/resume",
+        description: "Resume the previous saved project session",
+        usage: "/resume",
     },
     CommandSpec {
         name: "/select",
@@ -1131,6 +1139,7 @@ impl App {
             "/cancel" => LocalCommand::Cancel,
             "/export" => LocalCommand::Export,
             "/reload" => LocalCommand::Reload,
+            "/resume" => LocalCommand::Resume,
             "/agent" => match argument.parse::<usize>() {
                 Ok(slot) => LocalCommand::SelectAgent(slot),
                 Err(_) => {
@@ -3796,7 +3805,7 @@ fn footer_agent_label(app: &App, slot: usize, active_count: usize) -> String {
     } else {
         app.agent_turn_started
             .get(&slot)
-            .map(|started| format_turn_elapsed(*started))
+            .map(|started| format!(" {}", format_turn_elapsed(*started)))
             .unwrap_or_default()
     };
     format!("{arrow}{marker} {}{timer}", app.agent_name(slot))
@@ -3904,7 +3913,7 @@ fn render_command_palette(buffer: &mut Buffer, area: Rect, app: &App) {
             ),
             Span::styled(
                 command_description(command),
-                Style::default().fg(THOUGHT_TEXT),
+                Style::default().fg(SECONDARY_TEXT),
             ),
         ]));
     }
@@ -4198,7 +4207,7 @@ fn render_keyboard_help(buffer: &mut Buffer, area: Rect) {
         " Input: Enter send · Shift+Enter newline · Tab complete",
         " Turn: Ctrl+Enter direct · Ctrl+C cancel · Ctrl+K cancel queued",
         " Agents: /agent SLOT /reload · Goal: /goal [objective|run|done|clear]",
-        " Session: /settings /clear /export /select /exit",
+        " Session: /resume /settings /clear /export /select /exit",
     ];
     Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>())
         .style(Style::default().fg(Color::Gray).bg(PANEL_BG))
@@ -4680,7 +4689,7 @@ fn render_transcript(
                     if let Some(end) = body.find(']').filter(|_| body.starts_with('[')) {
                         spans.push(Span::styled(
                             format!(" {}", &body[1..end]),
-                            Style::default().fg(THOUGHT_TEXT),
+                            Style::default().fg(SECONDARY_TEXT),
                         ));
                         let content = body[end + 1..].trim_start();
                         if !content.is_empty() {
@@ -4796,16 +4805,16 @@ fn block_style(kind: crate::transcript::BlockKind) -> Style {
         }
         crate::transcript::BlockKind::Agent => Style::default().fg(PRIMARY_TEXT),
         crate::transcript::BlockKind::Thought => Style::default().fg(THOUGHT_TEXT).italic(),
-        crate::transcript::BlockKind::Tool => Style::default().fg(THOUGHT_TEXT),
+        crate::transcript::BlockKind::Tool => Style::default().fg(SECONDARY_TEXT),
         crate::transcript::BlockKind::Terminal => Style::default().fg(Color::Gray),
         crate::transcript::BlockKind::Diff => Style::default().fg(Color::Magenta),
-        crate::transcript::BlockKind::Notice => Style::default().fg(THOUGHT_TEXT),
+        crate::transcript::BlockKind::Notice => Style::default().fg(SECONDARY_TEXT),
     }
 }
 
 fn marker_style(kind: crate::transcript::BlockKind, text: &str) -> Style {
     match kind {
-        crate::transcript::BlockKind::Tool => Style::default().fg(THOUGHT_TEXT).bold(),
+        crate::transcript::BlockKind::Tool => Style::default().fg(SECONDARY_TEXT).bold(),
         crate::transcript::BlockKind::Terminal => Style::default().fg(Color::Yellow).bold(),
         crate::transcript::BlockKind::Notice => Style::default().fg(ACCENT).bold(),
         _ => row_style(kind, text).bold(),
@@ -4844,6 +4853,24 @@ fn markdown_style(kind: crate::transcript::BlockKind, text: &str) -> Style {
 }
 
 fn markdown_spans(
+    kind: crate::transcript::BlockKind,
+    text: &str,
+    in_code: &mut bool,
+) -> Vec<Span<'static>> {
+    let mut spans = markdown_content_spans(kind, text, in_code);
+    if kind == crate::transcript::BlockKind::Thought {
+        for span in &mut spans {
+            span.style = span
+                .style
+                .fg(THOUGHT_TEXT)
+                .italic()
+                .remove_modifier(Modifier::BOLD);
+        }
+    }
+    spans
+}
+
+fn markdown_content_spans(
     kind: crate::transcript::BlockKind,
     text: &str,
     in_code: &mut bool,
@@ -5069,8 +5096,8 @@ mod tests {
     use super::{
         ACCENT, AGENT_COLORS, App, CONFIG_SETTING_COUNT, ConfigAction, ConfigKey, FooterAction,
         LocalCommand, MAX_TOOL_HISTORY_ROWS, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PathPickerAction,
-        PermissionAction, PermissionKey, PromptAction, PromptEditor, STATUS_BG, StoreAction,
-        StoreAgent, StoreKey, THOUGHT_TEXT, TRANSCRIPT_BG, actionable_detail_preview,
+        PermissionAction, PermissionKey, PromptAction, PromptEditor, SECONDARY_TEXT, STATUS_BG,
+        StoreAction, StoreAgent, StoreKey, TRANSCRIPT_BG, actionable_detail_preview,
         agent_header_color, agent_slot_color, block_style, cell_width, compact_cell_label,
         compact_workspace_path, file_reference_spans, footer_agent_label, format_turn_elapsed,
         markdown_spans, markdown_style, marker_style, render, render_prompt_separator, row_style,
@@ -5121,13 +5148,19 @@ mod tests {
         assert_eq!(PANEL_BG, Color::Reset);
         assert_eq!(PRIMARY_TEXT, Color::Reset);
         assert_eq!(ACCENT, Color::Rgb(36, 184, 176));
-        assert_eq!(THOUGHT_TEXT, Color::Rgb(142, 142, 147));
+        assert_eq!(SECONDARY_TEXT, Color::Rgb(142, 142, 147));
         assert_eq!(block_style(BlockKind::Human).fg, Some(ACCENT));
-        assert_eq!(block_style(BlockKind::Thought).fg, Some(THOUGHT_TEXT));
-        assert_eq!(block_style(BlockKind::Tool).fg, Some(THOUGHT_TEXT));
+        assert_eq!(
+            block_style(BlockKind::Thought).fg,
+            Some(super::THOUGHT_TEXT)
+        );
+        assert_eq!(block_style(BlockKind::Tool).fg, Some(SECONDARY_TEXT));
         assert_eq!(block_style(BlockKind::Terminal).fg, Some(Color::Gray));
-        assert_eq!(block_style(BlockKind::Notice).fg, Some(THOUGHT_TEXT));
-        assert_eq!(marker_style(BlockKind::Tool, "Run").fg, Some(THOUGHT_TEXT));
+        assert_eq!(block_style(BlockKind::Notice).fg, Some(SECONDARY_TEXT));
+        assert_eq!(
+            marker_style(BlockKind::Tool, "Run").fg,
+            Some(SECONDARY_TEXT)
+        );
         assert_eq!(marker_style(BlockKind::Notice, "Wait").fg, Some(ACCENT));
         assert_eq!(selected_style().bg, None);
         assert!(selected_style().add_modifier.contains(Modifier::REVERSED));
@@ -6205,7 +6238,7 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(65),
         );
         assert_eq!(format_turn_elapsed(app.agent_turn_started[&0]), "1:05");
-        assert!(footer_agent_label(&app, 0, 1).contains("Codex1:05"));
+        assert!(footer_agent_label(&app, 0, 1).contains("Codex 1:05"));
         let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut app))
@@ -6220,7 +6253,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(footer.contains("Codex1:05"), "{footer}");
+        assert!(footer.contains("Codex 1:05"), "{footer}");
         assert!(!footer.contains("Codex ·"), "{footer}");
         let blocks_before_wait = app.transcript.len();
 
@@ -6239,7 +6272,7 @@ mod tests {
             });
         }
         assert_eq!(app.transcript.len(), blocks_before_wait);
-        assert!(footer_agent_label(&app, 0, 1).contains("Codex1:05"));
+        assert!(footer_agent_label(&app, 0, 1).contains("Codex 1:05"));
         assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
 
         app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
@@ -6283,7 +6316,7 @@ mod tests {
             slot: 0,
             text: "working".into(),
         });
-        assert!(footer_agent_label(&app, 0, 1).contains("Codex0:00"));
+        assert!(footer_agent_label(&app, 0, 1).contains("Codex 0:00"));
 
         app.request_turn_cancellation();
         assert!(app.cancellation_pending());
@@ -6470,6 +6503,41 @@ mod tests {
         );
         assert_eq!(app.handle_local_command("/exit"), Some(LocalCommand::Exit));
         assert_eq!(app.handle_local_command("ordinary text"), None);
+    }
+
+    #[test]
+    fn resume_is_a_local_command_with_help_and_argument_validation() {
+        let mut app = App::default();
+        assert_eq!(
+            app.handle_local_command("/resume"),
+            Some(LocalCommand::Resume)
+        );
+        assert_eq!(
+            app.handle_local_command(" /RESUME "),
+            Some(LocalCommand::Resume)
+        );
+        assert_eq!(
+            app.handle_local_command("/resume unexpected"),
+            Some(LocalCommand::Handled)
+        );
+        assert_eq!(app.status, "usage: /resume");
+        assert!(
+            super::LOCAL_COMMANDS
+                .iter()
+                .any(|command| command.name == "/resume")
+        );
+        assert!(app.transcript.is_empty());
+        app.handle_local_command("/help");
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Session: /resume"));
     }
 
     #[test]
@@ -7755,6 +7823,49 @@ mod tests {
             rows.iter()
                 .any(|row| row.contains("  Reviewed and approved"))
         );
+    }
+
+    #[test]
+    fn thoughts_render_faint_and_italic_in_every_theme() {
+        for (theme, expected) in [
+            ("terminal", Color::DarkGray),
+            ("light", Color::Rgb(155, 155, 160)),
+            ("dark", Color::Rgb(110, 114, 124)),
+        ] {
+            for expanded in [false, true] {
+                let mut app = App::default();
+                app.set_theme(theme);
+                app.set_thoughts_enabled(expanded);
+                app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
+                    slot: 0,
+                    text: "faint reasoning".into(),
+                });
+                let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let mut found = false;
+                for row in buffer.content().chunks(100) {
+                    let text = row.iter().map(|cell| cell.symbol()).collect::<String>();
+                    if let Some(start) = text.find("faint reasoning") {
+                        let start = text[..start].chars().count();
+                        for cell in &row[start..start + "faint reasoning".len()] {
+                            assert_eq!(cell.fg, expected, "{theme}, expanded={expanded}");
+                            assert!(cell.modifier.contains(Modifier::ITALIC));
+                        }
+                        found = true;
+                    }
+                }
+                assert!(found, "{theme}, expanded={expanded}");
+            }
+        }
+        let mut in_code = false;
+        for text in ["# heading", "**bold**", "```rust", "let x = 1;", "```"] {
+            for span in super::markdown_spans(BlockKind::Thought, text, &mut in_code) {
+                assert_eq!(span.style.fg, Some(super::THOUGHT_TEXT));
+                assert!(span.style.add_modifier.contains(Modifier::ITALIC));
+                assert!(!span.style.add_modifier.contains(Modifier::BOLD));
+            }
+        }
     }
 
     #[test]

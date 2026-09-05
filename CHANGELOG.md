@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-09-05
+
+### Added
+
+- Chat `/resume` restores the previous saved project session, roster, and goal.
+  The command is included in local help and completion; unavailable sessions
+  and attempts to switch during active work are reported in the status ribbon.
+
+### Fixed
+
+- Added a space between the agent name and elapsed timer in the footer.
+- Restored faint gray italic thought text in every theme. Lower thought contrast
+  is intentional and documented separately from ordinary text readability.
+
 ## [0.9.2] - 2026-09-05
 
 ### Changed

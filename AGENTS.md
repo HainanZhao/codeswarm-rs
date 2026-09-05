@@ -64,6 +64,11 @@
   press within three seconds quits; while idle, `Ctrl+C` quits immediately.
   `codeswarm resume [PATH]` starts the last provider-backed session saved for
   that project; a normal launch always starts a fresh provider session.
+  Chat `/resume` switches to the project session retained before the current
+  adapters started, after shutting down the current workers. It appears in
+  local help/completion, accepts no arguments, and rejects active work, pending
+  permissions, or queued prompts via the status ribbon. Fresh startup metadata
+  must never replace the retained resume target.
 - The relay defaults to 100 automated turns and can be adjusted with
   `--max-rounds N`. This is a runaway-safety limit, not a per-agent budget —
   it does not scale with roster size.
@@ -96,6 +101,11 @@
   separate from this in-terminal presentation rule and remain supported.
 - `/settings` offers Terminal, Light, and Dark themes. Terminal uses the user's
   canvas and ANSI accents; explicit palettes retain readable text contrast.
+  Thought bodies and collapsed thought previews are an intentional exception:
+  use faint muted gray and italics, visually lighter than normal messages.
+  Lower contrast is a deliberate user decision; do not raise thought contrast
+  to satisfy the ordinary text contrast target or map it to the normal terminal
+  foreground. Keep this styling distinct from tool output and other UI text.
   Redraws follow input, adapter/index updates, and visible timer deadlines.
 - After two minutes without adapter activity during a turn, the status ribbon
   shows the silent duration and offers `Ctrl+C` cancellation or `/reload`.

@@ -47,7 +47,8 @@ impl Theme {
         if self == Self::Terminal {
             return match color {
                 super::ACCENT => Cyan,
-                super::THOUGHT_TEXT => Reset,
+                super::SECONDARY_TEXT => Reset,
+                super::THOUGHT_TEXT => DarkGray,
                 _ => super::AGENT_COLORS
                     .iter()
                     .position(|candidate| *candidate == color)
@@ -78,7 +79,15 @@ impl Theme {
                     Rgb(74, 210, 200)
                 }
             }
-            super::THOUGHT_TEXT | Gray | DarkGray => {
+            // Thought text is deliberately faint, exempt from the normal contrast target.
+            super::THOUGHT_TEXT => {
+                if light {
+                    Rgb(155, 155, 160)
+                } else {
+                    Rgb(110, 114, 124)
+                }
+            }
+            super::SECONDARY_TEXT | Gray | DarkGray => {
                 if light {
                     Rgb(90, 90, 95)
                 } else {
@@ -186,7 +195,7 @@ mod tests {
             for role in [
                 Color::Reset,
                 super::super::ACCENT,
-                super::super::THOUGHT_TEXT,
+                super::super::SECONDARY_TEXT,
                 Color::Red,
                 Color::Yellow,
             ]

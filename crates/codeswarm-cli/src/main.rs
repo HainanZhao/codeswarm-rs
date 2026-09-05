@@ -447,6 +447,7 @@ fn interaction_height(frame_area: Rect) -> usize {
     usize::from(frame_area.height)
 }
 
+#[derive(Debug)]
 enum Launch {
     Preview,
     Store,
@@ -482,6 +483,40 @@ fn agent_spec_command(spec: &AgentSpec) -> &str {
 
 fn agent_spec_identity(spec: &AgentSpec) -> String {
     catalog_identity_for_command(agent_spec_command(spec))
+}
+
+#[derive(Debug)]
+enum SessionOutcome {
+    Exit,
+    Resume {
+        launch: Box<Launch>,
+        metadata: Box<SessionMetadata>,
+    },
+}
+
+fn saved_chat_resume() -> Result<SessionMetadata, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    load_session_metadata_candidates(session_metadata_candidates(&cwd))
+        .map_err(|error| error.to_string())?
+        .map(|(metadata, _)| metadata)
+        .ok_or_else(|| "No resumable CodeSwarm session for this project".into())
+}
+
+fn chat_resume_outcome(
+    saved: &Result<SessionMetadata, String>,
+    cwd: &Path,
+    settings: &str,
+    busy: bool,
+) -> Result<SessionOutcome, String> {
+    if busy {
+        return Err("Cancel active work and clear queued prompts before /resume".into());
+    }
+    let metadata = saved.as_ref().map_err(Clone::clone)?;
+    let launch = resume_launch_from_metadata(metadata, cwd, settings)?;
+    Ok(SessionOutcome::Resume {
+        launch: Box::new(launch),
+        metadata: Box::new(metadata.clone()),
+    })
 }
 
 fn main() -> std::io::Result<()> {
@@ -541,6 +576,27 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     };
 
+    let mut launch = launch;
+    let mut resume = resume_requested;
+    loop {
+        match run_launch_session(launch, resume)? {
+            SessionOutcome::Exit => return Ok(()),
+            SessionOutcome::Resume {
+                launch: next,
+                metadata,
+            } => {
+                // Old workers are stopped before restoring the selected snapshot.
+                SessionMetadataStore::open(session_metadata_path_for(&std::env::current_dir()?))
+                    .write(&metadata)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                launch = *next;
+                resume = true;
+            }
+        }
+    }
+}
+
+fn run_launch_session(launch: Launch, resume_requested: bool) -> std::io::Result<SessionOutcome> {
     // Ask supported terminals to report focus changes. Multiplexers retain
     // their own capture policy; the session guard restores raw/fullscreen
     // modes on normal, error, and unwind paths.
@@ -575,7 +631,7 @@ fn main() -> std::io::Result<()> {
         ),
     };
     let restore_result = terminal_session.restore();
-    result.and(restore_result)
+    result.and_then(|outcome| restore_result.map(|()| outcome))
 }
 
 /// Keep the compact flag-based interface while accepting the two documented
@@ -1202,7 +1258,9 @@ fn load_goal(cwd: &Path, resume: bool) -> Option<codeswarm_adapters::goal::Goal>
     codeswarm_adapters::goal::Goal::from_metadata(metadata.metadata.get("goal")?)
 }
 
-fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std::io::Result<()> {
+fn run_store(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+) -> std::io::Result<SessionOutcome> {
     let mut app = App::default();
     let settings = settings_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
@@ -1422,7 +1480,7 @@ fn run_store(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std:
                     100,
                 );
             }
-            StoreAction::Close => return Ok(()),
+            StoreAction::Close => return Ok(SessionOutcome::Exit),
             StoreAction::Directory(_) => {}
             StoreAction::Ignored | StoreAction::Changed => {}
         }
@@ -1908,7 +1966,10 @@ fn save_ui_preferences_at(path: &Path, app: &App) -> std::io::Result<()> {
     })
 }
 
-fn run_preview(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> std::io::Result<()> {
+fn run_preview(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+) -> std::io::Result<SessionOutcome> {
+    let saved_resume = saved_chat_resume();
     let mut app = App::default();
     app.set_header("CodeSwarm preview", "press q to quit");
     app.transcript.append(
@@ -1921,14 +1982,14 @@ fn run_preview(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> st
         fixtures::five_thousand_word_reply(),
         false,
     );
-    run_terminal(terminal, &mut app, None, None, None)
+    run_terminal(terminal, &mut app, None, None, None, saved_resume)
 }
 
 fn run_agy(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     prompt: Option<String>,
     resume: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<SessionOutcome> {
     run_agy_command(terminal, prompt, "agy", resume)
 }
 
@@ -1937,7 +1998,8 @@ fn run_agy_command(
     prompt: Option<String>,
     command: &str,
     resume: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<SessionOutcome> {
+    let saved_resume = saved_chat_resume();
     let initial_prompt = prompt.clone();
     let (events, controls, worker) = spawn_agy_command(prompt, command.to_owned(), resume);
     let mut app = App::default();
@@ -1949,7 +2011,14 @@ fn run_agy_command(
         app.record_human_message(&prompt, false);
     }
     let shutdown = controls.clone();
-    let result = run_terminal(terminal, &mut app, Some(events), Some(controls), None);
+    let result = run_terminal(
+        terminal,
+        &mut app,
+        Some(events),
+        Some(controls),
+        None,
+        saved_resume,
+    );
     stop_worker(shutdown, Some(worker));
     result
 }
@@ -1959,7 +2028,7 @@ fn run_acp(
     program: String,
     prompt: Option<String>,
     resume: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<SessionOutcome> {
     run_acp_program(terminal, program, prompt, resume)
 }
 
@@ -1968,7 +2037,8 @@ fn run_acp_program(
     program: String,
     prompt: Option<String>,
     resume: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<SessionOutcome> {
+    let saved_resume = saved_chat_resume();
     let initial_prompt = prompt.clone();
     let (events, controls, worker) = spawn_acp(program.clone(), prompt, resume);
     let mut app = App::default();
@@ -1980,7 +2050,14 @@ fn run_acp_program(
         app.record_human_message(&prompt, false);
     }
     let shutdown = controls.clone();
-    let result = run_terminal(terminal, &mut app, Some(events), Some(controls), None);
+    let result = run_terminal(
+        terminal,
+        &mut app,
+        Some(events),
+        Some(controls),
+        None,
+        saved_resume,
+    );
     stop_worker(shutdown, worker);
     result
 }
@@ -1995,7 +2072,8 @@ fn run_roster(
     prompt: Option<String>,
     first_slot: usize,
     max_rounds: usize,
-) -> std::io::Result<()> {
+) -> std::io::Result<SessionOutcome> {
+    let saved_resume = saved_chat_resume();
     let mut app = App::default();
     for (slot, spec) in specs.iter().enumerate() {
         let name = match spec {
@@ -2026,6 +2104,7 @@ fn run_roster(
         Some(events),
         Some(controls),
         Some(first_slot),
+        saved_resume,
     );
     stop_worker(shutdown, Some(worker));
     result
@@ -3221,7 +3300,8 @@ fn run_terminal(
     events: Option<Receiver<AdapterResult<AgentEvent>>>,
     controls: Option<tokio::sync::mpsc::UnboundedSender<AdapterControl>>,
     selected_slot: Option<usize>,
-) -> std::io::Result<()> {
+    saved_resume: Result<SessionMetadata, String>,
+) -> std::io::Result<SessionOutcome> {
     load_ui_preferences(app);
     load_config_agents(app);
     if let Ok(root) = std::env::current_dir() {
@@ -3670,7 +3750,7 @@ fn run_terminal(
                         if let Some(controls) = &controls {
                             let _ = controls.send(AdapterControl::Stop);
                         }
-                        return Ok(());
+                        return Ok(SessionOutcome::Exit);
                     }
                     KeyCode::Esc if pending_permission.is_none() && app.path_picker_visible() => {
                         let _ = app.handle_path_picker_key(TuiKey::Esc);
@@ -3910,7 +3990,7 @@ fn run_terminal(
                                         if let Some(controls) = &controls {
                                             let _ = controls.send(AdapterControl::Stop);
                                         }
-                                        return Ok(());
+                                        return Ok(SessionOutcome::Exit);
                                     }
                                     LocalCommand::Cancel => {
                                         if turn_active {
@@ -3921,6 +4001,22 @@ fn run_terminal(
                                             app.status = "cancelling".into();
                                         } else {
                                             app.status = "nothing to cancel".into();
+                                        }
+                                    }
+                                    LocalCommand::Resume => {
+                                        let settings = settings_path()
+                                            .and_then(|path| std::fs::read_to_string(path).ok())
+                                            .unwrap_or_default();
+                                        match chat_resume_outcome(
+                                            &saved_resume,
+                                            &history_project_root,
+                                            &settings,
+                                            turn_active
+                                                || pending_permission.is_some()
+                                                || app.queued_count() > 0,
+                                        ) {
+                                            Ok(outcome) => return Ok(outcome),
+                                            Err(error) => app.status = error,
                                         }
                                     }
                                     LocalCommand::Reload => {
@@ -3986,7 +4082,7 @@ fn run_terminal(
                             if let Some(controls) = &controls {
                                 let _ = controls.send(AdapterControl::Stop);
                             }
-                            return Ok(());
+                            return Ok(SessionOutcome::Exit);
                         }
                         if cancel_requested_at
                             .is_some_and(|started| started.elapsed() <= Duration::from_secs(3))
@@ -3994,7 +4090,7 @@ fn run_terminal(
                             if let Some(controls) = &controls {
                                 let _ = controls.send(AdapterControl::Stop);
                             }
-                            return Ok(());
+                            return Ok(SessionOutcome::Exit);
                         }
                         if let Some(controls) = &controls {
                             app.request_turn_cancellation();
@@ -4952,6 +5048,66 @@ mod tests {
         selected = Some(0);
         consume_one_shot_route(&app, &mut selected);
         assert_eq!(selected, Some(0));
+    }
+
+    #[test]
+    fn chat_resume_uses_retained_session_and_rejects_invalid_or_busy_switches() {
+        let root =
+            std::env::temp_dir().join(format!("codeswarm-chat-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.json");
+        let metadata = SessionMetadata::new(serde_json::json!({
+            "cwd": root,
+            "agents": [{"name":"Codex", "identity":"openai.com", "protocol":"acp",
+                "command":"codex-acp", "supports_load_session":true, "session_id":"previous-session"}],
+            "goal": {"objective":"retained goal"}
+        }).as_object().unwrap().clone());
+        let store = SessionMetadataStore::open(&path);
+        store.write(&metadata).unwrap();
+        let saved = super::load_session_metadata_candidates([path.clone()])
+            .unwrap()
+            .unwrap()
+            .0;
+        // A fresh adapter can replace the on-disk record after the chat opens.
+        store
+            .write(&SessionMetadata::new(
+                serde_json::json!({"cwd":root,"agents":[]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ))
+            .unwrap();
+        let snapshot = Ok(saved);
+        let result = super::chat_resume_outcome(&snapshot, &root, "{}", false).unwrap();
+        let super::SessionOutcome::Resume {
+            launch,
+            metadata: retained,
+        } = result
+        else {
+            panic!("resume");
+        };
+        assert!(
+            matches!(*launch, Launch::Roster { session_ids, prompt: None, .. }
+            if session_ids == vec![Some("previous-session".into())])
+        );
+        assert_eq!(retained.get("goal"), metadata.get("goal"));
+        assert!(
+            super::chat_resume_outcome(&snapshot, &root, "{}", true)
+                .unwrap_err()
+                .contains("Cancel")
+        );
+        for invalid in [
+            Err("No resumable CodeSwarm session for this project".into()),
+            Ok(SessionMetadata::new(serde_json::Map::new())),
+            Ok(super::load_session_metadata_candidates([path])
+                .unwrap()
+                .unwrap()
+                .0),
+        ] {
+            assert!(super::chat_resume_outcome(&invalid, &root, "{}", false).is_err());
+        }
+        assert!(super::chat_resume_outcome(&snapshot, &root.join("other"), "{}", false).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
