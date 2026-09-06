@@ -68,7 +68,7 @@ bounded to preserve tmux responsiveness.
 - On an empty single-line prompt, `Up`/`Down` browse the last 50 persisted prompts.
 - `Tab` completes a slash command; `F1` or `?` toggles help.
 - `Tab` also completes bounded workspace paths after `@`.
-- Click 🔍 to expand a thought/tool detail, or 🔽 to collapse it. `Ctrl+O`
+- Click 💭 for a thought or 🔧 for a tool to toggle its details. `Ctrl+O`
   toggles the focused detail. Collapsed
   thoughts show their newest two word-wrapped lines, scrolling up as each new
   line begins. Tools show a single-line tail preview. Both follow the agent's
@@ -143,10 +143,13 @@ viewport tests.
 
 ## Thought and tool appearance
 
-Thought and tool details follow their agent message. The clickable 🔍/🔽
-controls use the left margin, leaving the text width available. Thoughts use a rolling
+Thought and tool details follow their agent message. Clickable 💭/🔧 icons
+identify them without text labels and leave the full text width available.
+Thoughts use a rolling
 two-line preview: words fill a line, completed lines move up, and older lines
-leave the preview. Tools keep a single-line tail preview. Both use faint gray
+leave the preview. Paragraph breaks act as spaces in the preview, so they
+cannot clear a visible line; expansion preserves the original formatting.
+Tools keep a single-line tail preview. Both use faint gray
 italics so they stay
 visually secondary to messages. Their lower contrast is intentional in all
 three themes; thought/tool details are exempt from the ordinary text contrast

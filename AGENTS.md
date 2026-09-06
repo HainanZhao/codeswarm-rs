@@ -114,9 +114,12 @@
   details, regardless of adapter event order. Thoughts use a word-wrapped,
   rolling two-line preview: a full bottom line moves up as a new line begins,
   and only the newest two lines remain visible. Tools keep a one-line tail
-  preview. Both use faint gray italics. Put clickable 🔍 (expand) / 🔽
-  (collapse) controls in the existing two-column left gutter, one per visible
-  detail block; keep Ctrl+O as the keyboard shortcut. Controls must not consume
+  preview. Flatten paragraph whitespace in collapsed thoughts so blank lines
+  cannot clear the upper line or force text to start on the second line;
+  expanded history keeps the original formatting. Both use faint gray italics.
+  Use only clickable 💭 (thought) and 🔧 (tool) icons in the two-column left
+  gutter, without "Thought"/"Tool" text labels. Each icon toggles expansion;
+  keep Ctrl+O as the keyboard shortcut. Controls must not consume
   preview width, and hit targets must be rebuilt on redraw/scroll/resize.
   Preserve stable block IDs and cached earlier turns when ordering details.
   Thought and tool detail text/previews are an intentional exception:

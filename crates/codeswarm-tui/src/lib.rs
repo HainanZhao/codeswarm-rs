@@ -4714,12 +4714,15 @@ fn render_transcript(
                     )
                     && seen_details.insert(row.block_id)
                 {
-                    let collapsed = app.transcript.is_collapsed(row.block_id) == Some(true);
                     app.detail_controls.push((
                         Rect::new(area.x, area.y + row_index as u16, 2, 1),
                         row.block_id,
                     ));
-                    Some(if collapsed { "🔍" } else { "🔽" })
+                    Some(if row.kind == crate::transcript::BlockKind::Thought {
+                        "💭"
+                    } else {
+                        "🔧"
+                    })
                 } else {
                     None
                 };
@@ -6006,9 +6009,28 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         assert_eq!(app.detail_controls.len(), 2);
+        let (tool_area, _) = app
+            .detail_controls
+            .iter()
+            .find(|(_, id)| *id == tool)
+            .copied()
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(tool_area.x, tool_area.y)].symbol(),
+            "🔧"
+        );
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("Thought ·"));
+        assert!(!rendered.contains("Tool ·"));
         let (area, id) = app.detail_controls[0];
         assert_eq!(id, thought);
-        assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "🔍");
+        assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "💭");
         assert_eq!(app.click_detail(area.x + 2, area.y), None);
         // Both cells of the emoji target the same stable block.
         assert_eq!(app.click_detail(area.x + 1, area.y), Some(false));
@@ -6022,7 +6044,7 @@ mod tests {
             .find(|(_, id)| *id == thought)
             .copied()
             .unwrap();
-        assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "🔽");
+        assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "💭");
         assert_eq!(app.click_detail(area.x, area.y), Some(true));
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         app.scroll_by(1, 60, 8);
@@ -7870,10 +7892,7 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>();
         assert!(rows.iter().any(|row| row.contains("● Codex 12:05")));
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("Thought · checking relay state"))
-        );
+        assert!(rows.iter().any(|row| row.contains("checking relay state")));
         assert!(
             rows.iter()
                 .any(|row| row.contains("  Hello from the agent"))
@@ -7885,7 +7904,7 @@ mod tests {
         assert!(rows.iter().all(|row| !row.contains("Wait · completed")));
         let thought_row = rows
             .iter()
-            .position(|row| row.contains("Thought · checking relay state"))
+            .position(|row| row.contains("checking relay state"))
             .expect("thought row");
         let answer_row = rows
             .iter()
@@ -8001,8 +8020,8 @@ mod tests {
             });
             let rows = app.transcript.viewport(78, 0, 20, 0);
             assert_eq!(rows[1].text, "answer continued", "{order:?}");
-            assert_eq!(rows[2].text, "Thought · reasoning latest");
-            assert!(rows[3].text.starts_with("Tool · Read file"));
+            assert_eq!(rows[2].text, "reasoning latest");
+            assert!(rows[3].text.starts_with("Read file"));
             let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             for y in [2, 3] {
@@ -8077,9 +8096,9 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let row = |y| (2..22).map(|x| buffer[(x, y)].symbol()).collect::<String>();
-        assert_eq!(row(2), "Thought · three four");
-        assert_eq!(row(3), "          five      ");
-        assert!(buffer[(21, 2)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(row(2), "one two three four  ");
+        assert_eq!(row(3), "five                ");
+        assert!(buffer[(2, 2)].modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
@@ -8098,7 +8117,7 @@ mod tests {
         let thought = app.transcript.viewport(120, 0, 2, 0);
         assert!(thought[0].text.starts_with("Agent 0: ["));
         assert!(thought[0].text.ends_with(']'));
-        assert_eq!(thought[1].text, "Thought · first second");
+        assert_eq!(thought[1].text, "first second");
 
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -8113,10 +8132,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Agent 0"), "rendered={rendered:?}");
-        assert!(
-            rendered.contains("Thought · first second"),
-            "rendered={rendered:?}"
-        );
+        assert!(rendered.contains("first second"), "rendered={rendered:?}");
         app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
         app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
             slot: 0,
@@ -8148,7 +8164,7 @@ mod tests {
         let preview = app.transcript.viewport(72, 0, 10, 0);
         assert_eq!(preview.len(), 2);
         assert!(preview[0].text.starts_with("Antigravity: ["));
-        assert!(preview[1].text.starts_with("Tool · …"));
+        assert!(preview[1].text.starts_with("Noisy three"));
         assert!(preview[1].text.contains("tool output"));
 
         terminal
@@ -8162,8 +8178,8 @@ mod tests {
             .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
             .collect::<Vec<_>>();
         assert!(rows.iter().any(|row| row.contains("Antigravity")));
-        assert_eq!(rows.iter().filter(|row| row.contains("Tool ·")).count(), 1);
-        assert_eq!(rows.iter().filter(|row| row.contains("🔍")).count(), 1);
+        assert!(!rows.iter().any(|row| row.contains("Tool ·")));
+        assert_eq!(rows.iter().filter(|row| row.contains("🔧")).count(), 1);
         assert_eq!(app.toggle_focused_detail(), Some(false));
         let history = app.transcript.viewport(72, 0, 10, 0);
         assert_eq!(history.len(), 4);

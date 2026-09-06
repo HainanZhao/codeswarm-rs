@@ -340,7 +340,7 @@ impl Transcript {
                     });
                 }
                 let lines = if block.kind == BlockKind::Thought && block.collapsed {
-                    body.lines().map(str::to_owned).collect()
+                    body.split('\n').map(str::to_owned).collect()
                 } else if block.kind == BlockKind::Tool && !block.collapsed {
                     body.lines()
                         .map(|line| truncate_chars(line, width))
@@ -367,7 +367,7 @@ impl Transcript {
             }
             if block.collapsed {
                 let lines = if block.kind == BlockKind::Thought {
-                    display.lines().map(str::to_owned).collect()
+                    display.split('\n').map(str::to_owned).collect()
                 } else {
                     wrap(&display, width)
                 };
@@ -434,39 +434,14 @@ fn collapsed_thought_preview(block: &TranscriptBlock, width: usize) -> String {
         Some((speaker, &body[..=end], &body[end + 2..]))
     });
     let source = attribution.map_or(block.source.as_str(), |(_, _, content)| content);
-    let prefix = "Thought · ";
-    let preview = if source.trim().is_empty() || width <= prefix.chars().count() {
-        truncate_chars("Thought", width)
-    } else {
-        let lines = wrap(source, width - prefix.chars().count());
-        let visible = &lines[lines.len().saturating_sub(2)..];
-        visible
-            .iter()
-            .enumerate()
-            .map(|(index, line)| {
-                let label = if index == 0 {
-                    prefix.to_owned()
-                } else {
-                    " ".repeat(prefix.chars().count())
-                };
-                format!("{label}{line}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    // Paragraph separators must not evict readable lines or force an empty
+    // second row. Preserve the original source for expanded history.
+    let content = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lines = wrap(&content, width.max(1));
+    let preview = lines[lines.len().saturating_sub(2)..].join("\n");
     attribution.map_or(preview.clone(), |(speaker, timestamp, _)| {
         format!("{speaker}: {timestamp} {preview}")
     })
-}
-
-fn tail_preview(label: &str, source: &str, width: usize) -> String {
-    let prefix = format!("{label} · ");
-    if source.trim().is_empty() || prefix.chars().count() >= width {
-        return truncate_chars(label, width);
-    }
-    let content = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    let visible = truncate_start_chars(&content, width.saturating_sub(prefix.chars().count()));
-    format!("{prefix}{visible}")
 }
 
 fn collapsed_activity_preview(
@@ -489,13 +464,18 @@ fn collapsed_activity_preview(
     })
 }
 
-/// Match the thought preview: one labelled, tail-focused row for the newest call.
+/// Match the thought preview: one unlabelled, tail-focused row for the newest call.
 /// Full retained history remains available through Ctrl+O.
 fn rolling_tool_preview(source: &str, width: usize) -> String {
     let latest = source
         .rsplit_once("\n🔧")
         .map_or(source, |(_, latest)| latest);
-    tail_preview("Tool", latest.trim_start_matches('🔧').trim(), width)
+    let content = latest
+        .trim_start_matches('🔧')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_start_chars(&content, width)
 }
 
 fn bounded_head_preview(label: &str, source: &str, width: usize, max_lines: usize) -> String {
@@ -693,9 +673,8 @@ mod tests {
         );
         let rows = transcript.viewport(40, 0, 10, 0);
         assert_eq!(rows.len(), 2);
-        assert!(rows[0].text.starts_with("Thought · "));
+        assert!(rows[0].text.starts_with("cargo build"));
         assert!(rows[1].text.ends_with("finished"));
-        assert!(!rows[0].text.contains("cargo build"));
         assert!(rows.iter().all(|row| !row.text.contains("Ctrl+O")));
     }
 
@@ -729,30 +708,15 @@ mod tests {
                 .map(|row| row.text)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(text(&mut transcript, 20), ["Thought · one two"]);
+        assert_eq!(text(&mut transcript, 10), ["one two"]);
         transcript.extend(thought, " three");
-        assert_eq!(
-            text(&mut transcript, 20),
-            ["Thought · one two", "          three"]
-        );
+        assert_eq!(text(&mut transcript, 10), ["one two", "three"]);
         transcript.extend(thought, " four");
-        assert_eq!(
-            text(&mut transcript, 20),
-            ["Thought · one two", "          three four"]
-        );
+        assert_eq!(text(&mut transcript, 10), ["one two", "three four"]);
         transcript.extend(thought, " five");
-        assert_eq!(
-            text(&mut transcript, 20),
-            ["Thought · three four", "          five"]
-        );
-        assert_eq!(
-            text(&mut transcript, 30),
-            ["Thought · one two three four", "          five"]
-        );
-        assert_eq!(
-            text(&mut transcript, 20),
-            ["Thought · three four", "          five"]
-        );
+        assert_eq!(text(&mut transcript, 10), ["three four", "five"]);
+        assert_eq!(text(&mut transcript, 20), ["one two three four", "five"]);
+        assert_eq!(text(&mut transcript, 10), ["three four", "five"]);
         assert!(
             transcript
                 .source(thought)
@@ -760,19 +724,41 @@ mod tests {
                 .contains("one two three four five")
         );
         transcript.set_collapsed(thought, false);
-        assert_eq!(text(&mut transcript, 20), ["one two three four", "five"]);
+        assert_eq!(text(&mut transcript, 10), ["one two", "three four", "five"]);
         transcript.replace(thought, BlockKind::Thought, "new", true);
-        assert_eq!(text(&mut transcript, 20), ["Thought · new"]);
+        assert_eq!(text(&mut transcript, 10), ["new"]);
         let mut streamed = Transcript::default();
         let id = streamed.append(BlockKind::Thought, "", true);
         for ch in "one two three four five".chars() {
             streamed.extend(id, &ch.to_string());
-            assert!(streamed.row_count(20) <= 2);
+            assert!(streamed.row_count(10) <= 2);
         }
-        assert_eq!(
-            text(&mut streamed, 20),
-            ["Thought · three four", "          five"]
-        );
+        assert_eq!(text(&mut streamed, 10), ["three four", "five"]);
+    }
+
+    #[test]
+    fn thought_paragraph_breaks_do_not_clear_or_advance_preview_lines() {
+        let mut transcript = Transcript::default();
+        let id = transcript.append(BlockKind::Thought, "one two", true);
+        let rows = |transcript: &mut Transcript| {
+            transcript
+                .viewport(10, 0, 10, 0)
+                .into_iter()
+                .map(|row| row.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&mut transcript), ["one two"]);
+        transcript.extend(id, "\n\n");
+        assert_eq!(rows(&mut transcript), ["one two"]);
+        transcript.extend(id, "three four");
+        assert_eq!(rows(&mut transcript), ["one two", "three four"]);
+        transcript.extend(id, "\n\n\n");
+        assert_eq!(rows(&mut transcript), ["one two", "three four"]);
+        transcript.extend(id, "five");
+        assert_eq!(rows(&mut transcript), ["three four", "five"]);
+        assert!(transcript.source(id).unwrap().contains("\n\n\n"));
+        transcript.replace(id, BlockKind::Thought, "\n\nnew", true);
+        assert_eq!(rows(&mut transcript), ["new"]);
     }
 
     #[test]
@@ -782,16 +768,16 @@ mod tests {
 
         let rows = transcript.viewport(80, 0, 10, 0);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].text, "Thought · checking state");
+        assert_eq!(rows[0].text, "checking state");
     }
 
     #[test]
-    fn collapsed_preview_of_an_empty_block_is_labelled_empty() {
+    fn collapsed_empty_thought_leaves_a_row_for_its_icon() {
         let mut transcript = Transcript::default();
         transcript.append(BlockKind::Thought, "", true);
         let rows = transcript.viewport(80, 0, 10, 0);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].text, "Thought");
+        assert_eq!(rows[0].text, "");
         assert!(!rows[0].text.contains("Ctrl+O"));
     }
 
@@ -810,7 +796,7 @@ mod tests {
             .map(|row| row.text)
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(row.starts_with("Thought · "), "row={row:?}");
+        assert!(row.starts_with("word"), "row={row:?}");
         assert!(row.ends_with("word99"), "row={row:?}");
         assert!(!row.contains("word90 "), "row={row:?}");
     }
@@ -826,7 +812,7 @@ mod tests {
         let rows = transcript.viewport(120, 0, 2, 0);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].text, "Codex: [12:05]");
-        assert_eq!(rows[1].text, "Thought · checking the relay state");
+        assert_eq!(rows[1].text, "checking the relay state");
     }
 
     #[test]
@@ -845,7 +831,7 @@ mod tests {
         let rows = transcript.viewport(80, 0, 10, 0);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].text, "Codex: [12:05]");
-        assert!(rows[1].text.starts_with("Thought · "));
+        assert!(rows[1].text.starts_with("word"));
         assert!(rows[2].text.ends_with("word29"));
     }
 
@@ -868,7 +854,7 @@ mod tests {
         let rows = transcript.viewport(120, 0, 10, 0);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].text, "Codex: [12:05]");
-        assert_eq!(rows[1].text, "Thought · checking state");
+        assert_eq!(rows[1].text, "checking state");
         assert_eq!(rows[2].text, "final answer");
         assert_eq!(rows.iter().filter(|row| row.first_in_block).count(), 1);
     }
@@ -929,7 +915,7 @@ mod tests {
         let rows = transcript.viewport(48, 0, 10, 0);
         assert_eq!(rows[0].text, "Codex: [12:05]");
         assert_eq!(rows.len(), 2);
-        assert!(rows[1].text.starts_with("Tool · …"));
+        assert!(rows[1].text.starts_with("…"));
         assert!(rows[1].text.ends_with("third output line"));
         assert!(rows[1..].iter().all(|row| row.kind == BlockKind::Tool));
     }
