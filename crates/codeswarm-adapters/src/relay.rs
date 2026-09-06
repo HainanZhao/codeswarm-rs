@@ -664,6 +664,20 @@ mod tests {
     }
 
     #[test]
+    fn stop_keyword_requires_the_response_suffix_not_a_mention() {
+        for (text, expected) in [
+            (format!("review done {STOP_TOKEN}"), true),
+            (format!("review done {STOP_TOKEN}\n\t "), true),
+            (format!("consider {STOP_TOKEN}, then keep checking"), false),
+            (format!("{STOP_TOKEN} more reasoning"), false),
+            (format!("{STOP_TOKEN} 👍"), false),
+            (format!("`{STOP_TOKEN}`"), false),
+        ] {
+            assert_eq!(strip_stop_token(&text).1, expected, "{text:?}");
+        }
+    }
+
+    #[test]
     fn accepted_stop_ends_the_batch_but_a_new_prompt_can_start_one() {
         let mut relay = Relay::new(2, 10);
         assert!(matches!(

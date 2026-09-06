@@ -9074,11 +9074,13 @@ mod tests {
     }
 
     #[test]
-    fn two_line_thought_tail_remains_visible_without_hint_clipping() {
+    fn three_line_thought_tail_remains_visible_without_hint_clipping() {
         let mut app = App::default();
         app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
             slot: 0,
-            text: "one two three four five".into(),
+            text:
+                "one two three four five six seven eight nine ten eleven twelve thirteen fourteen"
+                    .into(),
         });
         app.apply_event(&codeswarm_adapters::AgentEvent::Text {
             slot: 0,
@@ -9088,8 +9090,9 @@ mod tests {
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
         let row = |y| (3..22).map(|x| buffer[(x, y)].symbol()).collect::<String>();
-        assert_eq!(row(2), "one two three four ");
-        assert_eq!(row(3), "five               ");
+        assert_eq!(row(1), "eight nine ten     ");
+        assert_eq!(row(2), "eleven twelve      ");
+        assert_eq!(row(3), "thirteen fourteen  ");
         assert!(buffer[(3, 2)].modifier.contains(Modifier::ITALIC));
     }
 

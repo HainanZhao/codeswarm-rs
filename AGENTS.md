@@ -62,6 +62,11 @@
   batch, including the current reviewer. An eligible reviewer with
   nothing meaningful to add may send an emoji followed by the token; a
   token-only response is displayed as `👍`. CodeSwarm always hides the token.
+  A stop is evaluated only after turn completion and only when the final text
+  segment ends in the exact token (ignoring trailing whitespace). Any later
+  meaningful text, thought, tool, permission, or terminal activity invalidates
+  an earlier marker; treat it as non-stopping reasoning. State/usage metadata
+  is not output and does not invalidate a final marker.
 - While work is active, the first `Ctrl+C` requests cancellation and a second
   press within three seconds quits; while idle, `Ctrl+C` quits immediately.
   `codeswarm resume [PATH]` starts the last provider-backed session saved for
@@ -123,8 +128,8 @@
   distinct non-teal roster identity colors remain supported.
   Within each agent turn, render message text before its thought and tool
   details, regardless of adapter event order. Thoughts use a word-wrapped,
-  rolling two-line preview: a full bottom line moves up as a new line begins,
-  and only the newest two lines remain visible. Tools keep a one-line tail
+  rolling three-line preview: a full bottom line moves up as a new line begins,
+  and only the newest three lines remain visible. Tools keep a one-line tail
   preview. Flatten paragraph whitespace in collapsed thoughts so blank lines
   cannot clear the upper line or force text to start on the second line;
   expanded history keeps the original formatting. Both use faint gray italics.

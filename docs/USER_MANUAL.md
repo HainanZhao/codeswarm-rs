@@ -91,7 +91,7 @@ bounded to preserve tmux responsiveness.
 - `Tab` also completes bounded workspace paths after `@`.
 - Click 💭 for a thought or 🔧 for a tool to toggle its details. `Ctrl+O`
   toggles the focused detail. Collapsed
-  thoughts show their newest two word-wrapped lines, scrolling up as each new
+  thoughts show their newest three word-wrapped lines, scrolling up as each new
   line begins. Tools show a single-line tail preview. Both follow the agent's
   message and use faint gray italics. While thinking, finished tool summaries
   move out of the live preview and remain in `/summary`; running tools keep
@@ -171,7 +171,7 @@ identify them without text labels, with one space between each icon and its
 text. Empty completed tool summaries are hidden; running and failed tools
 remain visible.
 Thoughts use a rolling
-two-line preview: words fill a line, completed lines move up, and older lines
+three-line preview: words fill a line, completed lines move up, and older lines
 leave the preview. Paragraph breaks act as spaces in the preview, so they
 cannot clear a visible line; expansion preserves the original formatting.
 Tools keep a single-line tail preview. Both use faint gray
@@ -198,3 +198,11 @@ Native Antigravity turns allow up to 24 hours. ACP prompt turns have no
 CodeSwarm wall-clock limit. The two-minute inactivity warning does not cancel
 work; use Ctrl+C to cancel a running turn. Startup and control requests keep
 their separate deadlines.
+
+## Ending automated review
+
+An eligible reviewer ends a batch by placing `[CODESWARM:STOP]` at the end of
+its final response. Trailing whitespace is allowed. The decision is made only
+when the turn finishes. A marker followed by more text, reasoning, or tool
+activity does not stop the batch; a new final marker is required. Existing
+reviewer eligibility still applies, and the marker stays hidden in message text.

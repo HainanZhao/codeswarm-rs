@@ -1538,7 +1538,7 @@ impl RelayHost {
             "{introduction}{separator}{prompt}{role_separator}{role_block}\n\n{}",
             if effective_can_stop {
                 format!(
-                    "You are reviewing another agent. If no meaningful correction is needed,\nreply with an optional emoji followed by {STOP_TOKEN} on the final line.\nCodeSwarm hides the token and ends this review batch."
+                    "You are reviewing another agent. If no meaningful correction is needed,\nend your final response with {STOP_TOKEN}, optionally preceded by an emoji.\nOnly a terminal marker after all reasoning and tool activity requests a stop. A marker followed by more output or activity is non-stopping reasoning. Trailing whitespace is allowed.\nCodeSwarm hides the token and evaluates it only when your turn is complete."
                 )
             } else {
                 format!(
@@ -1576,6 +1576,9 @@ impl RelayHost {
             self.last_public_dispatch = Some(*slot);
         }
         let mut response = String::new();
+        // Only the final contiguous message segment can request a stop.
+        // Later reasoning/tool activity invalidates an earlier marker.
+        let mut stop_segment_start = 0;
         let mut emitted_text = 0usize;
         let completion_event = loop {
             if self.cancel_requested.swap(false, Ordering::AcqRel) {
@@ -1681,6 +1684,16 @@ impl RelayHost {
             };
             match &update.event {
                 AgentEvent::Text { text, .. } => response.push_str(text),
+                AgentEvent::Thought { text, .. } | AgentEvent::UserText { text, .. }
+                    if !text.trim().is_empty() =>
+                {
+                    stop_segment_start = response.len();
+                }
+                AgentEvent::Tool { .. }
+                | AgentEvent::Permission { .. }
+                | AgentEvent::Terminal { .. } => {
+                    stop_segment_start = response.len();
+                }
                 AgentEvent::TurnComplete { .. } => {
                     let visible_response = response.replace(STOP_TOKEN, "");
                     let visible_start = emitted_text.min(visible_response.len());
@@ -1734,7 +1747,10 @@ impl RelayHost {
                 sink(update.event.clone());
             }
         };
-        let (response, requested_stop) = strip_stop_token(&response);
+        let requested_stop = response[stop_segment_start..]
+            .trim_end()
+            .ends_with(STOP_TOKEN);
+        let (response, _) = strip_stop_token(&response);
         let response = response.replace(STOP_TOKEN, "");
         let accepted_stop = requested_stop && effective_can_stop;
         let needs_stop_acknowledgment = accepted_stop && response.is_empty();
@@ -6338,6 +6354,89 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                 updates[7].clone(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn reviewer_stop_requires_a_terminal_marker_after_all_activity() {
+        let text = |value: &str| AgentEvent::Text {
+            slot: 1,
+            text: value.into(),
+        };
+        let thought = || AgentEvent::Thought {
+            slot: 1,
+            text: "still checking".into(),
+        };
+        let tool = || AgentEvent::Tool {
+            slot: 1,
+            update: crate::ToolUpdate {
+                id: "read".into(),
+                title: "Read file".into(),
+                status: ToolStatus::Running,
+                detail: None,
+            },
+        };
+        let cases = vec![
+            (vec![text(&format!("done {STOP_TOKEN}"))], true),
+            (vec![text(STOP_TOKEN), text("\n  ")], true),
+            (vec![text(STOP_TOKEN), text(" actually keep going")], false),
+            (vec![text(STOP_TOKEN), thought()], false),
+            (vec![text(STOP_TOKEN), tool()], false),
+            (vec![text(STOP_TOKEN), tool(), text(" ")], false),
+            (vec![text(STOP_TOKEN), tool(), text(STOP_TOKEN)], true),
+            (vec![text("[CODESWARM:"), text("STOP]")], true),
+            (vec![text("[CODESWARM:"), thought(), text("STOP]")], false),
+            (
+                vec![AgentEvent::Thought {
+                    slot: 1,
+                    text: STOP_TOKEN.into(),
+                }],
+                false,
+            ),
+            (
+                vec![
+                    text(STOP_TOKEN),
+                    AgentEvent::UsageUpdated {
+                        slot: 1,
+                        usage: crate::UsageUpdate { used: 1, size: 100 },
+                    },
+                ],
+                true,
+            ),
+        ];
+        for (mut events, stop) in cases {
+            let first = ScriptedAdapter::new(
+                0,
+                AgentCapabilities::default(),
+                [
+                    AgentEvent::Text {
+                        slot: 0,
+                        text: "initial response".into(),
+                    },
+                    AgentEvent::TurnComplete { slot: 0 },
+                    AgentEvent::TurnComplete { slot: 0 },
+                ],
+            );
+            events.push(AgentEvent::TurnComplete { slot: 1 });
+            let reviewer = ScriptedAdapter::new(1, AgentCapabilities::default(), events.clone());
+            let mut relay = RelayHost::new(
+                vec![
+                    AdapterHost::new(Box::new(first), None),
+                    AdapterHost::new(Box::new(reviewer), None),
+                ],
+                4,
+            )
+            .unwrap();
+            relay.start().await.unwrap();
+            relay.run_turn("task", 0).await.unwrap();
+            relay.run_turn("", 0).await.unwrap();
+            let next = relay.run_turn("", 0).await.unwrap();
+            assert_eq!(
+                matches!(next, RelayDecision::Complete),
+                stop,
+                "events={events:?}"
+            );
+            relay.stop().await.unwrap();
+        }
     }
 
     #[tokio::test]

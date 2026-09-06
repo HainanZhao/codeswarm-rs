@@ -488,7 +488,7 @@ fn collapsed_thought_preview(block: &TranscriptBlock, width: usize) -> String {
     // second row. Preserve the original source for expanded history.
     let content = source.split_whitespace().collect::<Vec<_>>().join(" ");
     let lines = wrap(&content, width.max(1));
-    let preview = lines[lines.len().saturating_sub(2)..].join("\n");
+    let preview = lines[lines.len().saturating_sub(3)..].join("\n");
     attribution.map_or(preview.clone(), |(speaker, timestamp, _)| {
         format!("{speaker}: {timestamp} {preview}")
     })
@@ -776,7 +776,7 @@ mod tests {
             fixtures::five_thousand_word_reply(),
             true,
         );
-        assert_eq!(transcript.row_count(80), 2);
+        assert_eq!(transcript.row_count(80), 3);
         assert!(transcript.set_collapsed(id, false));
         assert!(transcript.row_count(80) > 100);
     }
@@ -797,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_thought_preview_uses_two_rows_at_any_width() {
+    fn collapsed_thought_preview_uses_three_rows_at_any_width() {
         let mut transcript = Transcript::default();
         transcript.append(
             BlockKind::Thought,
@@ -805,9 +805,9 @@ mod tests {
             true,
         );
         for width in [20usize, 40, 80, 120] {
-            assert_eq!(transcript.row_count(width), 2);
+            assert_eq!(transcript.row_count(width), 3);
             let rows = transcript.viewport(width, 0, 10, 0);
-            assert_eq!(rows.len(), 2);
+            assert_eq!(rows.len(), 3);
             assert!(
                 rows.iter().all(|row| row.text.chars().count() <= width),
                 "overflow at {width}"
@@ -832,9 +832,9 @@ mod tests {
         transcript.extend(thought, " four");
         assert_eq!(text(&mut transcript, 10), ["one two", "three four"]);
         transcript.extend(thought, " five");
-        assert_eq!(text(&mut transcript, 10), ["three four", "five"]);
+        assert_eq!(text(&mut transcript, 10), ["one two", "three four", "five"]);
         assert_eq!(text(&mut transcript, 20), ["one two three four", "five"]);
-        assert_eq!(text(&mut transcript, 10), ["three four", "five"]);
+        assert_eq!(text(&mut transcript, 10), ["one two", "three four", "five"]);
         assert!(
             transcript
                 .source(thought)
@@ -849,9 +849,11 @@ mod tests {
         let id = streamed.append(BlockKind::Thought, "", true);
         for ch in "one two three four five".chars() {
             streamed.extend(id, &ch.to_string());
-            assert!(streamed.row_count(10) <= 2);
+            assert!(streamed.row_count(10) <= 3);
         }
-        assert_eq!(text(&mut streamed, 10), ["three four", "five"]);
+        assert_eq!(text(&mut streamed, 10), ["one two", "three four", "five"]);
+        streamed.extend(id, " six seven");
+        assert_eq!(text(&mut streamed, 10), ["three four", "five six", "seven"]);
     }
 
     #[test]
@@ -873,7 +875,7 @@ mod tests {
         transcript.extend(id, "\n\n\n");
         assert_eq!(rows(&mut transcript), ["one two", "three four"]);
         transcript.extend(id, "five");
-        assert_eq!(rows(&mut transcript), ["three four", "five"]);
+        assert_eq!(rows(&mut transcript), ["one two", "three four", "five"]);
         assert!(transcript.source(id).unwrap().contains("\n\n\n"));
         transcript.replace(id, BlockKind::Thought, "\n\nnew", true);
         assert_eq!(rows(&mut transcript), ["new"]);
@@ -909,14 +911,14 @@ mod tests {
         transcript.append(BlockKind::Thought, source, true);
 
         let row = transcript
-            .viewport(40, 0, 2, 0)
+            .viewport(40, 0, 3, 0)
             .into_iter()
             .map(|row| row.text)
             .collect::<Vec<_>>()
             .join(" ");
         assert!(row.starts_with("word"), "row={row:?}");
         assert!(row.ends_with("word99"), "row={row:?}");
-        assert!(!row.contains("word90 "), "row={row:?}");
+        assert!(!row.contains("word80 "), "row={row:?}");
     }
 
     #[test]
@@ -934,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn attributed_long_thought_uses_one_header_and_two_preview_rows() {
+    fn attributed_long_thought_uses_one_header_and_three_preview_rows() {
         let mut transcript = Transcript::default();
         let thought = (0..30)
             .map(|index| format!("word{index}"))
@@ -947,10 +949,10 @@ mod tests {
         );
 
         let rows = transcript.viewport(80, 0, 10, 0);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].text, "Codex: [12:05]");
         assert!(rows[1].text.starts_with("word"));
-        assert!(rows[2].text.ends_with("word29"));
+        assert!(rows[3].text.ends_with("word29"));
     }
 
     #[test]

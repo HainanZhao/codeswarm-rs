@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-06
+
 ### Fixed
 
+- Stop markers only end review when they terminate the final text segment;
+  later reasoning or tool activity invalidates earlier markers.
+- Increased the rolling thought preview from two lines to three.
 - Sort archive failures by session ID for deterministic listings on macOS and Linux.
 
 ## [0.10.0] - 2026-09-06
