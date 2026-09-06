@@ -991,6 +991,7 @@ impl RelayHost {
                         let host = self.hosts.get(slot)?;
                         let (protocol, command) = self.roster_launch_specs.get(slot)?;
                         let mut agent = serde_json::Map::new();
+                        agent.insert("slot".into(), serde_json::json!(slot));
                         agent.insert(
                             "name".into(),
                             serde_json::Value::String(
@@ -1105,6 +1106,47 @@ impl RelayHost {
                 let _ = host.stop().await;
             }
             return Err(error);
+        }
+        let _ = self.queue_session_metadata();
+        Ok(())
+    }
+
+    /// Restore each provider independently. An expired saved handle must not
+    /// tear down healthy peers; failed slots are immediately unroutable.
+    pub async fn start_resuming(&mut self) -> AdapterResult<()> {
+        let event_sink = self.event_sink.clone();
+        let policy = self.desired_policy.clone();
+        let starts = self.hosts.iter_mut().map(|host| {
+            let sink = event_sink.clone();
+            let policy = policy.clone();
+            async move {
+                host.start().await?;
+                refresh_adapter_startup(host, &sink).await?;
+                apply_policy_to_host(host, &policy).await
+            }
+        });
+        let results = futures::future::join_all(starts).await;
+        let mut first_error = None;
+        for (slot, result) in results.into_iter().enumerate() {
+            if let Err(error) = result {
+                let _ = self.relay.tombstone(slot);
+                let _ = self.hosts[slot].stop().await;
+                if let Some(sink) = &event_sink {
+                    sink(AgentEvent::Failed {
+                        slot,
+                        started: false,
+                        detail: format!("saved session could not be restored: {error}"),
+                    });
+                }
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if self.relay.active_slots().next().is_none() {
+            return Err(first_error.unwrap_or_else(|| {
+                AdapterError::Transport("no saved providers could be restored".into())
+            }));
         }
         let _ = self.queue_session_metadata();
         Ok(())
@@ -5856,6 +5898,66 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
     }
 
     #[tokio::test]
+    async fn failed_resume_does_not_stop_or_dispatch_to_healthy_peer() {
+        let stops = Arc::new(AtomicUsize::new(0));
+        let failed = FailingStartAdapter {
+            slot: 0,
+            stopped: stops.clone(),
+        };
+        let healthy = ScriptedAdapter::new(
+            1,
+            AgentCapabilities::default(),
+            [
+                AgentEvent::Text {
+                    slot: 1,
+                    text: "healthy response".into(),
+                },
+                AgentEvent::TurnComplete { slot: 1 },
+            ],
+        );
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let mut relay = RelayHost::new(
+            vec![
+                AdapterHost::new(Box::new(failed), None),
+                AdapterHost::new(Box::new(healthy), None),
+            ],
+            4,
+        )
+        .unwrap();
+        relay.set_event_sink(move |event| captured.lock().unwrap().push(event));
+        relay.start_resuming().await.unwrap();
+        assert_eq!(relay.relay().active_slots().collect::<Vec<_>>(), vec![1]);
+        assert!(relay.dispatches().is_empty());
+        assert_eq!(stops.load(Ordering::Relaxed), 1);
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Failed { slot: 0, .. }))
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Failed { slot: 1, .. }))
+        );
+        assert!(!relay.relay_mut().enqueue_human("do not retarget", Some(0)));
+        assert!(
+            relay
+                .relay_mut()
+                .enqueue_human("explicit healthy target", Some(1))
+        );
+        assert!(matches!(
+            relay.run_turn("", 1).await.unwrap(),
+            RelayDecision::Dispatch { slot: 1, .. }
+        ));
+        relay.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn pair_strategy_wires_roles_into_non_direct_prompts() {
         let capabilities = AgentCapabilities::default();
         let first = ScriptedAdapter::new(
@@ -6826,8 +6928,8 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         assert_eq!(
             metadata.get("agents"),
             Some(&serde_json::json!([
-                {"name": "First", "identity": "owner.example", "protocol": "custom", "command": "owner", "supports_load_session": false},
-                {"name": "Reviewer", "identity": "reviewer.example", "protocol": "custom", "command": "reviewer --acp", "supports_load_session": false}
+                {"slot": 0, "name": "First", "identity": "owner.example", "protocol": "custom", "command": "owner", "supports_load_session": false},
+                {"slot": 2, "name": "Reviewer", "identity": "reviewer.example", "protocol": "custom", "command": "reviewer --acp", "supports_load_session": false}
             ]))
         );
         assert!(
@@ -6872,7 +6974,7 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         assert_eq!(
             loaded.get("agents"),
             Some(&serde_json::json!([{
-                "name": "Codex", "identity": "openai.com", "protocol": "custom",
+                "slot": 1, "name": "Codex", "identity": "openai.com", "protocol": "custom",
                 "command": "codex", "supports_load_session": false
             }]))
         );

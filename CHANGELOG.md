@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-09-06
+
+### Fixed
+
+- Keep thought and tool previews visible as responses advance, removing
+  automatic hiding and the resulting scroll jumps.
+- Selecting the currently open session no longer shuts down its agents.
+- Failed provider resumes are isolated from healthy peers, preserve recovery
+  metadata, and never silently redirect the failed recipient's prompt.
+- Pending messages appear only in the queue until dispatch; failed sends retain
+  the input instead of adding an unsent message to chat.
+
 ## [0.10.1] - 2026-09-06
 
 ### Fixed

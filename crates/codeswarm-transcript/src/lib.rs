@@ -5,7 +5,7 @@
 //! rows; it does not reparse the full transcript, talk to an adapter, or wait
 //! for persistence.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -47,7 +47,6 @@ pub struct Transcript {
     blocks: Vec<TranscriptBlock>,
     next_id: u64,
     detail_indent: usize,
-    suppressed_details: BTreeSet<u64>,
     cached_width: Option<usize>,
     rows: Vec<RenderRow>,
     block_starts: BTreeMap<u64, usize>,
@@ -107,25 +106,6 @@ impl Transcript {
         true
     }
 
-    /// Hide an inactive collapsed detail without deleting its retained source.
-    /// Explicitly expanded details remain visible regardless of this flag.
-    pub fn suppress_detail(&mut self, id: u64, suppressed: bool) -> bool {
-        let Some(index) = self.blocks.iter().position(|block| {
-            block.id == id && matches!(block.kind, BlockKind::Thought | BlockKind::Tool)
-        }) else {
-            return false;
-        };
-        let changed = if suppressed {
-            self.suppressed_details.insert(id)
-        } else {
-            self.suppressed_details.remove(&id)
-        };
-        if changed {
-            self.invalidate_from(index);
-        }
-        true
-    }
-
     /// Number of durable logical blocks, not currently visible terminal rows.
     pub fn len(&self) -> usize {
         self.blocks.len()
@@ -165,7 +145,6 @@ impl Transcript {
 
     pub fn clear(&mut self) {
         self.blocks.clear();
-        self.suppressed_details.clear();
         self.next_id = 0;
         self.invalidate_rows();
     }
@@ -345,9 +324,6 @@ impl Transcript {
                 header_speaker = None;
             }
             self.block_starts.insert(block.id, self.rows.len());
-            if block.collapsed && self.suppressed_details.contains(&block.id) {
-                continue;
-            }
             // Terminal lifecycle stays available for export without adding
             // noisy create/output/exit records to the conversation.
             if block.kind == BlockKind::Terminal {

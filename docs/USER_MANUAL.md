@@ -25,11 +25,14 @@ compatibility with the previous launcher. `codeswarm --help` and
 starting providers. Inside chat, `/sessions` lists saved conversations with
 their title, roster, last activity and response preview. Navigate with arrows
 or the mouse wheel, press Enter to open, and Esc to return. `/resume` opens the
-previous saved session. Switching is blocked during active work or queued input.
+previous saved session. Switching is blocked during active work or queued input. Selecting the current
+session does nothing and keeps its agents connected.
 
 History is owned by CodeSwarm and remains readable if a provider is missing or
 its session has expired. A new message reconnects the selected saved provider;
-Ctrl+Enter continues privately. Older provider-only sessions may have no local
+Ctrl+Enter continues privately. If one saved provider cannot be restored,
+healthy peers stay available. An unsent prompt for the failed agent is not
+redirected automatically; choose an available agent and send again. Older provider-only sessions may have no local
 transcript until you continue and the provider replays it. A normal `codeswarm`
 launch still starts a fresh provider session and a separate archive.
 
@@ -84,7 +87,9 @@ bounded to preserve tmux responsiveness.
 
 ## Prompt and keyboard controls
 
-- `Enter` submits a prompt; `Shift+Enter` inserts a newline.
+- `Enter` submits a prompt; `Shift+Enter` inserts a newline. While an agent is
+  working, pending input appears only in the queue and moves into chat when
+  dispatched. Cancelling it leaves no duplicate conversation message.
 - `Up`/`Down` scroll the transcript; `End` follows the live tail.
 - On an empty single-line prompt, `Up`/`Down` browse the last 50 persisted prompts.
 - `Tab` completes a slash command; `F1` or `?` toggles help.
@@ -93,9 +98,8 @@ bounded to preserve tmux responsiveness.
   toggles the focused detail. Collapsed
   thoughts show their newest three word-wrapped lines, scrolling up as each new
   line begins. Tools show a single-line tail preview. Both follow the agent's
-  message and use faint gray italics. While thinking, finished tool summaries
-  move out of the live preview and remain in `/summary`; running tools keep
-  their output visible. Manually expanded details stay open.
+  message and use faint gray italics. Both previews remain visible as the
+  response advances; click their icons to expand or collapse them.
 - `Ctrl+Enter` sends to the selected roster agent.
 - `Ctrl+C` cancels active work; while idle it exits.
 - `Esc` closes the active picker, help, permission, or settings surface.

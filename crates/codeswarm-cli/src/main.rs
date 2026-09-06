@@ -360,6 +360,51 @@ enum AdapterControl {
     Stop,
 }
 
+fn record_dispatched_prompt(
+    app: &mut App,
+    journal: &mut Option<product::ConversationJournal>,
+    prompt: &str,
+    direct: bool,
+) {
+    app.record_human_message(prompt, direct);
+    if let Some(journal) = journal
+        && let Err(error) = journal.human(prompt, direct)
+    {
+        app.status = format!("unable to archive prompt: {error}");
+    }
+}
+
+fn same_provider_session(left: &SessionMetadata, right: &SessionMetadata) -> bool {
+    let handles = |metadata: &SessionMetadata| {
+        metadata
+            .get("agents")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|agent| {
+                (
+                    agent
+                        .get("identity")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    agent
+                        .get("session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let left = handles(left);
+    left.iter().any(|(_, handle)| !handle.is_empty()) && left == handles(right)
+}
+
+fn selecting_current_session(selected: &str, current: Option<&str>) -> bool {
+    current == Some(selected)
+}
+
 fn normal_prompt_control(target: Option<usize>, prompt: String) -> AdapterControl {
     match target {
         Some(slot) => AdapterControl::Queue { slot, prompt },
@@ -2049,12 +2094,13 @@ struct SessionSetup {
 
 fn run_saved_continue(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    conversation: product::SavedConversation,
+    mut conversation: product::SavedConversation,
     prompt: String,
     slot: usize,
     direct: bool,
 ) -> std::io::Result<SessionOutcome> {
     let cwd = std::env::current_dir()?;
+    product::rebase_provider_slots(&mut conversation.metadata);
     let settings = settings_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_default();
@@ -3061,7 +3107,8 @@ fn run_relay_task(
                 (protocol.to_owned(), agent_spec_command(spec).to_owned())
             })
             .collect::<Vec<_>>();
-        let restored_goal = load_goal(&cwd, session_ids.iter().any(Option::is_some));
+        let resuming = session_ids.iter().any(Option::is_some);
+        let restored_goal = load_goal(&cwd, resuming);
         let hosts = specs
             .into_iter()
             .enumerate()
@@ -3139,7 +3186,7 @@ fn run_relay_task(
         }
         let mut pending_commands = match await_startup(
             async {
-                relay.start().await?;
+                if resuming { relay.start_resuming().await?; } else { relay.start().await?; }
                 for (slot, model) in models.into_iter().enumerate() {
                     if let Some(model) = model
                         && let Err(error) = relay.set_model(slot, model).await
@@ -3172,6 +3219,14 @@ fn run_relay_task(
                 return;
             }
         };
+        let prompt = if resuming && !relay.relay().active_slots().any(|slot| slot == first_slot) {
+            if prompt.is_some() {
+                let _ = sender.send(Ok(AgentEvent::RosterUpdated { update: codeswarm_adapters::RosterUpdate::Rejected {
+                    action: "continue saved session".into(), detail: format!("agent {first_slot} could not resume; the message was not sent. Choose an available agent and send again."),
+                } }));
+            }
+            None
+        } else { prompt };
         if let Some(prompt) = prompt {
             let (stopping, deferred) = if pending_commands.is_empty() {
                 run_relay_sequence_with_controls(
@@ -3792,6 +3847,12 @@ fn run_terminal(
                             && dispatch_queued_prompt(controls.as_ref(), &queued)
                         {
                             app.remove_queued_prompt(queued.id);
+                            record_dispatched_prompt(
+                                app,
+                                &mut journal,
+                                &queued.prompt,
+                                queued.direct,
+                            );
                             turn_active = true;
                             app.status = "queued prompt dispatched".into();
                         }
@@ -3935,6 +3996,15 @@ fn run_terminal(
                 {
                     app.handle_product_panel_key(Input::from(key));
                     if let Some(id) = app.take_session_request() {
+                        let current = journal.as_ref().map(|journal| journal.id()).or_else(|| {
+                            saved_conversation
+                                .as_ref()
+                                .and_then(|saved| saved.id.as_deref())
+                        });
+                        if selecting_current_session(&id, current) {
+                            app.status = "this session is already open".into();
+                            continue;
+                        }
                         if turn_active || pending_permission.is_some() || app.queued_count() > 0 {
                             app.status = "cancel active work and clear queued prompts before switching sessions".into();
                         } else {
@@ -4230,12 +4300,6 @@ fn run_terminal(
                         if let Some(controls) = &controls {
                             let prompt = app.prompt.clone();
                             let slot = app.next_agent_slot().expect("guarded recipient");
-                            if let Some(journal) = &mut journal
-                                && let Err(error) = journal.human(&prompt, true)
-                            {
-                                app.status = format!("unable to archive prompt: {error}");
-                            }
-                            app.record_human_message(&prompt, true);
                             if turn_active {
                                 if app.queue_prompt(prompt, Some(slot), true).is_some() {
                                     let _ = app.take_prompt();
@@ -4251,9 +4315,13 @@ fn run_terminal(
                                 })
                                 .is_ok()
                             {
+                                record_dispatched_prompt(app, &mut journal, &prompt, true);
                                 turn_active = true;
                                 consume_one_shot_route(app, &mut selected_slot);
                                 app.status = "direct turn queued".into();
+                            } else {
+                                app.prompt = prompt;
+                                app.status = "agent connection closed; message not sent".into();
                             }
                         }
                     }
@@ -4449,7 +4517,19 @@ fn run_terminal(
                                                     );
                                                     continue;
                                                 }
-                                                Ok(None) => {}
+                                                Ok(None) => {
+                                                    if let (Some(journal), Ok(saved)) =
+                                                        (&journal, &saved_resume)
+                                                        && same_provider_session(
+                                                            &journal.metadata,
+                                                            saved,
+                                                        )
+                                                    {
+                                                        app.status =
+                                                            "this session is already open".into();
+                                                        continue;
+                                                    }
+                                                }
                                             }
                                         }
                                         let settings = settings_path()
@@ -4522,29 +4602,30 @@ fn run_terminal(
                                 app.status = "selected agent has no resumable provider handle; history remains available".into();
                             } else if let Some(controls) = &controls {
                                 let target = app.next_agent_slot();
-                                if let Some(journal) = &mut journal
-                                    && let Err(error) = journal.human(&prompt, false)
-                                {
-                                    app.status = format!("unable to archive prompt: {error}");
-                                }
-                                app.record_human_message(&prompt, false);
                                 if turn_active {
-                                    if app.queue_prompt(prompt, target, false).is_some() {
+                                    if app.queue_prompt(prompt.clone(), target, false).is_some() {
                                         consume_one_shot_route(app, &mut selected_slot);
                                         app.status = "prompt queued".into();
                                     } else {
+                                        app.prompt = prompt;
                                         app.status = "queue full or prompt empty".into();
                                     }
                                 } else {
                                     let Some(slot) = target else {
+                                        app.prompt = prompt;
                                         app.status = "no available agent for this message".into();
                                         continue;
                                     };
-                                    let command = normal_prompt_control(Some(slot), prompt);
+                                    let command = normal_prompt_control(Some(slot), prompt.clone());
                                     if controls.send(command).is_ok() {
+                                        record_dispatched_prompt(app, &mut journal, &prompt, false);
                                         turn_active = true;
                                         consume_one_shot_route(app, &mut selected_slot);
                                         app.status = "queued".into();
+                                    } else {
+                                        app.prompt = prompt;
+                                        app.status =
+                                            "agent connection closed; message not sent".into();
                                     }
                                 }
                             }
@@ -4853,6 +4934,28 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn pending_messages_only_enter_chat_after_dispatch() {
+        for direct in [false, true] {
+            let mut app = App::default();
+            let id = app
+                .queue_prompt("pending message", Some(0), direct)
+                .unwrap();
+            assert!(!app.export_markdown().contains("pending message"));
+            let queued = app.next_queued_prompt().cloned().unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            assert!(dispatch_queued_prompt(Some(&sender), &queued));
+            assert!(receiver.try_recv().is_ok());
+            app.remove_queued_prompt(id);
+            super::record_dispatched_prompt(&mut app, &mut None, &queued.prompt, queued.direct);
+            assert_eq!(app.export_markdown().matches("pending message").count(), 1);
+            assert_eq!(app.queued_count(), 0);
+        }
+        assert!(super::selecting_current_session("current", Some("current")));
+        assert!(!super::selecting_current_session("other", Some("current")));
+        assert!(!super::selecting_current_session("other", None));
+    }
 
     #[test]
     fn queued_message_keeps_the_recipient_shown_by_the_arrow() {

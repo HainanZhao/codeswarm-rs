@@ -51,6 +51,8 @@
   selection overrides that target: the prompt footer names the selected agent
   as the next recipient, so a queued message has to be delivered to it rather
   than to whichever agent happened to be working when it was submitted.
+- Pending prompts appear only in the queue; append them to the transcript and
+  archive when dispatched. Cancelling a queued prompt must leave no chat message.
 - Snapshot the footer arrow recipient on submission and retain that exact
   target through queuing and handoffs; never fall back to another agent.
 - Clicking an agent beside the prompt selects it as the first recipient for
@@ -77,7 +79,11 @@
   starts adapters; a new human prompt or explicit goal run reconnects them. It appears in
   local help/completion, accepts no arguments, and rejects active work, pending
   permissions, or queued prompts via the status ribbon. Fresh startup metadata
-  must never replace the retained resume target.
+  must never replace the retained resume target. Selecting the already-open
+  archive is a no-op and must not restart its adapters. During provider resume,
+  isolate failed slots and keep healthy peers available. Never redirect a failed
+  selected recipient's initial prompt to a different agent; report it as unsent.
+  Retain failed provider handles in local archives until explicit removal.
   Resume is history-only until a new human prompt: ACP session/load replay is
   display-only history, never live activity. It must not start timers, set a
   busy turn, queue input behind phantom work, or automatically dispatch agents.
@@ -142,9 +148,9 @@
   Each icon toggles expansion;
   keep Ctrl+O as the keyboard shortcut. Controls must not consume
   preview width, and hit targets must be rebuilt on redraw/scroll/resize.
-  While thoughts are streaming, suppress completed collapsed tool previews;
-  keep their evidence available in `/summary`. Show active tool output and
-  preserve explicitly expanded details. The footer owns routine activity;
+  Thought and tool previews remain visible as activity advances; do not add
+  automatic hiding or special scroll compensation. Details stay collapsed
+  unless explicitly expanded. The footer owns routine activity;
   do not flash a redundant "working" ribbon.
   Preserve stable block IDs and cached earlier turns when ordering details.
   Thought and tool detail text/previews are an intentional exception:

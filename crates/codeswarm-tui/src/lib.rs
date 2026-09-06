@@ -2591,7 +2591,7 @@ impl App {
 
     pub fn finish_turn_cancellation(&mut self) {
         for slot in std::mem::take(&mut self.cancelling_agents) {
-            self.restore_turn_details(slot);
+            self.thinking_agents.remove(&slot);
             self.agent_turn_started.remove(&slot);
             self.agent_states.insert(slot, "ready".into());
         }
@@ -3503,14 +3503,6 @@ impl App {
                     id
                 });
                 self.transcript.extend(id, text);
-                self.transcript.suppress_detail(id, false);
-                if let Some(window) = self.tool_windows.get(slot) {
-                    let completed = window
-                        .calls
-                        .iter()
-                        .all(|call| call.status == ToolStatus::Completed);
-                    self.transcript.suppress_detail(window.block_id, completed);
-                }
                 self.active_agent = self.agent_name(*slot);
                 self.agent_states.insert(*slot, "working".into());
                 self.status = "thinking".into();
@@ -3571,22 +3563,6 @@ impl App {
                 let executing = matches!(update.status, ToolStatus::Pending | ToolStatus::Running);
                 if executing || update.status == ToolStatus::Failed {
                     self.thinking_agents.remove(slot);
-                    if let Some(thought) = self
-                        .streaming_blocks
-                        .get(&(*slot, crate::transcript::BlockKind::Thought))
-                        .copied()
-                    {
-                        self.transcript.suppress_detail(thought, true);
-                    }
-                    self.transcript.suppress_detail(block_id, false);
-                } else if self.thinking_agents.contains(slot) {
-                    let completed = self.tool_windows.get(slot).is_some_and(|window| {
-                        window
-                            .calls
-                            .iter()
-                            .all(|call| call.status == ToolStatus::Completed)
-                    });
-                    self.transcript.suppress_detail(block_id, completed);
                 }
                 if !self.thinking_agents.contains(slot) {
                     self.focused_detail = Some(block_id);
@@ -3635,7 +3611,7 @@ impl App {
                 self.agent_states.insert(*slot, "working".into());
             }
             AgentEvent::TurnComplete { slot } => {
-                self.restore_turn_details(*slot);
+                self.thinking_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.streaming_blocks
@@ -3657,7 +3633,7 @@ impl App {
                 self.next_agent = self.next_roster_slot_after(*slot);
             }
             AgentEvent::UsageLimitReached { slot, detail } => {
-                self.restore_turn_details(*slot);
+                self.thinking_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.tool_windows.remove(slot);
@@ -3688,7 +3664,7 @@ impl App {
                 started,
                 detail,
             } => {
-                self.restore_turn_details(*slot);
+                self.thinking_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.tool_windows.remove(slot);
@@ -3741,20 +3717,6 @@ impl App {
     }
 
     /// Toggle the detail icon last rendered at this terminal coordinate.
-    fn restore_turn_details(&mut self, slot: usize) {
-        self.thinking_agents.remove(&slot);
-        if let Some(id) = self
-            .streaming_blocks
-            .get(&(slot, crate::transcript::BlockKind::Thought))
-            .copied()
-        {
-            self.transcript.suppress_detail(id, false);
-        }
-        if let Some(window) = self.tool_windows.get(&slot) {
-            self.transcript.suppress_detail(window.block_id, false);
-        }
-    }
-
     pub fn click_detail(&mut self, column: u16, row: u16) -> Option<bool> {
         if self.config_visible || self.store_visible {
             return None;
@@ -8911,7 +8873,7 @@ mod tests {
     }
 
     #[test]
-    fn active_details_hide_finished_tools_but_keep_running_and_expanded_output() {
+    fn activity_changes_keep_thought_and_tool_previews_visible() {
         use codeswarm_adapters::AgentEvent;
         let mut app = App::default();
         let tool = |status| AgentEvent::Tool {
@@ -8932,7 +8894,7 @@ mod tests {
         app.apply_event(&thought);
         let rows = app.transcript.viewport(78, 0, 20, 0);
         assert!(rows.iter().any(|row| row.kind == BlockKind::Thought));
-        assert!(rows.iter().all(|row| row.kind != BlockKind::Tool));
+        assert!(rows.iter().any(|row| row.kind == BlockKind::Tool));
         assert!(app.export_markdown().contains("retained result"));
         app.transcript.set_collapsed(tool_id, false);
         assert!(
@@ -8948,14 +8910,14 @@ mod tests {
             rows.iter()
                 .any(|row| row.kind == BlockKind::Tool && row.text.contains("retained result"))
         );
-        assert!(rows.iter().all(|row| row.kind != BlockKind::Thought));
+        assert!(rows.iter().any(|row| row.kind == BlockKind::Thought));
         app.apply_event(&tool(codeswarm_adapters::ToolStatus::Completed));
         app.apply_event(&thought);
         assert!(
             app.transcript
                 .viewport(78, 0, 20, 0)
                 .iter()
-                .all(|row| row.kind != BlockKind::Tool)
+                .any(|row| row.kind == BlockKind::Tool)
         );
         app.apply_event(&AgentEvent::TurnComplete { slot: 0 });
         assert!(
@@ -9074,17 +9036,53 @@ mod tests {
     }
 
     #[test]
+    fn response_text_keeps_collapsed_and_expanded_details_visible() {
+        for expanded in [false, true] {
+            let mut app = App::default();
+            app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
+                slot: 0,
+                text: "reasoning".into(),
+            });
+            app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
+                slot: 0,
+                update: codeswarm_adapters::ToolUpdate {
+                    id: "read".into(),
+                    title: "Read file".into(),
+                    status: codeswarm_adapters::ToolStatus::Completed,
+                    detail: Some("result".into()),
+                },
+            });
+            let thought = app.streaming_blocks[&(0, BlockKind::Thought)];
+            let tool = app.tool_windows[&0].block_id;
+            if expanded {
+                app.transcript.set_collapsed(thought, false);
+                app.transcript.set_collapsed(tool, false);
+            }
+            app.apply_event(&codeswarm_adapters::AgentEvent::Text {
+                slot: 0,
+                text: "answer".into(),
+            });
+            app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
+            let rows = app.transcript.viewport(78, 0, 20, 0);
+            assert!(rows.iter().any(|row| row.kind == BlockKind::Thought));
+            assert!(rows.iter().any(|row| row.kind == BlockKind::Tool));
+            assert!(app.export_markdown().contains("reasoning"));
+            assert!(app.export_markdown().contains("result"));
+        }
+    }
+
+    #[test]
     fn three_line_thought_tail_remains_visible_without_hint_clipping() {
         let mut app = App::default();
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
+            slot: 0,
+            text: "long answer ".repeat(100),
+        });
         app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
             slot: 0,
             text:
                 "one two three four five six seven eight nine ten eleven twelve thirteen fourteen"
                     .into(),
-        });
-        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
-            slot: 0,
-            text: "long answer ".repeat(100),
         });
         let mut terminal = Terminal::new(TestBackend::new(22, 8)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();

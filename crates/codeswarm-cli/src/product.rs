@@ -278,6 +278,7 @@ pub(super) struct ConversationJournal {
     pub metadata: SessionMetadata,
     pub summary: CompletionSummary,
     titled: bool,
+    failed_resume_slots: std::collections::BTreeSet<usize>,
     changes: Option<Receiver<Result<Vec<String>, String>>>,
 }
 
@@ -321,6 +322,7 @@ impl ConversationJournal {
             metadata,
             summary,
             titled: saved.is_some(),
+            failed_resume_slots: Default::default(),
             changes: None,
         })
     }
@@ -357,6 +359,47 @@ impl ConversationJournal {
             .append_agent(event)
             .map_err(|error| error.to_string())?;
         self.summary.observe(event);
+        match event {
+            AgentEvent::Failed {
+                slot,
+                started: false,
+                ..
+            } => {
+                self.failed_resume_slots.insert(*slot);
+            }
+            AgentEvent::Ready { slot, .. } => {
+                self.failed_resume_slots.remove(slot);
+            }
+            AgentEvent::RosterUpdated {
+                update: codeswarm_adapters::RosterUpdate::Dropped { slot },
+            } => {
+                self.failed_resume_slots.remove(slot);
+                if let Some(agents) = self
+                    .metadata
+                    .get("agents")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    let retained = agents
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, agent)| {
+                            agent
+                                .get("slot")
+                                .and_then(serde_json::Value::as_u64)
+                                .map(|value| value as usize)
+                                .unwrap_or(*index)
+                                != *slot
+                        })
+                        .map(|(_, agent)| agent.clone())
+                        .collect::<Vec<_>>();
+                    self.metadata.insert("agents", serde_json::json!(retained));
+                    self.writer
+                        .replace_metadata(self.metadata.clone())
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            _ => {}
+        }
         if matches!(event, AgentEvent::TurnStarted { .. }) {
             self.writer
                 .update_entry(|entry| entry.state = ArchiveState::Active)
@@ -365,8 +408,16 @@ impl ConversationJournal {
         if let AgentEvent::SessionMetadataUpdated { metadata } = event
             && let Some(data) = metadata.as_object()
         {
+            let preserved_agents = preserve_failed_resume_slots(
+                &self.metadata,
+                data.get("agents"),
+                &self.failed_resume_slots,
+            );
             for (key, value) in data {
                 self.metadata.insert(key, value.clone());
+            }
+            if let Some(agents) = preserved_agents {
+                self.metadata.insert("agents", agents);
             }
             let roster = metadata_roster(&self.metadata);
             self.writer
@@ -465,6 +516,50 @@ impl ConversationJournal {
     }
 }
 
+/// Saved active rosters are dense again when a new runtime is constructed.
+/// Rebase old slot annotations before merging any partial startup result.
+pub(super) fn rebase_provider_slots(metadata: &mut SessionMetadata) {
+    if let Some(agents) = metadata.get("agents").and_then(serde_json::Value::as_array) {
+        let mut agents = agents.clone();
+        for (slot, agent) in agents.iter_mut().enumerate() {
+            if let Some(agent) = agent.as_object_mut() {
+                agent.insert("slot".into(), serde_json::json!(slot));
+            }
+        }
+        metadata.insert("agents", serde_json::json!(agents));
+    }
+}
+
+fn preserve_failed_resume_slots(
+    metadata: &SessionMetadata,
+    incoming: Option<&serde_json::Value>,
+    failed: &std::collections::BTreeSet<usize>,
+) -> Option<serde_json::Value> {
+    if failed.is_empty() {
+        return None;
+    }
+    let mut agents = std::collections::BTreeMap::new();
+    for (index, agent) in metadata.get("agents")?.as_array()?.iter().enumerate() {
+        let slot = agent
+            .get("slot")
+            .and_then(serde_json::Value::as_u64)
+            .map(|slot| slot as usize)
+            .unwrap_or(index);
+        if failed.contains(&slot) {
+            agents.insert(slot, agent.clone());
+        }
+    }
+    for (index, agent) in incoming?.as_array()?.iter().enumerate() {
+        let slot = agent
+            .get("slot")
+            .and_then(serde_json::Value::as_u64)
+            .map(|slot| slot as usize)
+            .unwrap_or(index);
+        agents.insert(slot, agent.clone());
+    }
+    Some(serde_json::Value::Array(agents.into_values().collect()))
+}
+
 pub(super) fn summary_for(saved: &SavedConversation) -> CompletionSummary {
     let mut summary = CompletionSummary::new();
     for event in &saved.events {
@@ -501,6 +596,53 @@ fn parse_changed_paths(output: &[u8]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_rebases_old_roster_holes_before_preserving_failed_handles() {
+        let mut metadata = SessionMetadata::new(
+            serde_json::json!({"agents":[
+                {"slot":2,"identity":"failed","session_id":"old"},
+                {"slot":5,"identity":"healthy","session_id":"good"}
+            ]})
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        super::rebase_provider_slots(&mut metadata);
+        let incoming = serde_json::json!([{"slot":1,"identity":"healthy","session_id":"good"}]);
+        let kept = super::preserve_failed_resume_slots(
+            &metadata,
+            Some(&incoming),
+            &[0].into_iter().collect(),
+        )
+        .unwrap();
+        assert_eq!(kept.as_array().unwrap().len(), 2);
+        assert_eq!(kept[0]["session_id"], "old");
+        assert_eq!(kept[1]["session_id"], "good");
+    }
+
+    #[test]
+    fn partial_resume_keeps_failed_provider_metadata_for_later_recovery() {
+        let old = SessionMetadata::new(
+            serde_json::json!({"agents":[
+                {"identity":"failed","session_id":"old-handle"},
+                {"identity":"healthy","session_id":"healthy-handle"}
+            ]})
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let incoming =
+            serde_json::json!([{"slot":1,"identity":"healthy","session_id":"healthy-handle"}]);
+        let failed = [0].into_iter().collect();
+        let kept = super::preserve_failed_resume_slots(&old, Some(&incoming), &failed).unwrap();
+        assert_eq!(kept[0]["session_id"], "old-handle");
+        assert_eq!(kept[1]["session_id"], "healthy-handle");
+        assert!(
+            super::preserve_failed_resume_slots(&old, Some(&incoming), &Default::default())
+                .is_none()
+        );
+    }
 
     #[test]
     fn local_history_displays_without_resumable_handles_or_live_work() {
