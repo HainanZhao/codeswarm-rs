@@ -144,7 +144,9 @@ viewport tests.
 ## Thought and tool appearance
 
 Thought and tool details follow their agent message. Clickable 💭/🔧 icons
-identify them without text labels and leave the full text width available.
+identify them without text labels, with one space between each icon and its
+text. Empty completed tool summaries are hidden; running and failed tools
+remain visible.
 Thoughts use a rolling
 two-line preview: words fill a line, completed lines move up, and older lines
 leave the preview. Paragraph breaks act as spaces in the preview, so they

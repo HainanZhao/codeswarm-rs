@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.8] - 2026-09-06
+
+### Fixed
+
+- Added one space after thought/tool icons, reserving its width when wrapping.
+- Hide empty completed tool summaries instead of leaving an icon-only line.
+
 ## [0.9.7] - 2026-09-06
 
 ### Fixed

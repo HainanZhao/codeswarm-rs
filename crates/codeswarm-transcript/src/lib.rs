@@ -44,6 +44,7 @@ pub struct RenderRow {
 pub struct Transcript {
     blocks: Vec<TranscriptBlock>,
     next_id: u64,
+    detail_indent: usize,
     cached_width: Option<usize>,
     rows: Vec<RenderRow>,
     block_starts: BTreeMap<u64, usize>,
@@ -62,6 +63,14 @@ struct RowCache {
 }
 
 impl Transcript {
+    /// Reserve extra leading columns for thought and tool detail rendering.
+    pub fn with_detail_indent(columns: usize) -> Self {
+        Self {
+            detail_indent: columns,
+            ..Self::default()
+        }
+    }
+
     /// Append a logical block. Row materialization is deferred until a
     /// viewport requests it at a concrete width.
     pub fn append(&mut self, kind: BlockKind, source: impl Into<String>, collapsed: bool) -> u64 {
@@ -303,6 +312,11 @@ impl Transcript {
             self.block_starts.remove(&block.id);
         }
         for block in self.blocks.iter().skip(self.valid_blocks) {
+            let width = if matches!(block.kind, BlockKind::Thought | BlockKind::Tool) {
+                width.saturating_sub(self.detail_indent).max(1)
+            } else {
+                width
+            };
             self.headers.push(header_speaker.clone());
             if block.kind == BlockKind::Human {
                 header_speaker = None;
@@ -312,6 +326,16 @@ impl Transcript {
             // noisy create/output/exit records to the conversation.
             if block.kind == BlockKind::Terminal {
                 continue;
+            }
+            if block.kind == BlockKind::Tool {
+                let content = attributed_message(&block.source)
+                    .map_or(block.source.as_str(), |(_, _, body)| body);
+                if content
+                    .lines()
+                    .all(|line| line.trim().trim_start_matches('🔧').trim().is_empty())
+                {
+                    continue;
+                }
             }
             let display = if block.collapsed {
                 std::borrow::Cow::Owned(collapsed_preview(block, width))
@@ -901,6 +925,22 @@ mod tests {
 
         assert_eq!(transcript.row_count(120), 1);
         assert_eq!(transcript.block_row(120, expanded), Some(0));
+    }
+
+    #[test]
+    fn empty_tool_blocks_stay_hidden_when_collapsed_expanded_or_replaced() {
+        let mut transcript = Transcript::default();
+        for source in ["", "🔧 ", "Codex: [12:05] 🔧 ", "Codex: [12:05] "] {
+            let id = transcript.append(BlockKind::Tool, source, true);
+            assert_eq!(transcript.row_count(40), 0);
+            transcript.set_collapsed(id, false);
+            assert_eq!(transcript.row_count(39), 0);
+        }
+        let id = transcript.append(BlockKind::Tool, "Codex: [12:06] Read file", true);
+        assert_eq!(transcript.row_count(40), 2);
+        transcript.replace(id, BlockKind::Tool, "Codex: [12:06] 🔧 ", true);
+        assert_eq!(transcript.row_count(40), 0);
+        assert_eq!(transcript.row_count(39), 0);
     }
 
     #[test]

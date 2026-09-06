@@ -1009,7 +1009,7 @@ impl Default for App {
         Self {
             goal: None,
             theme: Theme::default(),
-            transcript: Transcript::default(),
+            transcript: Transcript::with_detail_indent(1),
             scroll_y: 0,
             follow_tail: true,
             prompt: String::new(),
@@ -3632,6 +3632,7 @@ fn tool_window_source(window: &ToolWindow) -> String {
             }
             row
         })
+        .filter(|row| row.trim() != "🔧")
         .collect::<Vec<_>>()
         .join("\n");
     format!("{}{}", window.prefix, calls)
@@ -4720,15 +4721,20 @@ fn render_transcript(
                         row.block_id,
                     ));
                     Some(if row.kind == crate::transcript::BlockKind::Thought {
-                        "💭"
+                        "💭 "
                     } else {
-                        "🔧"
+                        "🔧 "
                     })
                 } else {
                     None
                 };
                 let marker = if let Some(icon) = detail_icon {
                     icon
+                } else if matches!(
+                    row.kind,
+                    crate::transcript::BlockKind::Thought | crate::transcript::BlockKind::Tool
+                ) {
+                    "   "
                 } else if row.first_in_block {
                     match row.kind {
                         crate::transcript::BlockKind::Human => "› ",
@@ -6020,6 +6026,14 @@ mod tests {
             terminal.backend().buffer()[(tool_area.x, tool_area.y)].symbol(),
             "🔧"
         );
+        assert_eq!(
+            terminal.backend().buffer()[(tool_area.x + 2, tool_area.y)].symbol(),
+            " "
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(tool_area.x + 3, tool_area.y)].symbol(),
+            "t"
+        );
         let rendered = terminal
             .backend()
             .buffer()
@@ -6032,6 +6046,14 @@ mod tests {
         let (area, id) = app.detail_controls[0];
         assert_eq!(id, thought);
         assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), "💭");
+        assert_eq!(
+            terminal.backend().buffer()[(area.x + 2, area.y)].symbol(),
+            " "
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(area.x + 3, area.y)].symbol(),
+            "o"
+        );
         assert_eq!(app.click_detail(area.x + 2, area.y), None);
         // Both cells of the emoji target the same stable block.
         assert_eq!(app.click_detail(area.x + 1, area.y), Some(false));
@@ -7311,7 +7333,12 @@ mod tests {
         for width in [30, 50] {
             for kind in [BlockKind::Agent, BlockKind::Human, BlockKind::Thought] {
                 let mut app = App::default();
-                let text_width = usize::from(width - 2);
+                let indent = if matches!(kind, BlockKind::Thought | BlockKind::Tool) {
+                    3
+                } else {
+                    2
+                };
+                let text_width = usize::from(width - indent);
                 let first_line = format!("{}!", "a".repeat(text_width - 1));
                 let second_line = format!("{}?", "b".repeat(text_width - 1));
                 // A single long word must wrap without losing either edge character.
@@ -7322,7 +7349,7 @@ mod tests {
                 let buffer = terminal.backend().buffer();
                 assert_eq!(buffer[(width - 1, 0)].symbol(), "!", "{width} {kind:?}");
                 assert_eq!(buffer[(width - 1, 1)].symbol(), "?", "{width} {kind:?}");
-                assert_eq!(buffer[(2, 2)].symbol(), "Z", "{width} {kind:?}");
+                assert_eq!(buffer[(indent, 2)].symbol(), "Z", "{width} {kind:?}");
             }
         }
     }
@@ -8026,7 +8053,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
             for y in [2, 3] {
-                let cell = &terminal.backend().buffer()[(2, y)];
+                let cell = &terminal.backend().buffer()[(3, y)];
                 assert_eq!(cell.fg, Color::DarkGray);
                 assert!(cell.modifier.contains(Modifier::ITALIC));
             }
@@ -8096,10 +8123,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(22, 8)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let buffer = terminal.backend().buffer();
-        let row = |y| (2..22).map(|x| buffer[(x, y)].symbol()).collect::<String>();
-        assert_eq!(row(2), "one two three four  ");
-        assert_eq!(row(3), "five                ");
-        assert!(buffer[(2, 2)].modifier.contains(Modifier::ITALIC));
+        let row = |y| (3..22).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert_eq!(row(2), "one two three four ");
+        assert_eq!(row(3), "five               ");
+        assert!(buffer[(3, 2)].modifier.contains(Modifier::ITALIC));
     }
 
     #[test]
@@ -8207,6 +8234,92 @@ mod tests {
         assert!(completed.iter().all(|row| !row.text.contains("completed")));
         app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
         assert!(!app.tool_windows.contains_key(&0));
+    }
+
+    #[test]
+    fn completed_empty_tools_disappear_and_replacement_output_can_return() {
+        let mut app = App::default();
+        let event = |status, detail| codeswarm_adapters::AgentEvent::Tool {
+            slot: 0,
+            update: codeswarm_adapters::ToolUpdate {
+                id: "generic".into(),
+                title: "Tool call".into(),
+                status,
+                detail,
+            },
+        };
+        app.apply_event(&event(codeswarm_adapters::ToolStatus::Running, None));
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.detail_controls.len(), 1);
+        app.apply_event(&event(
+            codeswarm_adapters::ToolStatus::Completed,
+            Some(" \n".into()),
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.transcript.row_count(58), 0);
+        assert!(app.detail_controls.is_empty());
+        assert!(
+            !terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "🔧")
+        );
+        app.apply_event(&event(
+            codeswarm_adapters::ToolStatus::Completed,
+            Some("result available".into()),
+        ));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(app.detail_controls.len(), 1);
+        assert!(
+            app.transcript
+                .viewport(58, 0, 10, 0)
+                .iter()
+                .any(|row| row.text == "result available")
+        );
+        app.apply_event(&event(codeswarm_adapters::ToolStatus::Failed, None));
+        assert!(
+            app.transcript
+                .viewport(58, 0, 10, 0)
+                .iter()
+                .any(|row| row.text == "failed")
+        );
+    }
+
+    #[test]
+    fn tool_preview_reserves_icon_spacing_and_skips_later_empty_calls() {
+        for width in [30, 60] {
+            let mut app = App::default();
+            app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
+                slot: 0,
+                update: codeswarm_adapters::ToolUpdate {
+                    id: "meaningful".into(),
+                    title: "Read file".into(),
+                    status: codeswarm_adapters::ToolStatus::Completed,
+                    detail: Some(format!("{}!", "x".repeat(100))),
+                },
+            });
+            app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
+                slot: 0,
+                update: codeswarm_adapters::ToolUpdate {
+                    id: "empty".into(),
+                    title: "Tool call".into(),
+                    status: codeswarm_adapters::ToolStatus::Completed,
+                    detail: None,
+                },
+            });
+            let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert_eq!(app.detail_controls.len(), 1);
+            let (area, _) = app.detail_controls[0];
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, area.y)].symbol(), "🔧");
+            assert_eq!(buffer[(2, area.y)].symbol(), " ");
+            assert_eq!(buffer[(3, area.y)].symbol(), "…");
+            assert_eq!(buffer[(width - 1, area.y)].symbol(), "!");
+        }
     }
 
     #[test]
