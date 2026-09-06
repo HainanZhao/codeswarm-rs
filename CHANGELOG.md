@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Sort archive failures by session ID for deterministic listings on macOS and Linux.
+
 ## [0.10.0] - 2026-09-06
 
 ### Added

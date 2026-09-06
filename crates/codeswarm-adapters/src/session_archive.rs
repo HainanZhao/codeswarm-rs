@@ -612,7 +612,8 @@ impl SessionArchive {
         Ok(listing)
     }
 
-    /// List every archived session, newest activity first.
+    /// List every archived session, newest activity first. Failures are sorted
+    /// by session ID independently of filesystem enumeration order.
     pub fn list_all(&self) -> Result<SessionListing, PersistenceError> {
         let mut listing = SessionListing::default();
         let read_dir = match fs::read_dir(&self.root) {
@@ -656,6 +657,7 @@ impl SessionArchive {
                 .then_with(|| b.created_at.cmp(&a.created_at))
                 .then_with(|| a.id.cmp(&b.id))
         });
+        listing.failures.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(listing)
     }
 
@@ -1502,6 +1504,28 @@ mod tests {
         );
         let _ = corrupt;
         remove(root);
+    }
+
+    #[test]
+    fn archive_failures_are_ordered_independently_of_creation_order() {
+        for ids in [["z-last", "a-first"], ["a-first", "z-last"]] {
+            let root = temp_root("failure-order");
+            let archive = SessionArchive::open(&root);
+            for id in ids {
+                fs::create_dir(root.join(id)).unwrap();
+                fs::write(root.join(id).join(META_FILE), "broken").unwrap();
+            }
+            let listing = archive.list_all().unwrap();
+            assert_eq!(
+                listing
+                    .failures
+                    .iter()
+                    .map(|failure| failure.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["a-first", "z-last"]
+            );
+            remove(root);
+        }
     }
 
     #[test]
