@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-09-06
+
+### Fixed
+
+- `/config` opens local settings immediately instead of becoming an agent prompt.
+- Recognize OpenCode's `Quota exhausted` response as a provider limit instead
+  of reporting it as an adapter crash.
+- Map OpenCode's `build` mode to CodeSwarm Auto pilot so OpenCode can be added
+  to an existing roster.
+
 ## [0.10.2] - 2026-09-06
 
 ### Fixed

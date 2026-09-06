@@ -34,6 +34,7 @@ pub fn is_usage_limit_response(text: &str) -> bool {
     exhausted_usage
         || haystack.contains("insufficient_quota")
         || haystack.contains("quota exceeded")
+        || haystack.contains("quota exhausted")
         || haystack.contains("insufficient credits")
 }
 
@@ -821,6 +822,9 @@ mod tests {
         assert!(super::is_usage_limit_response("Error: insufficient_quota"));
         assert!(super::is_usage_limit_response(
             "Monthly quota exceeded for this plan"
+        ));
+        assert!(super::is_usage_limit_response(
+            "Quota exhausted: your token-plan quota has been exhausted"
         ));
         assert!(!super::is_usage_limit_response(
             "The rate limit on the build job slowed things down."

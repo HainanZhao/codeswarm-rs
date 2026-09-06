@@ -62,6 +62,8 @@ pub const POLICIES: &[ModePolicy] = &[
             "yolo",
             "bypasspermissions",
             "skippermissions",
+            // OpenCode's default tool-using mode.
+            "build",
             "codeswarmstartupfullaccess",
             "agyfullaccess",
         ],
@@ -156,6 +158,24 @@ mod tests {
         assert_eq!(
             super::resolve(DEFAULT_POLICY_ID, &modes).map(|mode| mode.id),
             Some("agent-full-access".into())
+        );
+    }
+
+    #[test]
+    fn maps_opencode_build_catalog_to_auto_pilot() {
+        let modes = vec![
+            Mode {
+                id: "build".into(),
+                label: "build".into(),
+            },
+            Mode {
+                id: "plan".into(),
+                label: "plan".into(),
+            },
+        ];
+        assert_eq!(
+            super::resolve(DEFAULT_POLICY_ID, &modes).map(|mode| mode.id),
+            Some("build".into())
         );
     }
 

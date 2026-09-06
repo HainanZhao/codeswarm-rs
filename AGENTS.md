@@ -13,7 +13,7 @@
 
 - Every session defaults to CodeSwarm's **Auto pilot** permission policy. After
   all active agents advertise their mode catalogs, CodeSwarm translates the
-  policy to each native mode ID and synchronizes the complete roster. A later
+  policy to each native mode ID (OpenCode's `build` is its tool-using mode) and synchronizes the complete roster. A later
   user selection becomes the new desired roster-wide policy; `Mixed` is not a
   user-facing mode.
 - An unlimited-size roster of ACP agents relay turns sequentially in a ring
@@ -124,6 +124,8 @@
   notification style over the conversation UI.
 - Optional operating-system notifications sent through `system_notify()` are
   separate from this in-terminal presentation rule and remain supported.
+- `/config` is a local alias for `/settings`, taking precedence over provider
+  command catalogs and never entering the agent queue.
 - `/settings` offers Terminal, Light, and Dark themes. Terminal uses the user's
   canvas and ANSI accents; explicit palettes retain readable text contrast.
   Reserve teal exclusively for human input/messages and interface controls.

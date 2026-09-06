@@ -104,6 +104,8 @@ bounded to preserve tmux responsiveness.
 - `Ctrl+C` cancels active work; while idle it exits.
 - `Esc` closes the active picker, help, permission, or settings surface.
 
+`/config` is an alias for `/settings` and opens locally, including while an agent is working.
+
 ## Slash commands
 
 - `/help` — show the complete keyboard and command guide.

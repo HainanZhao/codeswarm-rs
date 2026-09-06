@@ -201,6 +201,11 @@ pub const LOCAL_COMMANDS: &[CommandSpec] = &[
 ];
 
 fn local_command_spec(command: &str) -> Option<&'static CommandSpec> {
+    let command = if command == "/config" {
+        "/settings"
+    } else {
+        command
+    };
     LOCAL_COMMANDS.iter().find(|spec| spec.name == command)
 }
 
@@ -7576,7 +7581,7 @@ mod tests {
             assert_eq!(app.handle_local_command(command), Some(LocalCommand::Exit));
         }
         let mut app = App::default();
-        for command in ["/settings", "/SETTINGS"] {
+        for command in ["/settings", "/SETTINGS", "/config", " /CONFIG "] {
             assert_eq!(
                 app.handle_local_command(command),
                 Some(LocalCommand::Handled)
@@ -7658,12 +7663,44 @@ mod tests {
     }
 
     #[test]
+    fn config_stays_local_during_work_and_provider_catalog_replacement() {
+        let mut app = App::default();
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
+            slot: 0,
+            text: "working".into(),
+        });
+        for names in [vec!["config"], vec!["/config", "review"], vec![]] {
+            app.apply_event(&codeswarm_adapters::AgentEvent::CommandsReplaced {
+                slot: 0,
+                commands: names
+                    .into_iter()
+                    .map(|name| codeswarm_adapters::AgentCommand { name: name.into() })
+                    .collect(),
+            });
+            assert_eq!(
+                app.handle_local_command("/config"),
+                Some(LocalCommand::Handled)
+            );
+            assert!(app.config_visible());
+            assert_eq!(app.queued_count(), 0);
+            let mut terminal = Terminal::new(TestBackend::new(96, 24)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            app.handle_config_key(ConfigKey::Cancel);
+            assert_eq!(
+                app.handle_local_command("/config extra"),
+                Some(LocalCommand::Handled)
+            );
+            assert_eq!(app.status, "usage: /settings");
+            assert!(!app.config_visible());
+        }
+    }
+
+    #[test]
     fn canonical_commands_remain_and_config_duplicates_are_rejected() {
         let mut app = App::default();
         for removed in [
             "/close",
             "/quit",
-            "/config",
             "/to 2",
             "/mode chat",
             "/collab manual",
