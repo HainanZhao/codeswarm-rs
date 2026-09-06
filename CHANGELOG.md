@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Thought and tool previews use distinct clickable 💭/🔧 icons without text labels.
+- Removed generic tool-call labels and completion counts from tool summaries.
 - Thought previews fill both lines before scrolling; paragraph breaks no longer
   clear visible lines or force a blank first line. Expanded text keeps its formatting.
 

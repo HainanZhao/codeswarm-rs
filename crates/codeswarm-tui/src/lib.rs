@@ -890,7 +890,6 @@ struct ToolWindow {
     block_id: u64,
     prefix: String,
     calls: VecDeque<ToolCall>,
-    seen_call_ids: BTreeSet<String>,
 }
 
 const MAX_TOOL_HISTORY_ROWS: usize = 20;
@@ -2803,10 +2802,9 @@ impl App {
                 self.history_blocks.remove(&slot);
                 let key = (slot, update.id.clone());
                 let source = format!(
-                    "{}🔧 {} · {}{}",
+                    "{}{}{}",
                     agent_message_prefix(&self.agent_name(slot)),
-                    update.title,
-                    tool_status_label(update.status),
+                    tool_call_summary(&update.title, update.status),
                     update
                         .detail
                         .as_ref()
@@ -3056,7 +3054,6 @@ impl App {
                             block_id,
                             prefix,
                             calls: VecDeque::new(),
-                            seen_call_ids: BTreeSet::new(),
                         },
                     );
                 }
@@ -3065,7 +3062,6 @@ impl App {
                         .tool_windows
                         .get_mut(slot)
                         .expect("tool window inserted");
-                    window.seen_call_ids.insert(update.id.clone());
                     window.calls.retain(|call| call.id != update.id);
                     window.calls.push_back(ToolCall {
                         id: update.id.clone(),
@@ -3603,30 +3599,35 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
     }
 }
 
+fn tool_call_summary(title: &str, status: ToolStatus) -> String {
+    let title = title.trim();
+    let mut parts = Vec::new();
+    if !title.is_empty()
+        && !title.eq_ignore_ascii_case("tool call")
+        && !title.eq_ignore_ascii_case("tool")
+    {
+        parts.push(title);
+    }
+    if status != ToolStatus::Completed {
+        parts.push(tool_status_label(status));
+    }
+    format!("🔧 {}", parts.join(" · "))
+}
+
 fn tool_window_source(window: &ToolWindow) -> String {
-    let total_calls = window.seen_call_ids.len();
     let calls = window
         .calls
         .iter()
-        .enumerate()
-        .map(|(index, call)| {
-            let latest = index + 1 == window.calls.len();
-            let status = if latest && call.status == ToolStatus::Completed {
-                if total_calls == 1 {
-                    "1 tool call".to_owned()
-                } else {
-                    format!("{total_calls} tool calls")
-                }
-            } else {
-                tool_status_label(call.status).to_owned()
-            };
-            let mut row = format!("🔧 {} · {status}", call.title);
+        .map(|call| {
+            let mut row = tool_call_summary(&call.title, call.status);
             if let Some(detail) = call
                 .detail
                 .as_deref()
                 .and_then(|detail| detail.lines().rev().find(|line| !line.trim().is_empty()))
             {
-                row.push_str(" · ");
+                if row.trim_end() != "🔧" {
+                    row.push_str(" · ");
+                }
                 row.push_str(&detail.split_whitespace().collect::<Vec<_>>().join(" "));
             }
             row
@@ -8200,14 +8201,32 @@ mod tests {
         assert_eq!(app.tool_windows[&0].calls.len(), 3);
         let completed = app.transcript.viewport(72, 0, 10, 0);
         assert!(
-            completed
-                .iter()
-                .any(|row| row.text.contains("3 tool calls")),
+            completed.iter().any(|row| row.text.contains("Noisy three")),
             "completed={completed:?}"
         );
         assert!(completed.iter().all(|row| !row.text.contains("completed")));
         app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
         assert!(!app.tool_windows.contains_key(&0));
+    }
+
+    #[test]
+    fn tool_summaries_omit_generic_labels_and_counts_but_keep_failures() {
+        assert_eq!(
+            super::tool_call_summary("Tool call", codeswarm_adapters::ToolStatus::Completed),
+            "🔧 "
+        );
+        assert_eq!(
+            super::tool_call_summary("Read file", codeswarm_adapters::ToolStatus::Completed),
+            "🔧 Read file"
+        );
+        assert_eq!(
+            super::tool_call_summary("Tool call", codeswarm_adapters::ToolStatus::Failed),
+            "🔧 failed"
+        );
+        assert_eq!(
+            super::tool_call_summary("Read file", codeswarm_adapters::ToolStatus::Running),
+            "🔧 Read file · running"
+        );
     }
 
     #[test]
@@ -8245,7 +8264,7 @@ mod tests {
         let markdown = app.export_markdown();
         assert!(markdown.contains("## Tool"), "markdown={markdown:?}");
         assert!(
-            markdown.contains("Run tests · 1 tool call"),
+            markdown.contains("Run tests · second line"),
             "markdown={markdown:?}"
         );
         assert!(markdown.contains("second line"), "markdown={markdown:?}");
@@ -8266,7 +8285,6 @@ mod tests {
             });
         }
         let window = &app.tool_windows[&0];
-        assert_eq!(window.seen_call_ids.len(), 25);
         assert_eq!(window.calls.len(), MAX_TOOL_HISTORY_ROWS);
         assert_eq!(
             window.calls.front().map(|call| call.id.as_str()),
@@ -8279,7 +8297,7 @@ mod tests {
         assert!(rows.iter().any(|row| row.text.contains("Tool 5")));
         assert!(rows.iter().any(|row| row.text.contains("Tool 24")));
         assert!(rows.iter().all(|row| !row.text.contains("old output")));
-        assert!(rows.iter().any(|row| row.text.contains("25 tool calls")));
+        assert!(rows.iter().all(|row| !row.text.contains("tool calls")));
     }
 
     #[test]

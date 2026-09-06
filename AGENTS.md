@@ -118,7 +118,9 @@
   cannot clear the upper line or force text to start on the second line;
   expanded history keeps the original formatting. Both use faint gray italics.
   Use only clickable 💭 (thought) and 🔧 (tool) icons in the two-column left
-  gutter, without "Thought"/"Tool" text labels. Each icon toggles expansion;
+  gutter, without "Thought"/"Tool" text labels, generic "Tool call" titles, or
+  completion counts. Keep meaningful tool names and running/failure status.
+  Each icon toggles expansion;
   keep Ctrl+O as the keyboard shortcut. Controls must not consume
   preview width, and hit targets must be rebuilt on redraw/scroll/resize.
   Preserve stable block IDs and cached earlier turns when ordering details.
