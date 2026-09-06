@@ -4,6 +4,7 @@
 //! discovery to the terminal renderer: callers get either UTF-8 text or
 //! bounded binary data, and every path is resolved beneath the workspace root.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const MAX_RESOURCE_BYTES: u64 = 1024 * 1024;
@@ -68,12 +69,19 @@ pub fn load(
         return Err(ResourceError::OutsideWorkspace);
     }
     let metadata = std::fs::metadata(&path).map_err(ResourceError::Io)?;
+    if !metadata.is_file() {
+        return Err(ResourceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "resource must be a regular file",
+        )));
+    }
     if metadata.len() > MAX_RESOURCE_BYTES {
         return Err(ResourceError::TooLarge {
             bytes: metadata.len(),
         });
     }
-    let bytes = std::fs::read(&path).map_err(ResourceError::Io)?;
+    let file = std::fs::File::open(&path).map_err(ResourceError::Io)?;
+    let bytes = read_bounded(file)?;
     let mime_type = mime_type(&path);
     let (text, data) = match std::str::from_utf8(&bytes) {
         Ok(text) => (Some(text.to_owned()), None),
@@ -85,6 +93,22 @@ pub fn load(
         text,
         data,
     })
+}
+
+// The file may grow after metadata is read. Enforce the limit on actual I/O,
+// including filesystems that report a zero or stale length.
+fn read_bounded(reader: impl Read) -> Result<Vec<u8>, ResourceError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_RESOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(ResourceError::Io)?;
+    if bytes.len() as u64 > MAX_RESOURCE_BYTES {
+        return Err(ResourceError::TooLarge {
+            bytes: bytes.len() as u64,
+        });
+    }
+    Ok(bytes)
 }
 
 fn mime_type(path: &Path) -> String {
@@ -145,6 +169,32 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).expect("root");
         root
+    }
+
+    #[test]
+    fn actual_resource_reads_remain_bounded_even_with_stale_metadata() {
+        let mut reader = std::io::Cursor::new(vec![b'x'; (MAX_RESOURCE_BYTES * 2) as usize]);
+        assert!(matches!(
+            super::read_bounded(&mut reader),
+            Err(ResourceError::TooLarge { .. })
+        ));
+        assert_eq!(reader.position(), MAX_RESOURCE_BYTES + 1);
+        let exact = super::read_bounded(std::io::Cursor::new(vec![
+            b'x';
+            MAX_RESOURCE_BYTES as usize
+        ]))
+        .unwrap();
+        assert_eq!(exact.len() as u64, MAX_RESOURCE_BYTES);
+    }
+
+    #[test]
+    fn non_file_resources_are_rejected_before_reading() {
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("directory")).unwrap();
+        assert!(
+            matches!(load(&root, "directory"), Err(ResourceError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidInput)
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-09-06
+
+### Fixed
+
+- ACP tool patches retain omitted names, status, and output, and now display
+  reported text content. Explicit content replacements and reused IDs reset correctly.
+- ACP reload discards queued events and mode catalogs from the old process.
+- Clearing chat during history replay also clears history references and click targets.
+- Transcript and footer truncation use terminal columns and preserve Unicode graphemes;
+  long-word wrapping no longer rescans partially built rows repeatedly.
+- Attachment reads enforce their size limit during I/O and reject non-file resources.
+
 ## [0.9.8] - 2026-09-06
 
 ### Fixed

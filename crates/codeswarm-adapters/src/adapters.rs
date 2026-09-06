@@ -2284,6 +2284,7 @@ pub struct AcpAdapter {
     next_request_id: u64,
     prompt_request_id: Option<u64>,
     queued_events: VecDeque<AdapterResult<AgentEvent>>,
+    tool_updates: BTreeMap<String, ToolUpdate>,
     stderr_task: Option<tokio::task::JoinHandle<String>>,
     terminals: BTreeMap<String, TerminalProcess>,
     next_terminal_id: u64,
@@ -2311,6 +2312,7 @@ impl AcpAdapter {
             next_request_id: 1,
             prompt_request_id: None,
             queued_events: VecDeque::new(),
+            tool_updates: BTreeMap::new(),
             stderr_task: None,
             terminals: BTreeMap::new(),
             next_terminal_id: 1,
@@ -2388,7 +2390,7 @@ impl AcpAdapter {
                     .cloned()
                     .ok_or_else(|| AdapterError::Protocol("response has no result".into()));
             }
-            if let Some(event) = parse_acp_notification(self.slot, &line)? {
+            if let Some(event) = parse_acp_value(self.slot, &value, &mut self.tool_updates)? {
                 let event = if method == "session/load" {
                     restored_history_event(event)
                 } else {
@@ -2822,6 +2824,7 @@ impl AcpAdapter {
     }
 
     async fn start(&mut self) -> AdapterResult<()> {
+        self.modes.clear();
         // Starting an adapter twice must never orphan the first transport.
         if self.child.is_some() {
             self.stop().await?;
@@ -3103,6 +3106,7 @@ impl AgentAdapter for AcpAdapter {
             .session_id
             .as_ref()
             .ok_or_else(|| AdapterError::Transport("ACP session is not initialized".into()))?;
+        self.tool_updates.clear();
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let prompt_blocks = prompt_content_blocks(&self.cwd, &prompt);
@@ -3255,6 +3259,8 @@ impl AgentAdapter for AcpAdapter {
 
     async fn stop(&mut self) -> AdapterResult<()> {
         let terminals = std::mem::take(&mut self.terminals);
+        self.queued_events.clear();
+        self.tool_updates.clear();
         for terminal in terminals.values() {
             terminal.stop().await;
         }
@@ -3294,7 +3300,7 @@ impl AgentAdapter for AcpAdapter {
                 Ok(false) => {}
                 Err(error) => return Some(Err(error)),
             }
-            match parse_acp_notification(self.slot, &line) {
+            match parse_acp_value(self.slot, &value, &mut self.tool_updates) {
                 Ok(Some(event)) => {
                     if let AgentEvent::ModelsReplaced {
                         config_id, models, ..
@@ -3324,9 +3330,18 @@ impl AgentAdapter for AcpAdapter {
     }
 }
 
+#[cfg(test)]
 fn parse_acp_notification(slot: RosterSlot, line: &str) -> AdapterResult<Option<AgentEvent>> {
     let value: Value =
         serde_json::from_str(line).map_err(|error| AdapterError::Protocol(error.to_string()))?;
+    parse_acp_value(slot, &value, &mut BTreeMap::new())
+}
+
+fn parse_acp_value(
+    slot: RosterSlot,
+    value: &Value,
+    tools: &mut BTreeMap<String, ToolUpdate>,
+) -> AdapterResult<Option<AgentEvent>> {
     let method = value.get("method").and_then(Value::as_str);
     if method == Some("session/request_permission") {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
@@ -3458,34 +3473,68 @@ fn parse_acp_notification(slot: RosterSlot, line: &str) -> AdapterResult<Option<
             Ok(Some(AgentEvent::Thought { slot, text }))
         }
         (Some("tool_call"), _) | (Some("tool_call_update"), _) => {
-            let id = update
-                .get("toolCallId")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown-tool")
-                .to_owned();
-            let title = update
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or("Tool call")
-                .to_owned();
-            let status = match update.get("status").and_then(Value::as_str) {
-                Some("completed") => ToolStatus::Completed,
-                Some("failed") => ToolStatus::Failed,
-                Some("in_progress") => ToolStatus::Running,
-                _ => ToolStatus::Pending,
-            };
-            Ok(Some(AgentEvent::Tool {
-                slot,
-                update: ToolUpdate {
-                    id,
-                    title,
-                    status,
-                    detail: None,
-                },
-            }))
+            Ok(normalize_acp_tool(update, tools).map(|update| AgentEvent::Tool { slot, update }))
         }
         _ => Ok(None),
     }
+}
+
+/// ACP updates are patches: omitted/invalid fields retain their last valid
+/// values, whereas an explicit empty content array clears previous output.
+fn normalize_acp_tool(
+    value: &Value,
+    tools: &mut BTreeMap<String, ToolUpdate>,
+) -> Option<ToolUpdate> {
+    let id = value.get("toolCallId")?.as_str()?;
+    if id.trim().is_empty() {
+        return None;
+    }
+    if value.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call") {
+        tools.remove(id);
+    }
+    let tool = tools.entry(id.to_owned()).or_insert_with(|| ToolUpdate {
+        id: id.to_owned(),
+        title: "Tool call".into(),
+        status: ToolStatus::Pending,
+        detail: None,
+    });
+    if let Some(title) = value.get("title").and_then(Value::as_str) {
+        tool.title = title.to_owned();
+    }
+    if let Some(status) =
+        value
+            .get("status")
+            .and_then(Value::as_str)
+            .and_then(|status| match status {
+                "pending" => Some(ToolStatus::Pending),
+                "in_progress" => Some(ToolStatus::Running),
+                "completed" => Some(ToolStatus::Completed),
+                "failed" => Some(ToolStatus::Failed),
+                _ => None,
+            })
+    {
+        tool.status = status;
+    }
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        let text = content
+            .iter()
+            .filter_map(|entry| match entry.get("type").and_then(Value::as_str) {
+                Some("content") => entry.get("content")?.get("text")?.as_str(),
+                Some("diff") => entry.get("newText")?.as_str(),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        tool.detail = (!text.is_empty()).then_some(text);
+    } else if let Some(output) = value.get("rawOutput").filter(|output| !output.is_null()) {
+        tool.detail = Some(
+            output
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| output.to_string()),
+        );
+    }
+    Some(tool.clone())
 }
 
 fn parse_model_config(value: &Value) -> Option<(String, Vec<Mode>, Option<String>)> {
@@ -5024,6 +5073,116 @@ printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"timeou
             adapter.next_event().await,
             Some(Err(super::AdapterError::Protocol(detail))) if detail.contains("capacity")
         ));
+    }
+
+    #[test]
+    fn acp_tool_patches_preserve_fields_and_honor_explicit_replacements() {
+        let mut tools = std::collections::BTreeMap::new();
+        let first = serde_json::json!({"sessionUpdate":"tool_call", "toolCallId":"read", "title":"Read config", "status":"in_progress",
+            "content":[{"type":"content", "content":{"type":"text", "text":"old output"}}]});
+        let initial = super::normalize_acp_tool(&first, &mut tools).unwrap();
+        assert_eq!(initial.detail.as_deref(), Some("old output"));
+        let completed = super::normalize_acp_tool(&serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":"read","status":"completed"}), &mut tools).unwrap();
+        assert_eq!(completed.title, "Read config");
+        assert_eq!(completed.detail.as_deref(), Some("old output"));
+        assert_eq!(completed.status, ToolStatus::Completed);
+        let malformed = super::normalize_acp_tool(
+            &serde_json::json!({"toolCallId":"read","title":3,"status":"unknown","content":null}),
+            &mut tools,
+        )
+        .unwrap();
+        assert_eq!(malformed, completed);
+        let replaced = super::normalize_acp_tool(&serde_json::json!({"toolCallId":"read","content":[false,{"type":"content","content":{"type":"text","text":"new output"}}]}), &mut tools).unwrap();
+        assert_eq!(replaced.detail.as_deref(), Some("new output"));
+        let cleared = super::normalize_acp_tool(
+            &serde_json::json!({"toolCallId":"read","content":[]}),
+            &mut tools,
+        )
+        .unwrap();
+        assert_eq!(cleared.detail, None);
+        let raw = super::normalize_acp_tool(
+            &serde_json::json!({"toolCallId":"read","rawOutput":{"ok":true}}),
+            &mut tools,
+        )
+        .unwrap();
+        assert_eq!(raw.detail.as_deref(), Some("{\"ok\":true}"));
+        let fresh = super::normalize_acp_tool(&serde_json::json!({"sessionUpdate":"tool_call","toolCallId":"read","title":"New call"}), &mut tools).unwrap();
+        assert_eq!(fresh.status, ToolStatus::Pending);
+        assert_eq!(fresh.detail, None);
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"toolCallId":7}),
+            serde_json::json!({"toolCallId":" "}),
+        ] {
+            assert!(super::normalize_acp_tool(&invalid, &mut tools).is_none());
+        }
+        assert_eq!(tools.len(), 1);
+        // IDs are opaque, not whitespace-normalized aliases of another tool.
+        super::normalize_acp_tool(&serde_json::json!({"toolCallId":"read "}), &mut tools).unwrap();
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn acp_tool_status_only_notifications_retain_name_and_output() {
+        let script = r#"read _; echo '{"id":1,"result":{"agentCapabilities":{}}}'
+read _; echo '{"id":2,"result":{"sessionId":"s"}}'
+read _
+echo '{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"r","title":"Read config","status":"in_progress","content":[{"type":"content","content":{"type":"text","text":"file content"}}]}}}'
+echo '{"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"r","status":"completed"}}}'
+echo '{"id":3,"result":{"stopReason":"end_turn"}}'"#;
+        let mut adapter = AcpAdapter::new(
+            0,
+            std::env::current_dir().unwrap(),
+            "sh",
+            vec!["-c".into(), script.into()],
+        );
+        adapter.start().await.unwrap();
+        adapter.next_event().await.unwrap().unwrap();
+        adapter.send_prompt("read".into()).await.unwrap();
+        for status in [ToolStatus::Running, ToolStatus::Completed] {
+            let Some(Ok(AgentEvent::Tool { update, .. })) = adapter.next_event().await else {
+                panic!("tool event");
+            };
+            assert_eq!(update.status, status);
+            assert_eq!(update.title, "Read config");
+            assert_eq!(update.detail.as_deref(), Some("file content"));
+        }
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::TurnComplete { .. }))
+        ));
+        adapter.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn acp_reload_discards_old_queued_events_and_catalogs() {
+        let script = r#"read _; echo '{"id":1,"result":{"agentCapabilities":{}}}'; read _; echo '{"id":2,"result":{"sessionId":"new"}}'"#;
+        let mut adapter = AcpAdapter::new(
+            0,
+            std::env::current_dir().unwrap(),
+            "sh",
+            vec!["-c".into(), script.into()],
+        );
+        adapter.start().await.unwrap();
+        adapter.queued_events.push_back(Ok(AgentEvent::Text {
+            slot: 0,
+            text: "stale".into(),
+        }));
+        adapter.modes = vec![Mode {
+            id: "stale".into(),
+            label: "Stale".into(),
+        }];
+        // Real peers echo each request's ID. Reset for this fixed-ID test script.
+        adapter.next_request_id = 1;
+        adapter.reload().await.unwrap();
+        assert!(adapter.modes.is_empty());
+        assert_eq!(adapter.queued_events.len(), 1);
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Ready { .. }))
+        ));
+        adapter.stop().await.unwrap();
+        assert!(adapter.queued_events.is_empty());
     }
 
     #[tokio::test]

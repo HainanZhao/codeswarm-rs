@@ -22,6 +22,7 @@ use ratatui::{
 };
 pub use tui_textarea::{Input, Key};
 use tui_textarea::{TextArea, WrapMode};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub mod frame_scheduler;
 pub mod path_index;
@@ -1168,6 +1169,9 @@ impl App {
                 self.scroll_y = 0;
                 self.streaming_blocks.clear();
                 self.tool_windows.clear();
+                self.history_blocks.clear();
+                self.history_tools.clear();
+                self.detail_controls.clear();
                 self.focused_detail = None;
                 self.status = "conversation cleared".into();
                 LocalCommand::Handled
@@ -3711,13 +3715,13 @@ fn compact_cell_label(value: &str, width: usize) -> String {
     let content_budget = width.saturating_sub(cell_width(&ellipsis.to_string()));
     let mut label = String::new();
     let mut used = 0usize;
-    for character in value.chars() {
-        let character_width = cell_width(&character.to_string());
-        if used.saturating_add(character_width) > content_budget {
+    for grapheme in value.graphemes(true) {
+        let grapheme_width = cell_width(grapheme);
+        if used.saturating_add(grapheme_width) > content_budget {
             break;
         }
-        label.push(character);
-        used = used.saturating_add(character_width);
+        label.push_str(grapheme);
+        used += grapheme_width;
     }
     label.push(ellipsis);
     label
@@ -6618,6 +6622,65 @@ mod tests {
         );
         assert_eq!(app.handle_local_command("/exit"), Some(LocalCommand::Exit));
         assert_eq!(app.handle_local_command("ordinary text"), None);
+    }
+
+    #[test]
+    fn clearing_during_history_replay_drops_all_old_block_references() {
+        use codeswarm_adapters::HistoryContent;
+        let mut app = App::default();
+        app.apply_event(&codeswarm_adapters::AgentEvent::History {
+            slot: 0,
+            content: HistoryContent::Text("old response".into()),
+        });
+        let tool = codeswarm_adapters::ToolUpdate {
+            id: "old-tool".into(),
+            title: "Read file".into(),
+            status: codeswarm_adapters::ToolStatus::Completed,
+            detail: Some("old output".into()),
+        };
+        app.apply_event(&codeswarm_adapters::AgentEvent::History {
+            slot: 1,
+            content: HistoryContent::Tool(tool.clone()),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(!app.detail_controls.is_empty());
+        app.handle_local_command("/clear");
+        assert!(app.detail_controls.is_empty());
+        app.record_human_message("new human message", false);
+        let human = app.transcript.source(0).unwrap().to_owned();
+        app.apply_event(&codeswarm_adapters::AgentEvent::History {
+            slot: 0,
+            content: HistoryContent::Text("later history".into()),
+        });
+        app.apply_event(&codeswarm_adapters::AgentEvent::History {
+            slot: 1,
+            content: HistoryContent::Tool(tool),
+        });
+        assert_eq!(app.transcript.source(0), Some(human.as_str()));
+        assert_eq!(app.transcript.len(), 3);
+        assert!(app.export_markdown().contains("later history"));
+    }
+
+    #[test]
+    fn unicode_transcript_wraps_before_the_right_edge() {
+        let mut app = App::default();
+        app.transcript
+            .append(BlockKind::Agent, "界".repeat(17), false);
+        let mut terminal = Terminal::new(TestBackend::new(18, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .filter(|cell| cell.symbol() == "界")
+                .count(),
+            17
+        );
+        assert_eq!(compact_cell_label("👩‍💻abc", 3), "👩‍💻…");
+        assert_eq!(compact_cell_label("e\u{301}abc", 2), "e\u{301}…");
     }
 
     #[test]

@@ -3,7 +3,7 @@ members = [".", "crates/codeswarm-adapters"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.8"
+version = "0.9.9"
 edition = "2024"
 license = "MIT"
 authors = ["CodeSwarm contributors"]
@@ -43,7 +43,7 @@ name = "codeswarm"
 path = "crates/codeswarm-cli/src/main.rs"
 
 [dependencies]
-codeswarm-adapters = { version = "=0.9.8", path = "crates/codeswarm-adapters" }
+codeswarm-adapters = { version = "=0.9.9", path = "crates/codeswarm-adapters" }
 crossterm.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
@@ -51,6 +51,8 @@ sha2.workspace = true
 time.workspace = true
 tokio.workspace = true
 tui-textarea-2.workspace = true
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 async-trait.workspace = true

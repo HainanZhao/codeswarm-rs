@@ -6,6 +6,8 @@
 //! for persistence.
 
 use std::collections::BTreeMap;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// A logical transcript item. The source is retained for copy/export even
 /// when its rendered detail is collapsed.
@@ -552,30 +554,50 @@ fn presentation_source(block: &TranscriptBlock) -> &str {
     }
 }
 
-/// Shorten `text` to at most `max` characters, replacing the dropped tail
-/// with an ellipsis when truncation occurs.
+/// Shorten text by terminal columns without splitting a grapheme cluster.
 fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_owned();
-    }
-    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
-
-fn truncate_start_chars(text: &str, max: usize) -> String {
-    let count = text.chars().count();
-    if count <= max {
-        return text.to_owned();
-    }
     if max == 0 {
         return String::new();
     }
-    let tail = text
-        .chars()
-        .skip(count.saturating_sub(max.saturating_sub(1)))
-        .collect::<String>();
-    format!("…{tail}")
+    if text.width() <= max {
+        return text.to_owned();
+    }
+    let mut result = String::new();
+    let mut columns = 0;
+    for grapheme in text.graphemes(true) {
+        let next = grapheme.width();
+        if columns + next > max - 1 {
+            break;
+        }
+        result.push_str(grapheme);
+        columns += next;
+    }
+    result.push('…');
+    result
+}
+
+fn truncate_start_chars(text: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if text.width() <= max {
+        return text.to_owned();
+    }
+    let mut tail = Vec::new();
+    let mut columns = 0;
+    for grapheme in text.graphemes(true).rev() {
+        let next = grapheme.width();
+        if columns + next > max - 1 {
+            break;
+        }
+        tail.push(grapheme);
+        columns += next;
+    }
+    let mut result = String::from("…");
+    for grapheme in tail.into_iter().rev() {
+        result.push_str(grapheme);
+    }
+    result
 }
 
 fn label(kind: BlockKind) -> &'static str {
@@ -591,6 +613,7 @@ fn label(kind: BlockKind) -> &'static str {
 }
 
 fn wrap(source: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let mut rows = Vec::new();
     for original_line in source.lines() {
         if original_line.is_empty() {
@@ -598,25 +621,37 @@ fn wrap(source: &str, width: usize) -> Vec<String> {
             continue;
         }
         let mut row = String::new();
+        let mut columns = 0;
         for word in original_line.split_whitespace() {
+            let word_width = word.width();
             let separator = usize::from(!row.is_empty());
-            if !row.is_empty() && row.chars().count() + separator + word.chars().count() > width {
+            if !row.is_empty() && columns + separator + word_width > width {
                 rows.push(std::mem::take(&mut row));
+                columns = 0;
             }
-            if word.chars().count() > width && row.is_empty() {
-                let mut fragment = String::new();
-                for character in word.chars() {
-                    fragment.push(character);
-                    if fragment.chars().count() == width {
-                        rows.push(std::mem::take(&mut fragment));
+            if word_width > width {
+                for grapheme in word.graphemes(true) {
+                    // A two-column glyph cannot fit a one-column pane.
+                    let grapheme = if grapheme.width() > width {
+                        "�"
+                    } else {
+                        grapheme
+                    };
+                    let next = grapheme.width();
+                    if columns + next > width {
+                        rows.push(std::mem::take(&mut row));
+                        columns = 0;
                     }
+                    row.push_str(grapheme);
+                    columns += next;
                 }
-                row = fragment;
             } else {
                 if !row.is_empty() {
                     row.push(' ');
+                    columns += 1;
                 }
                 row.push_str(word);
+                columns += word_width;
             }
         }
         if !row.is_empty() {
@@ -657,6 +692,41 @@ pub mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::{BlockKind, Transcript, fixtures};
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn wrapping_and_truncation_use_cells_without_splitting_graphemes() {
+        let source = "你好世界🇨🇳e\u{301}👩‍💻z";
+        for width in [2, 3, 4, 8] {
+            let rows = super::wrap(source, width);
+            assert!(rows.iter().all(|row| row.width() <= width));
+            assert_eq!(rows.concat(), source);
+        }
+        assert!(super::wrap("你好", 1).iter().all(|row| row.width() <= 1));
+        assert_eq!(super::truncate_chars("abc", 0), "");
+        assert_eq!(super::truncate_chars("👩‍💻abc", 3), "👩‍💻…");
+        assert_eq!(super::truncate_start_chars("abc👩‍💻", 3), "…👩‍💻");
+        assert_eq!(super::truncate_chars("e\u{301}abc", 2), "e\u{301}…");
+        let mut transcript = Transcript::default();
+        let id = transcript.append(BlockKind::Thought, source, true);
+        for width in [4, 8, 4] {
+            assert!(
+                transcript
+                    .viewport(width, 0, 10, 0)
+                    .iter()
+                    .all(|row| row.text.width() <= width)
+            );
+        }
+        transcript.set_collapsed(id, false);
+        assert_eq!(
+            transcript
+                .viewport(4, 0, 20, 0)
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<String>(),
+            source
+        );
+    }
 
     #[test]
     fn single_long_reply_is_viewport_bounded() {
@@ -967,7 +1037,7 @@ mod tests {
 
         let rows = transcript.viewport(12, 0, 1, 0);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].text.chars().count(), 12);
+        assert!(rows[0].text.width() <= 12);
     }
 
     #[test]
