@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.7] - 2026-09-06
+
+### Fixed
+
+- Increased native Antigravity print timeout from one hour to 24 hours so long
+  tasks are not cut off at 60 minutes. User cancellation remains available.
+
 ## [0.9.6] - 2026-09-06
 
 ### Changed

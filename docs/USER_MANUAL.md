@@ -166,3 +166,10 @@ distinct non-teal colors. This Codex-inspired hierarchy applies to all themes.
 
 CodeSwarm collects no telemetry. Prompts, responses, tool calls, and terminal
 activity remain subject to the policies of the agent and provider you choose.
+
+## Long-running turns
+
+Native Antigravity turns allow up to 24 hours. ACP prompt turns have no
+CodeSwarm wall-clock limit. The two-minute inactivity warning does not cancel
+work; use Ctrl+C to cancel a running turn. Startup and control requests keep
+their separate deadlines.

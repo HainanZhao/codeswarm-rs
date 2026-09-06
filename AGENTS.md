@@ -72,6 +72,9 @@
   Resume is history-only until a new human prompt: ACP session/load replay is
   display-only history, never live activity. It must not start timers, set a
   busy turn, queue input behind phantom work, or automatically dispatch agents.
+- Native Antigravity print turns allow 24 hours (`--print-timeout 1440m`).
+  ACP prompt turns have no CodeSwarm wall-clock timeout; startup/control request
+  deadlines and user cancellation remain separate.
 - The relay defaults to 100 automated turns and can be adjusted with
   `--max-rounds N`. This is a runaway-safety limit, not a per-agent budget —
   it does not scale with roster size.

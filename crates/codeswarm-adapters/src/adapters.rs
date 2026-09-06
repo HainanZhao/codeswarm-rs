@@ -1967,7 +1967,8 @@ impl AgentAdapter for AgyAdapter {
             .arg("--print")
             .arg(prompt)
             .arg("--print-timeout")
-            .arg("60m")
+            // Allow day-long work; cancellation remains under user control.
+            .arg("1440m")
             .arg("--output-format")
             .arg("stream-json")
             .current_dir(&self.cwd)
@@ -4745,6 +4746,51 @@ mod tests {
             adapter.next_event().await,
             Some(Ok(AgentEvent::ModesReplaced { current_mode: Some(mode), .. })) if mode == "agy:full-access"
         ));
+    }
+
+    #[tokio::test]
+    async fn native_turns_receive_a_twenty_four_hour_timeout() {
+        let script_path = unique_test_path("codeswarm-native-timeout", "sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/bin/sh
+seen=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --print-timeout)
+            shift
+            [ "$1" = "1440m" ] || exit 2
+            seen=$((seen + 1))
+            ;;
+    esac
+    shift
+done
+[ "$seen" = 1 ] || exit 3
+printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"timeout accepted"}}'
+"#,
+        )
+        .unwrap();
+        let mut adapter = AgyAdapter::with_session_id(
+            0,
+            std::env::current_dir().unwrap(),
+            format!("sh {}", script_path.display()),
+            "saved-session",
+        );
+        adapter.start().await.unwrap();
+        adapter.next_event().await.unwrap().unwrap();
+        adapter.next_event().await.unwrap().unwrap();
+        for prompt in ["first task", "follow-up task"] {
+            adapter.send_prompt(prompt.into()).await.unwrap();
+            assert!(
+                matches!(adapter.next_event().await, Some(Ok(AgentEvent::Text { text, .. })) if text == "timeout accepted")
+            );
+            assert!(matches!(
+                adapter.next_event().await,
+                Some(Ok(AgentEvent::TurnComplete { .. }))
+            ));
+        }
+        adapter.stop().await.unwrap();
+        std::fs::remove_file(script_path).unwrap();
     }
 
     #[tokio::test]
