@@ -51,6 +51,8 @@
   selection overrides that target: the prompt footer names the selected agent
   as the next recipient, so a queued message has to be delivered to it rather
   than to whichever agent happened to be working when it was submitted.
+- Snapshot the footer arrow recipient on submission and retain that exact
+  target through queuing and handoffs; never fall back to another agent.
 - Clicking an agent beside the prompt selects it as the first recipient for
   the next normal relay message. Duplicate names display their roster number.
 - `[CODESWARM:STOP]` is the safe word, but only an agent reviewing a different
@@ -64,14 +66,20 @@
   press within three seconds quits; while idle, `Ctrl+C` quits immediately.
   `codeswarm resume [PATH]` starts the last provider-backed session saved for
   that project; a normal launch always starts a fresh provider session.
-  Chat `/resume` switches to the project session retained before the current
-  adapters started, after shutting down the current workers. It appears in
+  Chat `/sessions` browses local project archives by immutable session ID.
+  `/resume` opens the preceding archived session (legacy provider metadata is
+  a fallback), after shutting down current workers. Opening history never
+  starts adapters; a new human prompt or explicit goal run reconnects them. It appears in
   local help/completion, accepts no arguments, and rejects active work, pending
   permissions, or queued prompts via the status ribbon. Fresh startup metadata
   must never replace the retained resume target.
   Resume is history-only until a new human prompt: ACP session/load replay is
   display-only history, never live activity. It must not start timers, set a
   busy turn, queue input behind phantom work, or automatically dispatch agents.
+- Pair review is the worker/reviewer workflow. Roles are anchored to the first
+  responder of each human task and remain stable through review/fix cycles.
+  Only the reviewer may stop a multi-agent pair batch; worker changes return
+  for review. Do not add a duplicate workflow mode.
 - Native Antigravity print turns allow 24 hours (`--print-timeout 1440m`).
   ACP prompt turns have no CodeSwarm wall-clock timeout; startup/control request
   deadlines and user cancellation remain separate.
@@ -129,6 +137,10 @@
   Each icon toggles expansion;
   keep Ctrl+O as the keyboard shortcut. Controls must not consume
   preview width, and hit targets must be rebuilt on redraw/scroll/resize.
+  While thoughts are streaming, suppress completed collapsed tool previews;
+  keep their evidence available in `/summary`. Show active tool output and
+  preserve explicitly expanded details. The footer owns routine activity;
+  do not flash a redundant "working" ribbon.
   Preserve stable block IDs and cached earlier turns when ordering details.
   Thought and tool detail text/previews are an intentional exception:
   use faint muted gray and italics, visually lighter than normal messages.

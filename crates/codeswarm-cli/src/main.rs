@@ -1,3 +1,5 @@
+mod product;
+
 use std::{
     collections::VecDeque,
     ffi::OsStr,
@@ -358,6 +360,13 @@ enum AdapterControl {
     Stop,
 }
 
+fn normal_prompt_control(target: Option<usize>, prompt: String) -> AdapterControl {
+    match target {
+        Some(slot) => AdapterControl::Queue { slot, prompt },
+        None => AdapterControl::Prompt(prompt),
+    }
+}
+
 fn control_for_queued(prompt: &QueuedPrompt) -> Option<AdapterControl> {
     if prompt.direct {
         return Some(AdapterControl::Direct {
@@ -449,6 +458,13 @@ fn interaction_height(frame_area: Rect) -> usize {
 
 #[derive(Debug)]
 enum Launch {
+    History(Box<product::SavedConversation>),
+    ContinueSaved {
+        conversation: Box<product::SavedConversation>,
+        prompt: String,
+        slot: usize,
+        direct: bool,
+    },
     Preview,
     Store,
     Agy {
@@ -488,6 +504,13 @@ fn agent_spec_identity(spec: &AgentSpec) -> String {
 #[derive(Debug)]
 enum SessionOutcome {
     Exit,
+    OpenHistory(Box<product::SavedConversation>),
+    ContinueSaved {
+        conversation: Box<product::SavedConversation>,
+        prompt: String,
+        slot: usize,
+        direct: bool,
+    },
     Resume {
         launch: Box<Launch>,
         metadata: Box<SessionMetadata>,
@@ -560,7 +583,23 @@ fn main() -> std::io::Result<()> {
         std::env::set_current_dir(path)?;
     }
     let launch = if resume_requested {
-        Some(resume_launch()?)
+        Some(
+            match product::latest_conversation(&std::env::current_dir()?, None)
+                .map_err(std::io::Error::other)?
+            {
+                Some(conversation) => Launch::History(Box::new(conversation)),
+                None => {
+                    let _ = resume_launch()?;
+                    let metadata = saved_chat_resume().map_err(std::io::Error::other)?;
+                    Launch::History(Box::new(product::SavedConversation {
+                        id: None,
+                        metadata,
+                        events: Vec::new(),
+                        warnings: Vec::new(),
+                    }))
+                }
+            },
+        )
     } else {
         parse_launch(&arguments).or_else(|| {
             (arguments.is_empty()
@@ -581,16 +620,36 @@ fn main() -> std::io::Result<()> {
     loop {
         match run_launch_session(launch, resume)? {
             SessionOutcome::Exit => return Ok(()),
+            SessionOutcome::OpenHistory(conversation) => {
+                launch = Launch::History(conversation);
+                resume = false;
+            }
+            SessionOutcome::ContinueSaved {
+                conversation,
+                prompt,
+                slot,
+                direct,
+            } => {
+                launch = Launch::ContinueSaved {
+                    conversation,
+                    prompt,
+                    slot,
+                    direct,
+                };
+                resume = false;
+            }
             SessionOutcome::Resume {
-                launch: next,
+                launch: validated_launch,
                 metadata,
             } => {
-                // Old workers are stopped before restoring the selected snapshot.
-                SessionMetadataStore::open(session_metadata_path_for(&std::env::current_dir()?))
-                    .write(&metadata)
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                launch = *next;
-                resume = true;
+                drop(validated_launch);
+                launch = Launch::History(Box::new(product::SavedConversation {
+                    id: None,
+                    metadata: *metadata,
+                    events: Vec::new(),
+                    warnings: Vec::new(),
+                }));
+                resume = false;
             }
         }
     }
@@ -605,6 +664,13 @@ fn run_launch_session(launch: Launch, resume_requested: bool) -> std::io::Result
     let backend = CrosstermBackend::new(output);
     let mut terminal = Terminal::new(backend)?;
     let result = match launch {
+        Launch::History(conversation) => run_saved_history(&mut terminal, *conversation),
+        Launch::ContinueSaved {
+            conversation,
+            prompt,
+            slot,
+            direct,
+        } => run_saved_continue(&mut terminal, *conversation, prompt, slot, direct),
         Launch::Preview => run_preview(&mut terminal),
         Launch::Store => run_store(&mut terminal),
         Launch::Agy { prompt } => run_agy(&mut terminal, prompt, resume_requested),
@@ -628,6 +694,8 @@ fn run_launch_session(launch: Launch, resume_requested: bool) -> std::io::Result
             prompt,
             first_slot,
             max_rounds,
+            None,
+            false,
         ),
     };
     let restore_result = terminal_session.restore();
@@ -1232,6 +1300,7 @@ fn standalone_session_metadata(
     SessionMetadata::new(data)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queue_standalone_metadata(
     writer: Option<&codeswarm_adapters::persistence::BufferedSessionMetadataStore>,
     cwd: &Path,
@@ -1240,10 +1309,14 @@ fn queue_standalone_metadata(
     command: &str,
     adapter: &dyn AgentAdapter,
     goal: Option<&codeswarm_adapters::goal::Goal>,
+    sender: &Sender<AdapterResult<AgentEvent>>,
 ) {
+    let mut metadata = standalone_session_metadata(cwd, name, identity, command, adapter);
+    metadata.insert("goal", serde_json::to_value(goal).expect("goal serializes"));
+    let _ = sender.send(Ok(AgentEvent::SessionMetadataUpdated {
+        metadata: metadata.to_value(),
+    }));
     if let Some(writer) = writer {
-        let mut metadata = standalone_session_metadata(cwd, name, identity, command, adapter);
-        metadata.insert("goal", serde_json::to_value(goal).expect("goal serializes"));
         let _ = writer.write(metadata);
     }
 }
@@ -1478,6 +1551,8 @@ fn run_store(
                     None,
                     0,
                     100,
+                    None,
+                    false,
                 );
             }
             StoreAction::Close => return Ok(SessionOutcome::Exit),
@@ -1966,6 +2041,79 @@ fn save_ui_preferences_at(path: &Path, app: &App) -> std::io::Result<()> {
     })
 }
 
+#[derive(Default)]
+struct SessionSetup {
+    history: Option<product::SavedConversation>,
+    initial_prompt: Option<(String, bool)>,
+}
+
+fn run_saved_continue(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    conversation: product::SavedConversation,
+    prompt: String,
+    slot: usize,
+    direct: bool,
+) -> std::io::Result<SessionOutcome> {
+    let cwd = std::env::current_dir()?;
+    let settings = settings_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    let launch = resume_launch_from_metadata(&conversation.metadata, &cwd, &settings)
+        .map_err(std::io::Error::other)?;
+    SessionMetadataStore::open(session_metadata_path_for(&cwd))
+        .write(&conversation.metadata)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let Launch::Roster {
+        specs,
+        identities,
+        models,
+        session_ids,
+        max_rounds,
+        ..
+    } = launch
+    else {
+        return Err(std::io::Error::other("saved session is not a roster"));
+    };
+    run_roster(
+        terminal,
+        specs,
+        identities,
+        models,
+        session_ids,
+        Some(prompt),
+        slot,
+        max_rounds,
+        Some(conversation),
+        direct,
+    )
+}
+
+fn run_saved_history(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    conversation: product::SavedConversation,
+) -> std::io::Result<SessionOutcome> {
+    let mut app = App::default();
+    load_ui_preferences(&mut app);
+    product::replay_conversation(&mut app, &conversation);
+    if conversation.events.is_empty() {
+        app.status =
+            "provider-only saved session · send a message to load history and continue".into();
+    }
+    let saved = Ok(conversation.metadata.clone());
+    run_terminal(
+        terminal,
+        &mut app,
+        None,
+        None,
+        None,
+        saved,
+        SessionSetup {
+            history: Some(conversation),
+            initial_prompt: None,
+        },
+    )
+}
+
 fn run_preview(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
 ) -> std::io::Result<SessionOutcome> {
@@ -1982,7 +2130,15 @@ fn run_preview(
         fixtures::five_thousand_word_reply(),
         false,
     );
-    run_terminal(terminal, &mut app, None, None, None, saved_resume)
+    run_terminal(
+        terminal,
+        &mut app,
+        None,
+        None,
+        None,
+        saved_resume,
+        SessionSetup::default(),
+    )
 }
 
 fn run_agy(
@@ -2007,8 +2163,8 @@ fn run_agy_command(
     app.set_agent_name(0, name.clone());
     app.set_agent_identity(0, catalog_identity_for_command(command));
     app.set_header(name, "starting");
-    if let Some(prompt) = initial_prompt {
-        app.record_human_message(&prompt, false);
+    if let Some(prompt) = initial_prompt.as_ref() {
+        app.record_human_message(prompt, false);
     }
     let shutdown = controls.clone();
     let result = run_terminal(
@@ -2018,6 +2174,10 @@ fn run_agy_command(
         Some(controls),
         None,
         saved_resume,
+        SessionSetup {
+            history: None,
+            initial_prompt: initial_prompt.map(|prompt| (prompt, false)),
+        },
     );
     stop_worker(shutdown, Some(worker));
     result
@@ -2046,8 +2206,8 @@ fn run_acp_program(
     app.set_agent_name(0, name.clone());
     app.set_agent_identity(0, catalog_identity_for_command(&program));
     app.set_header(name, "starting");
-    if let Some(prompt) = initial_prompt {
-        app.record_human_message(&prompt, false);
+    if let Some(prompt) = initial_prompt.as_ref() {
+        app.record_human_message(prompt, false);
     }
     let shutdown = controls.clone();
     let result = run_terminal(
@@ -2057,6 +2217,10 @@ fn run_acp_program(
         Some(controls),
         None,
         saved_resume,
+        SessionSetup {
+            history: None,
+            initial_prompt: initial_prompt.map(|prompt| (prompt, false)),
+        },
     );
     stop_worker(shutdown, worker);
     result
@@ -2072,9 +2236,14 @@ fn run_roster(
     prompt: Option<String>,
     first_slot: usize,
     max_rounds: usize,
+    restored: Option<product::SavedConversation>,
+    initial_direct: bool,
 ) -> std::io::Result<SessionOutcome> {
     let saved_resume = saved_chat_resume();
     let mut app = App::default();
+    if let Some(saved) = &restored {
+        product::replay_conversation(&mut app, saved);
+    }
     for (slot, spec) in specs.iter().enumerate() {
         let name = match spec {
             AgentSpec::Agy(command) | AgentSpec::Acp(command) => command,
@@ -2085,17 +2254,24 @@ fn run_roster(
         }
     }
     if let Some(prompt) = prompt.as_ref() {
-        app.record_human_message(prompt, false);
+        app.record_human_message(prompt, initial_direct);
     }
+    let initial_prompt = prompt.clone();
     let (events, controls, worker) = spawn_relay(
         specs,
         identities,
         models,
         session_ids,
-        prompt,
+        if initial_direct { None } else { prompt },
         first_slot,
         max_rounds,
     );
+    if initial_direct && let Some(prompt) = &initial_prompt {
+        let _ = controls.send(AdapterControl::Direct {
+            slot: first_slot,
+            prompt: prompt.clone(),
+        });
+    }
     app.set_header(app.agent_name(first_slot), "starting");
     let shutdown = controls.clone();
     let result = run_terminal(
@@ -2105,6 +2281,10 @@ fn run_roster(
         Some(controls),
         Some(first_slot),
         saved_resume,
+        SessionSetup {
+            history: restored,
+            initial_prompt: initial_prompt.map(|prompt| (prompt, initial_direct)),
+        },
     );
     stop_worker(shutdown, Some(worker));
     result
@@ -2331,6 +2511,7 @@ fn run_agy_task(
             &command,
             &adapter,
             goal.as_ref(),
+            &sender,
         );
         if let Some(prompt) = prompt {
             if let Err(error) = adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt)).await {
@@ -2370,6 +2551,7 @@ fn run_agy_task(
                                         &command,
                                         &adapter,
                                         goal.as_ref(),
+                                        &sender,
                                     );
                                 }
                             }
@@ -2386,7 +2568,7 @@ fn run_agy_task(
                     None => break,
                 },
                 control = async { match startup_commands.pop_front() { Some(command) => Some(command), None => controls.recv().await } } => match control {
-                    Some(AdapterControl::Prompt(prompt) | AdapterControl::FollowUp(prompt)) => {
+                    Some(AdapterControl::Prompt(prompt) | AdapterControl::FollowUp(prompt) | AdapterControl::Queue { slot: 0, prompt } | AdapterControl::Direct { slot: 0, prompt }) => {
                         if let Err(error) = adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt)).await {
                             let _ = sender.send(Err(error));
                         } else {
@@ -2404,7 +2586,7 @@ fn run_agy_task(
                         match codeswarm_adapters::goal::apply(&mut goal, goal_command) {
                             Ok(task) => {
                                 let _ = sender.send(Ok(AgentEvent::GoalUpdated { goal: goal.clone() }));
-                                queue_standalone_metadata(metadata_writer.as_ref(), &cwd, &name, &identity, &command, &adapter, goal.as_ref());
+                                queue_standalone_metadata(metadata_writer.as_ref(), &cwd, &name, &identity, &command, &adapter, goal.as_ref(), &sender);
                                 if let Some(task) = task {
                                     match adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &task)).await {
                                         Ok(()) => { turn_running = true; let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 })); }
@@ -2549,6 +2731,7 @@ fn run_acp_task(
             &command,
             &adapter,
             goal.as_ref(),
+            &sender,
         );
         if let Some(prompt) = prompt {
             if let Err(error) = adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt)).await {
@@ -2588,6 +2771,7 @@ fn run_acp_task(
                                         &command,
                                         &adapter,
                                         goal.as_ref(),
+                                        &sender,
                                     );
                                 }
                             }
@@ -2604,7 +2788,7 @@ fn run_acp_task(
                     None => break,
                 },
                 control = async { match startup_commands.pop_front() { Some(command) => Some(command), None => controls.recv().await } } => match control {
-                    Some(AdapterControl::Prompt(prompt) | AdapterControl::FollowUp(prompt)) => {
+                    Some(AdapterControl::Prompt(prompt) | AdapterControl::FollowUp(prompt) | AdapterControl::Queue { slot: 0, prompt } | AdapterControl::Direct { slot: 0, prompt }) => {
                         if let Err(error) = adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt)).await {
                             let _ = sender.send(Err(error));
                         } else {
@@ -2622,7 +2806,7 @@ fn run_acp_task(
                         match codeswarm_adapters::goal::apply(&mut goal, goal_command) {
                             Ok(task) => {
                                 let _ = sender.send(Ok(AgentEvent::GoalUpdated { goal: goal.clone() }));
-                                queue_standalone_metadata(metadata_writer.as_ref(), &cwd, &name, &identity, &command, &adapter, goal.as_ref());
+                                queue_standalone_metadata(metadata_writer.as_ref(), &cwd, &name, &identity, &command, &adapter, goal.as_ref(), &sender);
                                 if let Some(task) = task {
                                     match adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &task)).await {
                                         Ok(()) => { turn_running = true; let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 })); }
@@ -2977,6 +3161,13 @@ fn run_relay_task(
             Ok(commands) => commands,
             Err(error) => {
                 let _ = relay.stop().await;
+                for slot in relay.relay().active_slots() {
+                    let _ = sender.send(Ok(AgentEvent::Failed {
+                        slot,
+                        started: false,
+                        detail: error.to_string(),
+                    }));
+                }
                 let _ = sender.send(Err(error));
                 return;
             }
@@ -3301,7 +3492,9 @@ fn run_terminal(
     controls: Option<tokio::sync::mpsc::UnboundedSender<AdapterControl>>,
     selected_slot: Option<usize>,
     saved_resume: Result<SessionMetadata, String>,
+    setup: SessionSetup,
 ) -> std::io::Result<SessionOutcome> {
+    let mut saved_conversation = setup.history;
     load_ui_preferences(app);
     load_config_agents(app);
     if let Ok(root) = std::env::current_dir() {
@@ -3312,6 +3505,33 @@ fn run_terminal(
     // between unrelated projects.
     let history_project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     app.load_prompt_history(load_prompt_history(&history_project_root));
+    let mut journal = if controls.is_some() {
+        match product::ConversationJournal::open(
+            &history_project_root,
+            saved_conversation.as_ref(),
+            app.active_roster_slots()
+                .into_iter()
+                .map(|slot| app.agent_name(slot))
+                .collect(),
+        ) {
+            Ok(mut journal) => {
+                if let Some((prompt, direct)) = setup.initial_prompt
+                    && let Err(error) = journal.human(&prompt, direct)
+                {
+                    app.status = format!("unable to archive prompt: {error}");
+                }
+                Some(journal)
+            }
+            Err(error) => {
+                app.status = format!("unable to open session archive: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let offline_summary = saved_conversation.as_ref().map(product::summary_for);
+
     let completion_candidates = codeswarm::tui::LOCAL_COMMANDS
         .iter()
         .map(|spec| spec.name.to_owned())
@@ -3341,6 +3561,17 @@ fn run_terminal(
     let mut redraw = codeswarm::tui::frame_scheduler::RedrawSchedule::default();
     let mut frame_area = ratatui::layout::Rect::default();
     loop {
+        if let Some(journal) = &mut journal
+            && let Some(result) = journal.poll_changes()
+        {
+            if let Err(error) = result {
+                app.status = error;
+            }
+            if app.summary_visible() {
+                app.open_summary(journal.summary.render_text());
+            }
+            redraw.invalidate();
+        }
         if app.poll_path_index() {
             redraw.invalidate();
         }
@@ -3368,8 +3599,22 @@ fn run_terminal(
                 redraw.invalidate();
                 match event {
                     Ok(event) => {
+                        if matches!(event, AgentEvent::History { .. })
+                            && saved_conversation
+                                .as_ref()
+                                .is_some_and(|saved| !saved.events.is_empty())
+                        {
+                            continue;
+                        }
+                        if let Some(journal) = &mut journal
+                            && let Err(error) = journal.event(&event)
+                        {
+                            app.status = format!("unable to archive update: {error}");
+                        }
                         match &event {
-                            AgentEvent::History { .. } | AgentEvent::GoalUpdated { .. } => {}
+                            AgentEvent::History { .. }
+                            | AgentEvent::GoalUpdated { .. }
+                            | AgentEvent::SessionMetadataUpdated { .. } => {}
                             AgentEvent::RosterUpdated { update } => match update {
                                 codeswarm_adapters::RosterUpdate::Added {
                                     slot, identity, ..
@@ -3570,6 +3815,10 @@ fn run_terminal(
                 }
             }
         }
+        if let Some(error) = journal.as_ref().and_then(|journal| journal.poll_error()) {
+            app.status = format!("unable to save session: {error}");
+            redraw.invalidate();
+        }
         if app.terminal_alert_active() && app.blink_title_enabled() {
             if title_blink_at.elapsed() >= Duration::from_millis(500) {
                 app.toggle_terminal_title_blink();
@@ -3609,6 +3858,20 @@ fn run_terminal(
             }
             Event::FocusLost => {
                 app.set_terminal_focused(false);
+                continue;
+            }
+            Event::Mouse(mouse)
+                if app.product_panel_visible() && mouse_scroll_delta(mouse.kind).is_some() =>
+            {
+                let delta = mouse_scroll_delta(mouse.kind).unwrap_or(0);
+                for _ in 0..delta.unsigned_abs() {
+                    app.handle_product_panel_key(Input {
+                        key: if delta < 0 { TuiKey::Up } else { TuiKey::Down },
+                        ctrl: false,
+                        alt: false,
+                        shift: false,
+                    });
+                }
                 continue;
             }
             Event::Mouse(mouse) if mouse_scroll_delta(mouse.kind).is_some() => {
@@ -3664,6 +3927,30 @@ fn run_terminal(
             }
             Event::Key(key) => {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if app.product_panel_visible()
+                    && !(key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL))
+                {
+                    app.handle_product_panel_key(Input::from(key));
+                    if let Some(id) = app.take_session_request() {
+                        if turn_active || pending_permission.is_some() || app.queued_count() > 0 {
+                            app.status = "cancel active work and clear queued prompts before switching sessions".into();
+                        } else {
+                            if let Some(journal) = &journal {
+                                let _ = journal.flush();
+                            }
+                            match product::load_conversation(&id, &history_project_root) {
+                                Ok(conversation) => {
+                                    return Ok(SessionOutcome::OpenHistory(Box::new(conversation)));
+                                }
+                                Err(error) => {
+                                    app.status = format!("unable to open session: {error}")
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 if app.config_visible() {
@@ -3921,13 +4208,33 @@ fn run_terminal(
                         }
                     }
                     KeyCode::Enter
-                        if selected_slot.is_some()
+                        if app.next_agent_slot().is_some()
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                             && !app.prompt.trim().is_empty() =>
                     {
+                        if controls.is_none()
+                            && let Some(conversation) = &saved_conversation
+                        {
+                            let slot = app.next_agent_slot().expect("guarded recipient");
+                            if product::resumable_slots(&conversation.metadata).contains(&slot) {
+                                return Ok(SessionOutcome::ContinueSaved {
+                                    conversation: Box::new(conversation.clone()),
+                                    prompt: app.take_prompt(),
+                                    slot,
+                                    direct: true,
+                                });
+                            }
+                            app.status = "selected agent has no resumable provider handle; history remains available".into();
+                            continue;
+                        }
                         if let Some(controls) = &controls {
                             let prompt = app.prompt.clone();
-                            let slot = selected_slot.expect("guarded selected slot");
+                            let slot = app.next_agent_slot().expect("guarded recipient");
+                            if let Some(journal) = &mut journal
+                                && let Err(error) = journal.human(&prompt, true)
+                            {
+                                app.status = format!("unable to archive prompt: {error}");
+                            }
                             app.record_human_message(&prompt, true);
                             if turn_active {
                                 if app.queue_prompt(prompt, Some(slot), true).is_some() {
@@ -3973,6 +4280,12 @@ fn run_terminal(
                                                     objective,
                                                 ) = command
                                                 {
+                                                    if let Some(journal) = &mut journal {
+                                                        let _ = journal.human(
+                                                            &format!("Goal: {objective}"),
+                                                            false,
+                                                        );
+                                                    }
                                                     app.record_human_message(
                                                         &format!("Goal: {objective}"),
                                                         false,
@@ -3987,12 +4300,112 @@ fn run_terminal(
                                             } else {
                                                 app.status = "unable to update goal: agent connection closed".into();
                                             }
+                                        } else if let Some(conversation) = &mut saved_conversation {
+                                            let mut goal =
+                                                conversation.metadata.get("goal").and_then(
+                                                    codeswarm_adapters::goal::Goal::from_metadata,
+                                                );
+                                            match codeswarm_adapters::goal::apply(
+                                                &mut goal, command,
+                                            ) {
+                                                Ok(task) => {
+                                                    let value = serde_json::to_value(&goal)
+                                                        .expect("goal serializes");
+                                                    conversation
+                                                        .metadata
+                                                        .insert("goal", value.clone());
+                                                    if let Some(id) = &conversation.id
+                                                        && let Err(error) = product::archive_store()
+                                                            .update_metadata(id, |metadata| {
+                                                                metadata.insert("goal", value);
+                                                            })
+                                                    {
+                                                        app.status =
+                                                            format!("unable to save goal: {error}");
+                                                        continue;
+                                                    }
+                                                    app.apply_event(&AgentEvent::GoalUpdated {
+                                                        goal,
+                                                    });
+                                                    if let Some(prompt) = task {
+                                                        let slot =
+                                                            app.next_agent_slot().unwrap_or(0);
+                                                        if product::resumable_slots(
+                                                            &conversation.metadata,
+                                                        )
+                                                        .contains(&slot)
+                                                        {
+                                                            return Ok(
+                                                                SessionOutcome::ContinueSaved {
+                                                                    conversation: Box::new(
+                                                                        conversation.clone(),
+                                                                    ),
+                                                                    prompt,
+                                                                    slot,
+                                                                    direct: false,
+                                                                },
+                                                            );
+                                                        }
+                                                        app.status = "goal saved; selected agent has no resumable provider handle".into();
+                                                    }
+                                                }
+                                                Err(error) => app.status = error,
+                                            }
                                         } else {
                                             app.apply_local_goal(command);
                                         }
                                     }
+                                    LocalCommand::Sessions => {
+                                        if let Some(journal) = &journal {
+                                            let _ = journal.flush();
+                                        }
+                                        match product::session_entries(&history_project_root) {
+                                            Ok((entries, failures)) => {
+                                                app.open_sessions(entries);
+                                                if failures > 0 {
+                                                    app.status = format!(
+                                                        "unable to read {failures} saved session(s); other sessions remain available"
+                                                    );
+                                                }
+                                            }
+                                            Err(error) => {
+                                                app.status =
+                                                    format!("unable to list sessions: {error}")
+                                            }
+                                        }
+                                    }
+                                    LocalCommand::Status => {
+                                        let status = format!(
+                                            "{}\n{}",
+                                            product::runtime_diagnostics(
+                                                journal.as_ref().map(|j| &j.metadata).or_else(
+                                                    || saved_conversation
+                                                        .as_ref()
+                                                        .map(|s| &s.metadata)
+                                                ),
+                                                controls
+                                                    .as_ref()
+                                                    .is_none_or(|controls| controls.is_closed())
+                                            ),
+                                            app.status_report()
+                                        );
+                                        app.open_status(status);
+                                    }
+                                    LocalCommand::Summary => {
+                                        if let Some(journal) = &mut journal {
+                                            journal.inspect_changes(&history_project_root);
+                                            app.open_summary(journal.summary.render_text());
+                                        } else if let Some(summary) = &offline_summary {
+                                            app.open_summary(summary.render_text());
+                                        } else {
+                                            app.open_summary("No completion summary recorded yet.");
+                                        }
+                                    }
                                     LocalCommand::Handled => {}
                                     LocalCommand::Exit => {
+                                        if let Some(journal) = &journal {
+                                            journal.flush().map_err(std::io::Error::other)?;
+                                        }
                                         if let Some(controls) = &controls {
                                             let _ = controls.send(AdapterControl::Stop);
                                         }
@@ -4010,6 +4423,35 @@ fn run_terminal(
                                         }
                                     }
                                     LocalCommand::Resume => {
+                                        if !(turn_active
+                                            || pending_permission.is_some()
+                                            || app.queued_count() > 0)
+                                        {
+                                            if let Some(journal) = &journal {
+                                                let _ = journal.flush();
+                                            }
+                                            match product::latest_conversation(
+                                                &history_project_root,
+                                                journal.as_ref().map(|j| j.id()).or_else(|| {
+                                                    saved_conversation
+                                                        .as_ref()
+                                                        .and_then(|s| s.id.as_deref())
+                                                }),
+                                            ) {
+                                                Ok(Some(conversation)) => {
+                                                    return Ok(SessionOutcome::OpenHistory(
+                                                        Box::new(conversation),
+                                                    ));
+                                                }
+                                                Err(error) => {
+                                                    app.status = format!(
+                                                        "unable to resume history: {error}"
+                                                    );
+                                                    continue;
+                                                }
+                                                Ok(None) => {}
+                                            }
+                                        }
                                         let settings = settings_path()
                                             .and_then(|path| std::fs::read_to_string(path).ok())
                                             .unwrap_or_default();
@@ -4028,6 +4470,10 @@ fn run_terminal(
                                     LocalCommand::Reload => {
                                         if let Some(controls) = &controls {
                                             request_agent_reload(app, controls, Instant::now());
+                                        } else {
+                                            app.status =
+                                                "history is offline; send a message to reconnect"
+                                                    .into();
                                         }
                                     }
                                     LocalCommand::SelectAgent(slot) => {
@@ -4059,21 +4505,42 @@ fn run_terminal(
                                         }
                                     },
                                 }
+                            } else if controls.is_none()
+                                && let Some(conversation) = saved_conversation.as_ref()
+                            {
+                                let slot =
+                                    selected_slot.or_else(|| app.next_agent_slot()).unwrap_or(0);
+                                if product::resumable_slots(&conversation.metadata).contains(&slot)
+                                {
+                                    return Ok(SessionOutcome::ContinueSaved {
+                                        conversation: Box::new(conversation.clone()),
+                                        prompt,
+                                        slot,
+                                        direct: false,
+                                    });
+                                }
+                                app.status = "selected agent has no resumable provider handle; history remains available".into();
                             } else if let Some(controls) = &controls {
+                                let target = app.next_agent_slot();
+                                if let Some(journal) = &mut journal
+                                    && let Err(error) = journal.human(&prompt, false)
+                                {
+                                    app.status = format!("unable to archive prompt: {error}");
+                                }
                                 app.record_human_message(&prompt, false);
                                 if turn_active {
-                                    if app.queue_prompt(prompt, selected_slot, false).is_some() {
+                                    if app.queue_prompt(prompt, target, false).is_some() {
                                         consume_one_shot_route(app, &mut selected_slot);
                                         app.status = "prompt queued".into();
                                     } else {
                                         app.status = "queue full or prompt empty".into();
                                     }
                                 } else {
-                                    let command = if let Some(slot) = selected_slot {
-                                        AdapterControl::Queue { slot, prompt }
-                                    } else {
-                                        AdapterControl::Prompt(prompt)
+                                    let Some(slot) = target else {
+                                        app.status = "no available agent for this message".into();
+                                        continue;
                                     };
+                                    let command = normal_prompt_control(Some(slot), prompt);
                                     if controls.send(command).is_ok() {
                                         turn_active = true;
                                         consume_one_shot_route(app, &mut selected_slot);
@@ -4085,6 +4552,9 @@ fn run_terminal(
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if !turn_active {
+                            if let Some(journal) = &journal {
+                                journal.flush().map_err(std::io::Error::other)?;
+                            }
                             if let Some(controls) = &controls {
                                 let _ = controls.send(AdapterControl::Stop);
                             }
@@ -4383,6 +4853,26 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn queued_message_keeps_the_recipient_shown_by_the_arrow() {
+        let mut app = App::default();
+        app.set_agent_name(0, "One");
+        app.set_agent_name(1, "Two");
+        app.apply_event(&AgentEvent::TurnStarted { slot: 0 });
+        app.apply_event(&AgentEvent::TurnComplete { slot: 0 });
+        assert_eq!(app.next_agent_slot(), Some(1));
+        let target = app.next_agent_slot();
+        let id = app.queue_prompt("follow-up", target, false).unwrap();
+        app.apply_event(&AgentEvent::TurnStarted { slot: 0 });
+        let queued = app.remove_queued_prompt(id).unwrap();
+        assert!(matches!(
+            super::control_for_queued(&queued),
+            Some(AdapterControl::Queue { slot: 1, .. })
+        ));
+        app.set_selected_agent(Some(0));
+        assert_eq!(app.next_agent_slot(), Some(0));
+    }
 
     #[test]
     fn theme_preferences_round_trip_and_invalid_replacements_use_terminal_defaults() {

@@ -34,7 +34,11 @@ codeswarm
 codeswarm resume
 ```
 
-Inside chat, `/resume` restores the previous saved project session.
+Inside chat, `/sessions` browses saved project conversations and `/resume` opens
+previous history without starting providers. Send a new message to reconnect
+and continue. `/status` shows the running version, executable, roster and
+connection state; `/summary` shows observed tool outcomes and the last response.
+Pair review uses stable worker/reviewer roles within the existing pair mode.
 
 The first launch opens agent selection. A saved roster is restored on later
 launches. For a deterministic preview or smoke test:

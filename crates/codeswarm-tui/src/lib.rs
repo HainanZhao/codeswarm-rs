@@ -34,6 +34,10 @@ pub use path_index::{
 pub use theme::Theme;
 
 const MAX_QUEUED_PROMPTS: usize = 100;
+// Fixed row step for PageUp/PageDown inside the session browser. The visible
+// capacity depends on the pane height, so navigation uses a modest constant
+// that never overshoots small lists.
+const SESSIONS_PAGE_STEP: usize = 5;
 // Theme-adaptive chrome: let the terminal own its canvas and text colors,
 // then use one restrained teal accent for focus and controls. This stays
 // legible on both light and dark terminal themes.
@@ -108,8 +112,11 @@ pub enum LocalCommand {
     Export,
     Reload,
     Resume,
+    Sessions,
     SelectAgent(usize),
     SelectText,
+    Status,
+    Summary,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -167,6 +174,11 @@ pub const LOCAL_COMMANDS: &[CommandSpec] = &[
         usage: "/resume",
     },
     CommandSpec {
+        name: "/sessions",
+        description: "Browse saved project sessions",
+        usage: "/sessions",
+    },
+    CommandSpec {
         name: "/select",
         description: "Temporarily enable text selection",
         usage: "/select",
@@ -175,6 +187,16 @@ pub const LOCAL_COMMANDS: &[CommandSpec] = &[
         name: "/settings",
         description: "Open settings",
         usage: "/settings",
+    },
+    CommandSpec {
+        name: "/status",
+        description: "Show session diagnostics",
+        usage: "/status",
+    },
+    CommandSpec {
+        name: "/summary",
+        description: "Summarize the last completed turn",
+        usage: "/summary",
     },
 ];
 
@@ -411,6 +433,58 @@ pub enum FooterAction {
     SelectAgent(usize),
     OpenCollaboration,
     OpenMode,
+}
+
+/// One saved session as shown by the `/sessions` browser.
+///
+/// The UI treats these rows as immutable presentation data supplied by the
+/// host: `id` is the stable archive session identifier, timestamps are plain
+/// strings, and the roster is a list of display names. Nothing here reaches
+/// into provider or filesystem state, so rendering stays provider-independent.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionListEntry {
+    pub id: String,
+    pub title: String,
+    pub updated_at: String,
+    pub roster: Vec<String>,
+    pub preview: String,
+}
+
+/// Which read-only diagnostics pane `/status` or `/summary` opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReportKind {
+    Status,
+    Summary,
+}
+
+impl ReportKind {
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Status => " CodeSwarm status ",
+            Self::Summary => " CodeSwarm summary ",
+        }
+    }
+
+    pub const fn hint(self) -> &'static str {
+        match self {
+            Self::Status => "Session diagnostics · read-only",
+            Self::Summary => "Last completed turn · read-only",
+        }
+    }
+}
+
+/// Result of one key routed to an open product panel.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PanelAction {
+    /// No open panel consumed the key.
+    #[default]
+    Ignored,
+    /// Selection or scroll moved inside the open panel.
+    Changed,
+    /// The open panel was dismissed with Esc.
+    Dismissed,
+    /// Enter confirmed a session row. The payload is the immutable session id.
+    SessionSelected(String),
 }
 
 /// A low-churn, multiline prompt editor backed by `tui-textarea`.
@@ -938,6 +1012,16 @@ pub struct App {
     config_roster_dirty: bool,
     config_snapshot: Option<ConfigSnapshot>,
     config_collaboration_pending: bool,
+    sessions_visible: bool,
+    sessions_entries: Vec<SessionListEntry>,
+    sessions_selected: usize,
+    session_request: Option<String>,
+    report_visible: Option<ReportKind>,
+    report_text: String,
+    report_scroll: usize,
+    /// Cached `(inner_width, inner_height, max_scroll)` from the last report
+    /// render so key handling can clamp scrolling without re-wrapping text.
+    report_layout: Option<(usize, usize, usize)>,
     full_repaint_requested: bool,
     prompt_editor: PromptEditor,
     agent_names: BTreeMap<usize, String>,
@@ -963,6 +1047,7 @@ pub struct App {
     tool_windows: BTreeMap<usize, ToolWindow>,
     history_blocks: BTreeMap<usize, (crate::transcript::BlockKind, u64)>,
     history_tools: BTreeMap<(usize, String), u64>,
+    thinking_agents: BTreeSet<usize>,
     focused_detail: Option<u64>,
     detail_controls: Vec<(Rect, u64)>,
     /// Background workspace index used only by the optional `@path` picker.
@@ -982,7 +1067,7 @@ const CONFIG_SETTING_COUNT: usize = 13;
 
 fn agent_event_slot(event: &AgentEvent) -> Option<usize> {
     match event {
-        AgentEvent::GoalUpdated { .. } => None,
+        AgentEvent::GoalUpdated { .. } | AgentEvent::SessionMetadataUpdated { .. } => None,
         AgentEvent::History { slot, .. }
         | AgentEvent::Ready { slot, .. }
         | AgentEvent::TurnStarted { slot }
@@ -1049,6 +1134,14 @@ impl Default for App {
             config_roster_dirty: false,
             config_snapshot: None,
             config_collaboration_pending: false,
+            sessions_visible: false,
+            sessions_entries: Vec::new(),
+            sessions_selected: 0,
+            session_request: None,
+            report_visible: None,
+            report_text: String::new(),
+            report_scroll: 0,
+            report_layout: None,
             full_repaint_requested: false,
             prompt_editor: PromptEditor::default(),
             agent_names: BTreeMap::new(),
@@ -1072,6 +1165,7 @@ impl Default for App {
             tool_windows: BTreeMap::new(),
             history_blocks: BTreeMap::new(),
             history_tools: BTreeMap::new(),
+            thinking_agents: BTreeSet::new(),
             focused_detail: None,
             detail_controls: Vec::new(),
             path_index: None,
@@ -1147,6 +1241,9 @@ impl App {
             "/export" => LocalCommand::Export,
             "/reload" => LocalCommand::Reload,
             "/resume" => LocalCommand::Resume,
+            "/sessions" => LocalCommand::Sessions,
+            "/status" => LocalCommand::Status,
+            "/summary" => LocalCommand::Summary,
             "/agent" => match argument.parse::<usize>() {
                 Ok(slot) => LocalCommand::SelectAgent(slot),
                 Err(_) => {
@@ -1169,6 +1266,7 @@ impl App {
                 self.scroll_y = 0;
                 self.streaming_blocks.clear();
                 self.tool_windows.clear();
+                self.thinking_agents.clear();
                 self.history_blocks.clear();
                 self.history_tools.clear();
                 self.detail_controls.clear();
@@ -1778,6 +1876,365 @@ impl App {
         }
     }
 
+    /// Replace the session browser contents and open it as a full view.
+    ///
+    /// Rows are immutable presentation data supplied by the host. When the
+    /// browser is already visible, the previous selection is preserved and
+    /// clamped to the replaced list so refreshes never jump or panic; a fresh
+    /// open always starts on the first row.
+    pub fn open_sessions(&mut self, entries: Vec<SessionListEntry>) {
+        let selected_id = self
+            .sessions_visible
+            .then(|| {
+                self.sessions_entries
+                    .get(self.sessions_selected)
+                    .map(|entry| entry.id.clone())
+            })
+            .flatten();
+        let previous_index = if self.sessions_visible {
+            self.sessions_selected
+        } else {
+            0
+        };
+        self.report_visible = None;
+        self.session_request = None;
+        self.sessions_entries = entries;
+        self.sessions_visible = true;
+        self.sessions_selected = selected_id
+            .and_then(|id| {
+                self.sessions_entries
+                    .iter()
+                    .position(|entry| entry.id == id)
+            })
+            .unwrap_or_else(|| previous_index.min(self.sessions_entries.len().saturating_sub(1)));
+        self.full_repaint_requested = true;
+        self.status = if self.sessions_entries.is_empty() {
+            "no saved sessions".into()
+        } else {
+            format!("{} saved session(s)", self.sessions_entries.len())
+        };
+    }
+
+    pub fn sessions_visible(&self) -> bool {
+        self.sessions_visible
+    }
+
+    pub fn sessions_entries(&self) -> &[SessionListEntry] {
+        &self.sessions_entries
+    }
+
+    pub fn sessions_selected(&self) -> usize {
+        self.sessions_selected
+    }
+
+    pub fn open_status(&mut self, text: impl Into<String>) {
+        self.open_report(ReportKind::Status, text);
+    }
+
+    pub fn summary_visible(&self) -> bool {
+        self.report_visible == Some(ReportKind::Summary)
+    }
+
+    pub fn open_summary(&mut self, text: impl Into<String>) {
+        self.open_report(ReportKind::Summary, text);
+    }
+
+    fn open_report(&mut self, kind: ReportKind, text: impl Into<String>) {
+        self.sessions_visible = false;
+        self.report_visible = Some(kind);
+        self.report_text = text.into();
+        self.report_scroll = 0;
+        self.report_layout = None;
+        self.full_repaint_requested = true;
+        self.status = match kind {
+            ReportKind::Status => "session status".into(),
+            ReportKind::Summary => "turn summary".into(),
+        };
+    }
+
+    /// The selected immutable session id requested by the browser, if any.
+    /// Taking the request clears it so a caller cannot replay it.
+    pub fn take_session_request(&mut self) -> Option<String> {
+        self.session_request.take()
+    }
+
+    /// Whether a user-opened product panel currently owns the full view.
+    /// The host routes keys to [`App::handle_product_panel_key`] first while
+    /// this returns true.
+    pub fn product_panel_visible(&self) -> bool {
+        self.sessions_visible || self.report_visible.is_some()
+    }
+
+    /// Close any open product panel without touching other UI state.
+    pub fn close_product_panel(&mut self) {
+        if self.sessions_visible {
+            self.close_sessions();
+        }
+        if self.report_visible.is_some() {
+            self.close_report();
+        }
+    }
+
+    fn close_sessions(&mut self) {
+        self.sessions_visible = false;
+        self.full_repaint_requested = true;
+        self.status = "session browser closed".into();
+    }
+
+    fn close_report(&mut self) {
+        self.report_visible = None;
+        self.report_scroll = 0;
+        self.full_repaint_requested = true;
+        self.status = "diagnostics closed".into();
+    }
+
+    /// Route one key to the open product panel before prompt editing.
+    ///
+    /// The host calls this when [`App::product_panel_visible`] is true so
+    /// browser navigation and Esc never leak into the composer. Keys that no
+    /// open panel understands are reported as [`PanelAction::Ignored`].
+    pub fn handle_product_panel_key(&mut self, input: Input) -> PanelAction {
+        if self.sessions_visible {
+            return self.handle_sessions_key(input);
+        }
+        if self.report_visible.is_some() {
+            return self.handle_report_key(input);
+        }
+        PanelAction::Ignored
+    }
+
+    fn handle_sessions_key(&mut self, input: Input) -> PanelAction {
+        let total = self.sessions_entries.len();
+        match input.key {
+            Key::Esc => {
+                self.close_sessions();
+                PanelAction::Dismissed
+            }
+            Key::Enter => {
+                let Some(entry) = self.sessions_entries.get(self.sessions_selected) else {
+                    return PanelAction::Ignored;
+                };
+                let id = entry.id.clone();
+                self.sessions_visible = false;
+                self.session_request = Some(id.clone());
+                self.full_repaint_requested = true;
+                self.status = "opening saved session".into();
+                PanelAction::SessionSelected(id)
+            }
+            Key::Up => {
+                if self.sessions_selected == 0 {
+                    return PanelAction::Ignored;
+                }
+                self.sessions_selected -= 1;
+                PanelAction::Changed
+            }
+            Key::Down => {
+                if self.sessions_selected + 1 >= total {
+                    return PanelAction::Ignored;
+                }
+                self.sessions_selected += 1;
+                PanelAction::Changed
+            }
+            Key::PageUp | Key::PageDown | Key::Home | Key::End => {
+                let moved = match input.key {
+                    Key::PageUp => {
+                        let target = self.sessions_selected.saturating_sub(SESSIONS_PAGE_STEP);
+                        (self.sessions_selected != target).then_some(target)
+                    }
+                    Key::PageDown => {
+                        let target = (self.sessions_selected + SESSIONS_PAGE_STEP)
+                            .min(total.saturating_sub(1));
+                        (self.sessions_selected != target).then_some(target)
+                    }
+                    Key::Home => (self.sessions_selected != 0).then_some(0),
+                    _ => {
+                        let target = total.saturating_sub(1);
+                        (self.sessions_selected != target).then_some(target)
+                    }
+                };
+                match moved {
+                    Some(target) => {
+                        self.sessions_selected = target;
+                        PanelAction::Changed
+                    }
+                    None => PanelAction::Ignored,
+                }
+            }
+            _ => PanelAction::Ignored,
+        }
+    }
+
+    fn handle_report_key(&mut self, input: Input) -> PanelAction {
+        let body_capacity = self.report_layout.map_or(10, |(_, capacity, _)| capacity);
+        let raw_lines = self.report_text.lines().count();
+        let fallback_max = raw_lines.saturating_sub(body_capacity.min(raw_lines.max(1)));
+        let max_scroll = self.report_layout.map_or(fallback_max, |(_, _, max)| max);
+        let page = body_capacity.max(1);
+        match input.key {
+            Key::Esc => {
+                self.close_report();
+                PanelAction::Dismissed
+            }
+            Key::Up => {
+                if self.report_scroll == 0 {
+                    return PanelAction::Ignored;
+                }
+                self.report_scroll -= 1;
+                PanelAction::Changed
+            }
+            Key::Down => {
+                if self.report_scroll >= max_scroll {
+                    return PanelAction::Ignored;
+                }
+                self.report_scroll += 1;
+                PanelAction::Changed
+            }
+            Key::PageUp => {
+                if self.report_scroll == 0 {
+                    return PanelAction::Ignored;
+                }
+                self.report_scroll = self.report_scroll.saturating_sub(page);
+                PanelAction::Changed
+            }
+            Key::PageDown => {
+                let target = self.report_scroll.saturating_add(page).min(max_scroll);
+                if target == self.report_scroll {
+                    return PanelAction::Ignored;
+                }
+                self.report_scroll = target;
+                PanelAction::Changed
+            }
+            Key::Home => {
+                if self.report_scroll == 0 {
+                    return PanelAction::Ignored;
+                }
+                self.report_scroll = 0;
+                PanelAction::Changed
+            }
+            Key::End => {
+                if max_scroll == self.report_scroll {
+                    return PanelAction::Ignored;
+                }
+                self.report_scroll = max_scroll;
+                PanelAction::Changed
+            }
+            _ => PanelAction::Ignored,
+        }
+    }
+
+    /// Summarize current session state for the `/status` diagnostics pane.
+    ///
+    /// This is a pure view over state the renderer already holds: no
+    /// filesystem, environment, or process access, and no relay scheduling
+    /// changes. The caller prepends runtime facts it owns, such as the
+    /// running version and executable path.
+    pub fn status_report(&self) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("status: {}", self.status));
+        if !self.active_agent.trim().is_empty() {
+            lines.push(format!("active agent: {}", self.active_agent));
+        }
+        lines.push(format!("mode: {}", self.mode));
+        if let Some(policy) = self.mode_policy.as_deref() {
+            lines.push(format!("mode policy: {policy}"));
+        }
+        if let Some(shared) = self.current_mode_policy() {
+            lines.push(format!("roster policy: {shared}"));
+        }
+        lines.push(format!("collaboration: {}", self.collaboration));
+        lines.push(format!(
+            "workspace: {}",
+            if self.workspace_root.as_os_str().is_empty() {
+                "(none)".to_owned()
+            } else {
+                self.workspace_root.display().to_string()
+            }
+        ));
+        lines.push(match &self.goal {
+            Some(goal) => format!("goal: {}", goal.summary()),
+            None => "goal: none".to_owned(),
+        });
+
+        let active_slots = self.active_roster_slots();
+        if self.agent_names.is_empty() {
+            lines.push("roster: empty".to_owned());
+        } else {
+            lines.push(format!(
+                "roster: {} of {} agents active",
+                active_slots.len(),
+                self.agent_names.len()
+            ));
+            for (slot, name) in &self.agent_names {
+                let state = self
+                    .agent_states
+                    .get(slot)
+                    .map(String::as_str)
+                    .unwrap_or("starting");
+                let identity = self.agent_identity(*slot).unwrap_or("unknown provider");
+                lines.push(format!("  slot {slot}: {name} — {state} · {identity}"));
+            }
+            if let Some(selected) = self.selected_agent {
+                lines.push(format!(
+                    "selected next recipient: {}",
+                    self.agent_name(selected)
+                ));
+            }
+            if let Some(next) = self.next_agent {
+                lines.push(format!("next in relay: {}", self.agent_name(next)));
+            }
+        }
+
+        let working = self.agent_turn_started.keys().copied().collect::<Vec<_>>();
+        if working.is_empty() {
+            lines.push("turn: idle".to_owned());
+        } else {
+            let names = working
+                .iter()
+                .map(|slot| self.agent_name(*slot))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("turn: running → {names}"));
+        }
+        if self.cancellation_pending() {
+            lines.push("cancellation: requested".to_owned());
+        }
+        match &self.permission {
+            Some(request) => {
+                let chosen = request
+                    .options
+                    .get(request.selected)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                lines.push(format!(
+                    "permission: waiting for {} · {}/{} chosen · \"{}\"",
+                    self.agent_name(request.slot),
+                    request.selected + 1,
+                    request.options.len(),
+                    request.title
+                ));
+                lines.push(format!("  chosen option: {chosen}"));
+            }
+            None => lines.push("permission: none pending".to_owned()),
+        }
+        lines.push(format!("queued prompts: {}", self.queued_prompts.len()));
+        if let Some(failed) = self.failed_agent() {
+            lines.push(format!(
+                "failed agent: {} (slot {failed}) · /reload restarts it",
+                self.agent_name(failed)
+            ));
+        }
+        lines.push(format!(
+            "transcript: {} blocks · {}",
+            self.transcript.len(),
+            if self.follow_tail {
+                "following tail".to_owned()
+            } else {
+                format!("paused at scroll {}", self.scroll_y)
+            }
+        ));
+        lines.join("\n")
+    }
+
     pub fn collapse_details(&self) -> bool {
         self.collapse_details
     }
@@ -2134,6 +2591,7 @@ impl App {
 
     pub fn finish_turn_cancellation(&mut self) {
         for slot in std::mem::take(&mut self.cancelling_agents) {
+            self.restore_turn_details(slot);
             self.agent_turn_started.remove(&slot);
             self.agent_states.insert(slot, "ready".into());
         }
@@ -2392,7 +2850,7 @@ impl App {
         }
         if matches!(
             message.to_ascii_lowercase().as_str(),
-            "idle" | "starting" | "thinking" | "streaming" | "waiting" | "queued"
+            "idle" | "starting" | "thinking" | "streaming" | "working" | "waiting" | "queued"
         ) {
             return;
         }
@@ -2588,7 +3046,22 @@ impl App {
     }
 
     pub fn next_agent_slot(&self) -> Option<usize> {
-        self.selected_agent.or(self.next_agent)
+        let routable = |slot: usize| {
+            self.agent_names.contains_key(&slot)
+                && self
+                    .agent_states
+                    .get(&slot)
+                    .is_none_or(|state| !matches!(state.as_str(), "dropped" | "error" | "limited"))
+        };
+        self.selected_agent
+            .filter(|slot| routable(*slot))
+            .or_else(|| self.next_agent.filter(|slot| routable(*slot)))
+            .or_else(|| {
+                self.agent_names
+                    .keys()
+                    .copied()
+                    .find(|slot| routable(*slot))
+            })
     }
 
     /// Resolve a footer click using the same compact geometry as the renderer.
@@ -2871,6 +3344,7 @@ impl App {
             self.agent_last_activity.insert(slot, Instant::now());
         }
         match event {
+            AgentEvent::SessionMetadataUpdated { .. } => {}
             AgentEvent::History { .. } => unreachable!("history handled without live state"),
             AgentEvent::GoalUpdated { goal } => {
                 self.goal = goal.clone();
@@ -2987,6 +3461,7 @@ impl App {
             }
             AgentEvent::Text { slot, text } => {
                 self.mark_agent_turn_started(*slot);
+                self.thinking_agents.remove(slot);
                 let key = (*slot, crate::transcript::BlockKind::Agent);
                 let block = self.streaming_blocks.get(&key).copied().unwrap_or_else(|| {
                     let id = self.transcript.append(
@@ -3013,6 +3488,7 @@ impl App {
             }
             AgentEvent::Thought { slot, text } => {
                 self.mark_agent_turn_started(*slot);
+                self.thinking_agents.insert(*slot);
                 let key = (*slot, crate::transcript::BlockKind::Thought);
                 let id = self.streaming_blocks.get(&key).copied().unwrap_or_else(|| {
                     let id = self.transcript.append(
@@ -3027,6 +3503,14 @@ impl App {
                     id
                 });
                 self.transcript.extend(id, text);
+                self.transcript.suppress_detail(id, false);
+                if let Some(window) = self.tool_windows.get(slot) {
+                    let completed = window
+                        .calls
+                        .iter()
+                        .all(|call| call.status == ToolStatus::Completed);
+                    self.transcript.suppress_detail(window.block_id, completed);
+                }
                 self.active_agent = self.agent_name(*slot);
                 self.agent_states.insert(*slot, "working".into());
                 self.status = "thinking".into();
@@ -3084,11 +3568,35 @@ impl App {
                     source,
                     self.transcript.is_collapsed(block_id) != Some(false),
                 );
-                self.focused_detail = Some(block_id);
+                let executing = matches!(update.status, ToolStatus::Pending | ToolStatus::Running);
+                if executing || update.status == ToolStatus::Failed {
+                    self.thinking_agents.remove(slot);
+                    if let Some(thought) = self
+                        .streaming_blocks
+                        .get(&(*slot, crate::transcript::BlockKind::Thought))
+                        .copied()
+                    {
+                        self.transcript.suppress_detail(thought, true);
+                    }
+                    self.transcript.suppress_detail(block_id, false);
+                } else if self.thinking_agents.contains(slot) {
+                    let completed = self.tool_windows.get(slot).is_some_and(|window| {
+                        window
+                            .calls
+                            .iter()
+                            .all(|call| call.status == ToolStatus::Completed)
+                    });
+                    self.transcript.suppress_detail(block_id, completed);
+                }
+                if !self.thinking_agents.contains(slot) {
+                    self.focused_detail = Some(block_id);
+                }
                 self.active_agent = self.agent_name(*slot);
                 self.agent_states.insert(*slot, "working".into());
                 self.status = if update.status == ToolStatus::Failed {
                     format!("tool failed: {}", update.title)
+                } else if self.thinking_agents.contains(slot) {
+                    "thinking".into()
                 } else {
                     "working".into()
                 };
@@ -3127,6 +3635,7 @@ impl App {
                 self.agent_states.insert(*slot, "working".into());
             }
             AgentEvent::TurnComplete { slot } => {
+                self.restore_turn_details(*slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.streaming_blocks
@@ -3148,6 +3657,7 @@ impl App {
                 self.next_agent = self.next_roster_slot_after(*slot);
             }
             AgentEvent::UsageLimitReached { slot, detail } => {
+                self.restore_turn_details(*slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.tool_windows.remove(slot);
@@ -3178,6 +3688,7 @@ impl App {
                 started,
                 detail,
             } => {
+                self.restore_turn_details(*slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.tool_windows.remove(slot);
@@ -3230,6 +3741,20 @@ impl App {
     }
 
     /// Toggle the detail icon last rendered at this terminal coordinate.
+    fn restore_turn_details(&mut self, slot: usize) {
+        self.thinking_agents.remove(&slot);
+        if let Some(id) = self
+            .streaming_blocks
+            .get(&(slot, crate::transcript::BlockKind::Thought))
+            .copied()
+        {
+            self.transcript.suppress_detail(id, false);
+        }
+        if let Some(window) = self.tool_windows.get(&slot) {
+            self.transcript.suppress_detail(window.block_id, false);
+        }
+    }
+
     pub fn click_detail(&mut self, column: u16, row: u16) -> Option<bool> {
         if self.config_visible || self.store_visible {
             return None;
@@ -3387,7 +3912,7 @@ impl App {
     }
 
     fn help_height(&self) -> u16 {
-        if self.keyboard_help_visible() { 8 } else { 0 }
+        if self.keyboard_help_visible() { 9 } else { 0 }
     }
 
     /// Handle navigation or a response for the focused permission request.
@@ -3469,6 +3994,22 @@ fn render_content(frame: &mut Frame, app: &mut App) {
     }
     if app.config_visible {
         render_config(frame, app, area);
+        return;
+    }
+    if app.sessions_visible || app.report_visible.is_some() {
+        let panel = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+        if app.sessions_visible {
+            render_sessions(frame, app, panel);
+        } else {
+            render_report(frame, app, panel);
+        }
+        if area.height > 0 {
+            render_status_banner(
+                frame.buffer_mut(),
+                Rect::new(area.x, area.bottom() - 1, area.width, 1),
+                app,
+            );
+        }
         return;
     }
     if area.width < 36 || area.height < 7 {
@@ -4265,7 +4806,8 @@ fn render_keyboard_help(buffer: &mut Buffer, area: Rect) {
         " Input: Enter send · Shift+Enter newline · Tab complete",
         " Turn: Ctrl+Enter direct · Ctrl+C cancel · Ctrl+K cancel queued",
         " Agents: /agent SLOT /reload · Goal: /goal [objective|run|done|clear]",
-        " Session: /resume /settings /clear /export /select /exit",
+        " Session: /resume /sessions /status /summary /clear /exit",
+        " Tools: /settings /export /select",
     ];
     Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>())
         .style(Style::default().fg(Color::Gray).bg(PANEL_BG))
@@ -4630,6 +5172,294 @@ fn render_store_directory(frame: &mut Frame, app: &mut App, area: Rect) {
     )
     .render(modal, frame.buffer_mut());
     app.prompt_editor.render(frame, inner);
+}
+
+/// Render the `/sessions` browser as a centered card over a cleared surface.
+///
+/// The layout follows the established store/settings card design: a bordered
+/// panel with a bold header, gray hints, and selection rows using the shared
+/// teal accent. Each entry shows its title on one line and timestamp, roster,
+/// and preview on the following detail line; narrow panes collapse to one row
+/// per entry so nothing important is clipped away.
+fn render_sessions(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area.width.clamp(46, 92);
+    let height = area.height.clamp(12, 28);
+    let modal = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width.min(area.width),
+        height.min(area.height),
+    );
+    frame.render_widget(Clear, modal);
+    let compact = modal.width < 64;
+    let rows_per_entry = usize::from(!compact) + 1;
+    let inner_width = usize::from(modal.width).saturating_sub(4).max(1);
+    // Border (2) + title/hint (2) + blank separator (1) + blank footer (1)
+    // + action row (1).
+    let reserved = 7;
+    let capacity = usize::from(modal.height)
+        .saturating_sub(reserved)
+        .max(rows_per_entry)
+        / rows_per_entry;
+    let total = app.sessions_entries.len();
+    let start = app
+        .sessions_selected
+        .saturating_sub(capacity.saturating_sub(1))
+        .min(total.saturating_sub(capacity));
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::styled(
+        if compact {
+            "Sessions"
+        } else {
+            "Saved sessions"
+        },
+        Style::default()
+            .fg(PRIMARY_TEXT)
+            .add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::styled(
+        if compact {
+            "↑/↓ choose · Enter open · Esc close"
+        } else {
+            "↑/↓ choose · Enter open saved history · Esc close"
+        },
+        Style::default().fg(Color::Gray),
+    ));
+    lines.push(Line::raw(""));
+    if total == 0 {
+        lines.push(Line::styled(
+            "No saved sessions yet.",
+            Style::default().fg(PRIMARY_TEXT),
+        ));
+        lines.push(Line::styled(
+            "CodeSwarm archives conversations locally as you work;",
+            Style::default().fg(SECONDARY_TEXT),
+        ));
+        lines.push(Line::styled(
+            "finished sessions appear here to read without starting agents.",
+            Style::default().fg(SECONDARY_TEXT),
+        ));
+    } else {
+        let preview_budget = inner_width.saturating_sub(6);
+        for (index, entry) in app
+            .sessions_entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(capacity)
+        {
+            let selected = index == app.sessions_selected;
+            let marker = if selected { "▶" } else { " " };
+            let style = if selected {
+                selected_style()
+            } else {
+                Style::default().fg(PRIMARY_TEXT)
+            };
+            let title = entry.title.trim();
+            let title = if title.is_empty() {
+                "(untitled session)"
+            } else {
+                title
+            };
+            let roster = if entry.roster.is_empty() {
+                "no roster".to_owned()
+            } else {
+                entry.roster.join(", ")
+            };
+            if compact {
+                let title_budget = inner_width.saturating_sub(10).max(6);
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {marker} "), style),
+                    Span::styled(compact_label(title, title_budget), style),
+                    Span::styled(
+                        format!(
+                            "  · {} · {}",
+                            compact_label(&entry.updated_at, 16),
+                            compact_label(&roster, 16)
+                        ),
+                        Style::default().fg(SECONDARY_TEXT),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {marker} "), style),
+                    Span::styled(compact_label(title, inner_width.saturating_sub(6)), style),
+                ]));
+                let mut detail = format!("      {} · {}", entry.updated_at, roster);
+                let preview = entry.preview.replace(['\n', '\r'], " ");
+                let preview = preview.trim();
+                if !preview.is_empty() {
+                    detail.push_str(" · ");
+                    detail.push_str(preview);
+                }
+                lines.push(Line::styled(
+                    compact_label(&detail, preview_budget),
+                    Style::default().fg(SECONDARY_TEXT),
+                ));
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+    let footer = if total == 0 {
+        " Esc Close".to_owned()
+    } else if compact {
+        format!(
+            " ↑/↓ · Enter · Esc  ({}/{})",
+            app.sessions_selected + 1,
+            total
+        )
+    } else {
+        format!(
+            " ↑/↓ Navigate · Enter Open · Esc Close  ({}/{})",
+            app.sessions_selected + 1,
+            total
+        )
+    };
+    lines.push(Line::styled(footer, Style::default().fg(Color::Gray)));
+    Paragraph::new(lines)
+        .style(Style::default().bg(PANEL_BG))
+        .block(
+            Block::default()
+                .title(" CodeSwarm sessions ")
+                .title_style(Style::default().fg(ACCENT).bold())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(SEPARATOR)),
+        )
+        .render(modal, frame.buffer_mut());
+}
+
+/// Render the read-only `/status` or `/summary` pane as a centered card with
+/// line scrolling. Text arrives pre-rendered from the host, so this view only
+/// wraps it to the pane width and applies the cached scroll offset.
+fn render_report(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let kind = app.report_visible.unwrap_or(ReportKind::Status);
+    let width = area.width.clamp(50, 100);
+    let height = area.height.clamp(12, 32);
+    let modal = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width.min(area.width),
+        height.min(area.height),
+    );
+    frame.render_widget(Clear, modal);
+    // Border (2) + hint (1) + blank (1) + blank footer (1) + action row (1).
+    let capacity = usize::from(modal.height).saturating_sub(6).max(1);
+    let inner_width = usize::from(modal.width).saturating_sub(6).max(1);
+    let wrapped = wrap_text(&app.report_text, inner_width);
+    let max_scroll = wrapped.len().saturating_sub(capacity);
+    let scroll = app.report_scroll.min(max_scroll);
+    app.report_layout = Some((inner_width, capacity, max_scroll));
+    let mut lines = Vec::with_capacity(capacity.saturating_add(4));
+    lines.push(Line::styled(kind.hint(), Style::default().fg(Color::Gray)));
+    lines.push(Line::raw(""));
+    if wrapped.is_empty() {
+        lines.push(Line::styled(
+            "(nothing recorded yet)",
+            Style::default().fg(SECONDARY_TEXT),
+        ));
+    } else {
+        for row in wrapped.iter().skip(scroll).take(capacity) {
+            lines.push(Line::styled(
+                row.as_str(),
+                Style::default().fg(PRIMARY_TEXT),
+            ));
+        }
+    }
+    lines.push(Line::raw(""));
+    let compact = modal.width < 64;
+    let footer = if max_scroll == 0 {
+        " Esc Close".to_owned()
+    } else if compact {
+        format!(" PgUp/PgDn · Esc  ({}/{})", scroll + 1, wrapped.len())
+    } else {
+        format!(
+            " ↑/↓ Scroll · Esc Close  (line {}/{} of {})",
+            scroll + 1,
+            scroll + capacity.min(wrapped.len().saturating_sub(scroll)),
+            wrapped.len()
+        )
+    };
+    lines.push(Line::styled(footer, Style::default().fg(Color::Gray)));
+    Paragraph::new(lines)
+        .style(Style::default().bg(PANEL_BG))
+        .block(
+            Block::default()
+                .title(kind.title())
+                .title_style(Style::default().fg(ACCENT).bold())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(SEPARATOR)),
+        )
+        .render(modal, frame.buffer_mut());
+}
+
+/// Word-wrap plain text to a display-width budget, preserving blank lines.
+/// Words wider than the budget are hard-broken on grapheme boundaries so
+/// long paths or URLs never overflow the pane.
+fn wrap_text(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    for raw in value.lines() {
+        if raw.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for word in raw.split_whitespace() {
+            let mut word = word;
+            loop {
+                let separator = usize::from(!current.is_empty());
+                let word_width = cell_width(word);
+                if current_width + separator + word_width <= width {
+                    if separator == 1 {
+                        current.push(' ');
+                    }
+                    current.push_str(word);
+                    current_width += separator + word_width;
+                    break;
+                }
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                    current_width = 0;
+                    continue;
+                }
+                let mut chunk = String::new();
+                let mut chunk_width = 0usize;
+                let mut chunk_bytes = 0usize;
+                for grapheme in word.graphemes(true) {
+                    let glyph_width = cell_width(grapheme);
+                    if chunk_width + glyph_width > width && !chunk.is_empty() {
+                        break;
+                    }
+                    if glyph_width > width {
+                        chunk.push('�');
+                        chunk_width += 1;
+                    } else {
+                        chunk.push_str(grapheme);
+                        chunk_width += glyph_width;
+                    }
+                    chunk_bytes += grapheme.len();
+                }
+                if chunk_bytes >= word.len() {
+                    current.push_str(&chunk);
+                    current_width = chunk_width;
+                    break;
+                }
+                out.push(chunk);
+                word = &word[chunk_bytes..];
+            }
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    out
 }
 
 fn render_permission(buffer: &mut Buffer, area: Rect, request: &PermissionPrompt) {
@@ -5165,12 +5995,13 @@ mod tests {
 
     use super::{
         ACCENT, AGENT_COLORS, App, CONFIG_SETTING_COUNT, ConfigAction, ConfigKey, FooterAction,
-        LocalCommand, MAX_TOOL_HISTORY_ROWS, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PathPickerAction,
-        PermissionAction, PermissionKey, PromptAction, PromptEditor, SECONDARY_TEXT, STATUS_BG,
-        StoreAction, StoreAgent, StoreKey, TRANSCRIPT_BG, agent_header_color, agent_slot_color,
-        block_style, cell_width, compact_cell_label, compact_workspace_path, file_reference_spans,
-        footer_agent_label, format_turn_elapsed, markdown_spans, markdown_style, marker_style,
-        render, render_prompt_separator, row_style, selected_style,
+        LocalCommand, MAX_TOOL_HISTORY_ROWS, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PanelAction,
+        PathPickerAction, PermissionAction, PermissionKey, PermissionPrompt, PromptAction,
+        PromptEditor, SECONDARY_TEXT, STATUS_BG, SessionListEntry, StoreAction, StoreAgent,
+        StoreKey, TRANSCRIPT_BG, agent_header_color, agent_slot_color, block_style, cell_width,
+        compact_cell_label, compact_workspace_path, file_reference_spans, footer_agent_label,
+        format_turn_elapsed, markdown_spans, markdown_style, marker_style, render,
+        render_prompt_separator, row_style, selected_style,
     };
 
     fn key(key: Key) -> Input {
@@ -6339,6 +7170,19 @@ mod tests {
         assert!(app.agent_turn_started.contains_key(&1));
         app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 1 });
         assert!(app.agent_turn_started.is_empty());
+    }
+
+    #[test]
+    fn routine_working_updates_do_not_flash_a_redundant_ribbon() {
+        let mut app = App::default();
+        for status in ["working", "streaming", "working", "thinking", "working"] {
+            app.status = status.into();
+            app.refresh_status_banner(std::time::Instant::now());
+            assert!(app.status_banner.is_none());
+        }
+        app.status = "tool failed: permission denied".into();
+        app.refresh_status_banner(std::time::Instant::now());
+        assert!(app.status_banner.is_some());
     }
 
     #[test]
@@ -8067,6 +8911,63 @@ mod tests {
     }
 
     #[test]
+    fn active_details_hide_finished_tools_but_keep_running_and_expanded_output() {
+        use codeswarm_adapters::AgentEvent;
+        let mut app = App::default();
+        let tool = |status| AgentEvent::Tool {
+            slot: 0,
+            update: codeswarm_adapters::ToolUpdate {
+                id: "read".into(),
+                title: "Read file".into(),
+                status,
+                detail: Some("retained result".into()),
+            },
+        };
+        let thought = AgentEvent::Thought {
+            slot: 0,
+            text: "reasoning now".into(),
+        };
+        app.apply_event(&tool(codeswarm_adapters::ToolStatus::Completed));
+        let tool_id = app.tool_windows[&0].block_id;
+        app.apply_event(&thought);
+        let rows = app.transcript.viewport(78, 0, 20, 0);
+        assert!(rows.iter().any(|row| row.kind == BlockKind::Thought));
+        assert!(rows.iter().all(|row| row.kind != BlockKind::Tool));
+        assert!(app.export_markdown().contains("retained result"));
+        app.transcript.set_collapsed(tool_id, false);
+        assert!(
+            app.transcript
+                .viewport(78, 0, 20, 0)
+                .iter()
+                .any(|row| row.kind == BlockKind::Tool)
+        );
+        app.transcript.set_collapsed(tool_id, true);
+        app.apply_event(&tool(codeswarm_adapters::ToolStatus::Running));
+        let rows = app.transcript.viewport(78, 0, 20, 0);
+        assert!(
+            rows.iter()
+                .any(|row| row.kind == BlockKind::Tool && row.text.contains("retained result"))
+        );
+        assert!(rows.iter().all(|row| row.kind != BlockKind::Thought));
+        app.apply_event(&tool(codeswarm_adapters::ToolStatus::Completed));
+        app.apply_event(&thought);
+        assert!(
+            app.transcript
+                .viewport(78, 0, 20, 0)
+                .iter()
+                .all(|row| row.kind != BlockKind::Tool)
+        );
+        app.apply_event(&AgentEvent::TurnComplete { slot: 0 });
+        assert!(
+            app.transcript
+                .viewport(78, 0, 20, 0)
+                .iter()
+                .any(|row| row.kind == BlockKind::Tool)
+        );
+        assert_eq!(super::wrap_text("界", 1), vec!["�"]);
+    }
+
+    #[test]
     fn live_details_follow_the_message_for_every_initial_event_order() {
         let events = [
             codeswarm_adapters::AgentEvent::Text {
@@ -8829,5 +9730,349 @@ mod tests {
         assert!(rendered.contains("review queued changes"));
         assert!(rendered.contains("Ctrl+K cancel queue"));
         assert!(rendered.contains("End follow tail"));
+    }
+
+    fn draw_to_string(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| render(frame, app)).expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn session_entries(count: usize, tag: &str) -> Vec<SessionListEntry> {
+        (0..count)
+            .map(|index| SessionListEntry {
+                id: format!("{tag}-session-{index}"),
+                title: format!("{tag} task {index}"),
+                updated_at: format!("day {index}"),
+                roster: vec![format!("agent-{index}")],
+                preview: format!("changed file-{index}.rs"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn session_commands_are_canonical_across_parser_help_and_completion() {
+        let mut app = App::default();
+        assert_eq!(
+            app.handle_local_command("/sessions"),
+            Some(LocalCommand::Sessions)
+        );
+        assert_eq!(
+            app.handle_local_command(" /STATUS "),
+            Some(LocalCommand::Status)
+        );
+        assert_eq!(
+            app.handle_local_command("/summary"),
+            Some(LocalCommand::Summary)
+        );
+        assert_eq!(
+            app.handle_local_command("/status extra"),
+            Some(LocalCommand::Handled)
+        );
+        assert_eq!(app.status, "usage: /status");
+        for name in ["/sessions", "/status", "/summary"] {
+            let spec = super::LOCAL_COMMANDS
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from LOCAL_COMMANDS"));
+            assert_eq!(spec.usage, name, "{name} takes no arguments");
+            assert!(!spec.description.is_empty());
+        }
+    }
+
+    #[test]
+    fn session_browser_renders_entries_and_a_readable_empty_state() {
+        let mut app = App::default();
+        app.open_sessions(Vec::new());
+        assert!(app.sessions_visible());
+        let rendered = draw_to_string(&mut app, 80, 24);
+        assert!(rendered.contains("CodeSwarm sessions"), "{rendered:?}");
+        assert!(rendered.contains("No saved sessions yet"), "{rendered:?}");
+        assert!(rendered.contains("Esc Close"), "{rendered:?}");
+
+        let entries = vec![
+            SessionListEntry {
+                id: "s1".into(),
+                title: "Fix login flow".into(),
+                updated_at: "2h ago".into(),
+                roster: vec!["atlas".into(), "review".into()],
+                preview: "edited src/login.rs".into(),
+            },
+            SessionListEntry {
+                id: "s2".into(),
+                title: String::new(),
+                updated_at: "yesterday".into(),
+                roster: Vec::new(),
+                preview: String::new(),
+            },
+        ];
+        app.open_sessions(entries);
+        let rendered = draw_to_string(&mut app, 80, 24);
+        assert!(rendered.contains("Fix login flow"), "{rendered:?}");
+        assert!(rendered.contains("2h ago · atlas, review"), "{rendered:?}");
+        assert!(rendered.contains("edited src/login.rs"), "{rendered:?}");
+        assert!(rendered.contains("(untitled session)"), "{rendered:?}");
+        assert!(rendered.contains("no roster"), "{rendered:?}");
+        assert!(rendered.contains("(1/2)"), "{rendered:?}");
+    }
+
+    #[test]
+    fn session_browser_navigation_requests_the_selected_session_id() {
+        let mut app = App::default();
+        app.open_sessions(session_entries(3, "a"));
+        assert!(app.product_panel_visible());
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Down)),
+            PanelAction::Changed
+        );
+        assert_eq!(app.sessions_selected(), 1);
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Up)),
+            PanelAction::Changed
+        );
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Up)),
+            PanelAction::Ignored
+        );
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::End)),
+            PanelAction::Changed
+        );
+        assert_eq!(app.sessions_selected(), 2);
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Enter)),
+            PanelAction::SessionSelected("a-session-2".into())
+        );
+        assert_eq!(
+            app.take_session_request(),
+            Some("a-session-2".to_owned()),
+            "the browser must request the immutable selected id"
+        );
+        assert_eq!(app.take_session_request(), None);
+        assert!(!app.product_panel_visible());
+        app.open_sessions(session_entries(2, "b"));
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Esc)),
+            PanelAction::Dismissed
+        );
+        assert!(!app.product_panel_visible());
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Down)),
+            PanelAction::Ignored
+        );
+    }
+
+    #[test]
+    fn session_browser_keeps_selection_stable_when_lists_are_replaced() {
+        let mut app = App::default();
+        app.open_sessions(session_entries(5, "a"));
+        app.handle_product_panel_key(key(Key::Down));
+        app.handle_product_panel_key(key(Key::Down));
+        assert_eq!(app.sessions_selected(), 2);
+        // Same-length replacement keeps the selection.
+        app.open_sessions(session_entries(5, "b"));
+        assert_eq!(app.sessions_selected(), 2);
+        // Empty replacement resets the selection without panicking.
+        app.open_sessions(Vec::new());
+        assert_eq!(app.sessions_selected(), 0);
+        app.open_sessions(session_entries(4, "c"));
+        app.handle_product_panel_key(key(Key::End));
+        assert_eq!(app.sessions_selected(), 3);
+        // A shorter replacement clamps the selection to the new tail.
+        app.open_sessions(session_entries(2, "d"));
+        assert_eq!(app.sessions_selected(), 1);
+        let rendered = draw_to_string(&mut app, 80, 24);
+        assert!(rendered.contains("(2/2)"), "{rendered:?}");
+    }
+
+    #[test]
+    fn reordered_session_lists_keep_the_selected_stable_id() {
+        let mut app = App::default();
+        let mut entries = session_entries(3, "stable");
+        app.open_sessions(entries.clone());
+        app.handle_product_panel_key(Input {
+            key: Key::Down,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        });
+        entries.swap(0, 1);
+        app.open_sessions(entries);
+        assert_eq!(app.sessions_selected(), 0);
+        app.handle_product_panel_key(Input {
+            key: Key::Enter,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        });
+        assert_eq!(
+            app.take_session_request().as_deref(),
+            Some("stable-session-1")
+        );
+    }
+
+    #[test]
+    fn session_browser_renders_in_narrow_panes() {
+        let mut app = App::default();
+        app.open_sessions(session_entries(3, "a"));
+        let rendered = draw_to_string(&mut app, 44, 14);
+        assert!(rendered.contains("CodeSwarm sessions"), "{rendered:?}");
+        assert!(rendered.contains("a task 0"), "{rendered:?}");
+        assert!(rendered.contains('▶'), "{rendered:?}");
+        assert!(rendered.contains("Esc close"), "{rendered:?}");
+        // Very small surfaces still render the panel without panicking and
+        // keep at least the selected row visible.
+        let rendered = draw_to_string(&mut app, 30, 8);
+        assert!(rendered.contains("Sessions"), "{rendered:?}");
+        assert!(rendered.contains('▶'), "{rendered:?}");
+        // The compact footer keeps its position counter inside narrow panes.
+        let rendered = draw_to_string(&mut app, 44, 14);
+        assert!(rendered.contains("(1/3)"), "{rendered:?}");
+    }
+
+    #[test]
+    fn status_and_summary_panes_scroll_and_dismiss() {
+        let mut app = App::default();
+        let body = (0..40)
+            .map(|index| format!("line{index:02} diagnostics"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.open_status(body);
+        assert!(app.product_panel_visible());
+        let first = draw_to_string(&mut app, 80, 24);
+        assert!(first.contains("CodeSwarm status"), "{first:?}");
+        assert!(first.contains("line00"), "{first:?}");
+        assert!(!first.contains("line39"), "{first:?}");
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Down)),
+            PanelAction::Changed
+        );
+        let scrolled = draw_to_string(&mut app, 80, 24);
+        assert!(
+            scrolled.contains("line01") && !scrolled.contains("line00"),
+            "{scrolled:?}"
+        );
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::PageDown)),
+            PanelAction::Changed
+        );
+        let paged = draw_to_string(&mut app, 80, 24);
+        assert!(
+            paged.contains("line20") && !paged.contains("line01"),
+            "{paged:?}"
+        );
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::End)),
+            PanelAction::Changed
+        );
+        let tail = draw_to_string(&mut app, 80, 24);
+        assert!(tail.contains("line39"), "{tail:?}");
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Down)),
+            PanelAction::Ignored,
+            "scrolling stops at the end of the report"
+        );
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Home)),
+            PanelAction::Changed
+        );
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Esc)),
+            PanelAction::Dismissed
+        );
+        assert!(!app.product_panel_visible());
+
+        app.open_summary("final response summary");
+        let rendered = draw_to_string(&mut app, 80, 24);
+        assert!(rendered.contains("CodeSwarm summary"), "{rendered:?}");
+        assert!(rendered.contains("final response summary"), "{rendered:?}");
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Esc)),
+            PanelAction::Dismissed
+        );
+    }
+
+    #[test]
+    fn product_panel_keys_are_ignored_without_an_open_panel() {
+        let mut app = App::default();
+        assert!(!app.product_panel_visible());
+        assert_eq!(
+            app.handle_product_panel_key(key(Key::Enter)),
+            PanelAction::Ignored
+        );
+        assert_eq!(app.take_session_request(), None);
+    }
+
+    #[test]
+    fn status_report_summarizes_roster_state_without_filesystem() {
+        let mut app = App::default();
+        app.set_workspace_root("/tmp/demo");
+        app.set_agent_name(0, "atlas");
+        app.set_agent_identity(0, "acp:atlas");
+        app.set_agent_name(1, "review");
+        app.set_mode("Auto pilot");
+        app.set_collaboration("Pair review");
+        app.apply_local_goal(codeswarm_adapters::goal::GoalCommand::Set(
+            "Ship the release".into(),
+        ));
+        app.permission = Some(PermissionPrompt {
+            slot: 1,
+            request_id: "r1".into(),
+            title: "Run command?".into(),
+            options: vec!["Allow once".into(), "Deny".into()],
+            option_ids: vec!["allow".into(), "deny".into()],
+            selected: 1,
+        });
+        app.queue_prompt("follow up", Some(0), false);
+        let report = app.status_report();
+        assert!(report.contains("mode: Auto pilot"), "{report:?}");
+        assert!(report.contains("collaboration: Pair review"), "{report:?}");
+        assert!(report.contains("goal:"), "{report:?}");
+        assert!(report.contains("atlas"), "{report:?}");
+        assert!(report.contains("review"), "{report:?}");
+        assert!(
+            report.contains("permission: waiting for review"),
+            "{report:?}"
+        );
+        assert!(report.contains("queued prompts: 1"), "{report:?}");
+        assert!(report.contains("workspace: /tmp/demo"), "{report:?}");
+        assert!(report.contains("transcript: 0 blocks"), "{report:?}");
+        // The report is a pure read: repeated calls are identical and no
+        // pending state is consumed.
+        assert_eq!(report, app.status_report());
+        assert!(app.permission.is_some());
+        assert_eq!(app.queued_count(), 1);
+        // An empty session still renders a complete report.
+        let empty = App::default().status_report();
+        assert!(empty.contains("roster: empty"), "{empty:?}");
+        assert!(empty.contains("turn: idle"), "{empty:?}");
+    }
+
+    #[test]
+    fn report_text_wraps_long_words_to_the_pane_width() {
+        let wrapped = super::wrap_text("first short line", 80);
+        assert_eq!(wrapped, vec!["first short line".to_owned()]);
+        let wrapped = super::wrap_text("alpha beta gamma delta", 10);
+        assert_eq!(
+            wrapped,
+            vec![
+                "alpha beta".to_owned(),
+                "gamma".to_owned(),
+                "delta".to_owned(),
+            ]
+        );
+        // Overlong words are hard-broken on grapheme boundaries.
+        let wrapped = super::wrap_text(&"x".repeat(25), 10);
+        assert_eq!(wrapped.len(), 3);
+        assert!(wrapped.iter().all(|row| super::cell_width(row) <= 10));
+        // Blank lines are preserved so diagnostics keep their structure.
+        let wrapped = super::wrap_text("a\n\nb", 10);
+        assert_eq!(wrapped, vec!["a".to_owned(), String::new(), "b".to_owned()]);
     }
 }

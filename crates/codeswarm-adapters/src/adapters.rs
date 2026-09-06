@@ -429,6 +429,9 @@ fn restored_history_event(event: AgentEvent) -> AgentEvent {
 
 fn map_event_slot(event: AgentEvent, slot: RosterSlot) -> AgentEvent {
     match event {
+        AgentEvent::SessionMetadataUpdated { metadata } => {
+            AgentEvent::SessionMetadataUpdated { metadata }
+        }
         AgentEvent::History { content, .. } => AgentEvent::History { slot, content },
         AgentEvent::GoalUpdated { goal } => AgentEvent::GoalUpdated { goal },
         AgentEvent::RosterUpdated { update } => AgentEvent::RosterUpdated { update },
@@ -723,6 +726,8 @@ pub struct RelayHost {
     metadata_writer: Option<BufferedSessionMetadataStore>,
     metadata_workspace: Option<String>,
     dispatches: Vec<(RosterSlot, String)>,
+    last_public_dispatch: Option<RosterSlot>,
+    pair_implementer: Option<RosterSlot>,
     event_sink: Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
     cancel_requested: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
@@ -910,6 +915,8 @@ impl RelayHost {
             metadata_workspace: None,
             hosts,
             dispatches: Vec::new(),
+            last_public_dispatch: None,
+            pair_implementer: None,
             goal: None,
             event_sink: None,
             cancel_requested: Arc::new(AtomicBool::new(false)),
@@ -1026,9 +1033,15 @@ impl RelayHost {
     }
 
     fn queue_session_metadata(&self) -> AdapterResult<()> {
+        let metadata = self.session_metadata();
+        if let Some(sink) = &self.event_sink {
+            sink(AgentEvent::SessionMetadataUpdated {
+                metadata: metadata.to_value(),
+            });
+        }
         if let Some(writer) = &self.metadata_writer {
             writer
-                .write(self.session_metadata())
+                .write(metadata)
                 .map_err(|error| AdapterError::Transport(error.to_string()))?;
         }
         Ok(())
@@ -1146,6 +1159,10 @@ impl RelayHost {
     /// shared context remain intact when a user changes this setting.
     pub fn set_strategy(&mut self, strategy: CollaborationStrategy) {
         self.relay.set_strategy(strategy);
+        if strategy != CollaborationStrategy::Pair {
+            self.pair_implementer = None;
+        }
+        let _ = self.queue_session_metadata();
     }
 
     pub fn strategy(&self) -> CollaborationStrategy {
@@ -1219,6 +1236,7 @@ impl RelayHost {
 
     pub async fn reload(&mut self, slot: RosterSlot) -> AdapterResult<()> {
         let desired_policy = self.desired_policy.clone();
+        let _ = self.queue_session_metadata();
         let event_sink = self.event_sink.clone();
         let host = self
             .hosts
@@ -1342,6 +1360,16 @@ impl RelayHost {
             self.roster_launch_specs.swap(first, second);
         }
         self.introduced.swap(first, second);
+        if self.pair_implementer == Some(first) {
+            self.pair_implementer = Some(second);
+        } else if self.pair_implementer == Some(second) {
+            self.pair_implementer = Some(first);
+        }
+        if self.last_public_dispatch == Some(first) {
+            self.last_public_dispatch = Some(second);
+        } else if self.last_public_dispatch == Some(second) {
+            self.last_public_dispatch = Some(first);
+        }
         if let Some(sink) = &self.event_sink {
             sink(AgentEvent::RosterUpdated {
                 update: RosterUpdate::Swapped { first, second },
@@ -1472,9 +1500,43 @@ impl RelayHost {
         } else {
             String::new()
         };
+        // Pair strategy only: make the implementer/reviewer handoff explicit.
+        // Solo, roster, manual, and direct turns keep their existing prompt
+        // text, and stop eligibility stays governed by the footer below.
+        if !*direct && !*can_stop && self.relay.strategy() == CollaborationStrategy::Pair {
+            self.pair_implementer = Some(*slot);
+        }
+        let role_block = if !*direct
+            && self.relay.strategy() == CollaborationStrategy::Pair
+            && self.relay.active_slots().count() >= 2
+        {
+            crate::workflow::pair_role(self.pair_implementer, *slot)
+                .map(|role| {
+                    let peer = match role {
+                        crate::workflow::PairRole::Reviewer => self
+                            .last_public_dispatch
+                            .and_then(|previous| self.roster_names.get(previous).cloned()),
+                        crate::workflow::PairRole::Implementer => None,
+                    };
+                    crate::workflow::role_fragment(role, peer.as_deref())
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let effective_can_stop = *can_stop
+            && !(self.relay.strategy() == CollaborationStrategy::Pair
+                && self.relay.routable_slots().count() >= 2
+                && self.pair_implementer == Some(*slot));
+        let role_separator =
+            if role_block.is_empty() || (introduction.is_empty() && prompt.is_empty()) {
+                ""
+            } else {
+                "\n\n"
+            };
         let prompt = format!(
-            "{introduction}{separator}{prompt}\n\n{}",
-            if *can_stop {
+            "{introduction}{separator}{prompt}{role_separator}{role_block}\n\n{}",
+            if effective_can_stop {
                 format!(
                     "You are reviewing another agent. If no meaningful correction is needed,\nreply with an optional emoji followed by {STOP_TOKEN} on the final line.\nCodeSwarm hides the token and ends this review batch."
                 )
@@ -1510,6 +1572,9 @@ impl RelayHost {
             *introduced = true;
         }
         self.dispatches.push((*slot, prompt));
+        if !*direct {
+            self.last_public_dispatch = Some(*slot);
+        }
         let mut response = String::new();
         let mut emitted_text = 0usize;
         let completion_event = loop {
@@ -1671,7 +1736,7 @@ impl RelayHost {
         };
         let (response, requested_stop) = strip_stop_token(&response);
         let response = response.replace(STOP_TOKEN, "");
-        let accepted_stop = requested_stop && *can_stop;
+        let accepted_stop = requested_stop && effective_can_stop;
         let needs_stop_acknowledgment = accepted_stop && response.is_empty();
         let response = if needs_stop_acknowledgment {
             DEFAULT_STOP_ACKNOWLEDGMENT.to_owned()
@@ -3689,7 +3754,7 @@ mod tests {
     use crate::{
         AgentCapabilities, AgentEvent, EventLog, Mode, PermissionAnswer, ToolStatus,
         persistence::SessionMetadataStore,
-        relay::{DEFAULT_STOP_ACKNOWLEDGMENT, RelayDecision, STOP_TOKEN},
+        relay::{CollaborationStrategy, DEFAULT_STOP_ACKNOWLEDGMENT, RelayDecision, STOP_TOKEN},
     };
     use async_trait::async_trait;
     use serde_json::Value;
@@ -5772,6 +5837,175 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
             positions,
             [("start", 0), ("complete", 0), ("start", 1), ("complete", 1)]
         );
+    }
+
+    #[tokio::test]
+    async fn pair_strategy_wires_roles_into_non_direct_prompts() {
+        let capabilities = AgentCapabilities::default();
+        let first = ScriptedAdapter::new(
+            0,
+            capabilities.clone(),
+            [
+                AgentEvent::Text {
+                    slot: 0,
+                    text: "implemented".into(),
+                },
+                AgentEvent::TurnComplete { slot: 0 },
+                AgentEvent::Text {
+                    slot: 0,
+                    text: format!("fixed review findings {STOP_TOKEN}"),
+                },
+                AgentEvent::TurnComplete { slot: 0 },
+            ],
+        );
+        let second = ScriptedAdapter::new(
+            1,
+            capabilities,
+            [
+                AgentEvent::Text {
+                    slot: 1,
+                    text: "reviewed".into(),
+                },
+                AgentEvent::TurnComplete { slot: 1 },
+                AgentEvent::Text {
+                    slot: 1,
+                    text: format!("approved {STOP_TOKEN}"),
+                },
+                AgentEvent::TurnComplete { slot: 1 },
+                AgentEvent::Text {
+                    slot: 1,
+                    text: "new task".into(),
+                },
+                AgentEvent::TurnComplete { slot: 1 },
+            ],
+        );
+        let hosts = vec![
+            AdapterHost::new(Box::new(first), None),
+            AdapterHost::new(Box::new(second), None),
+        ];
+        let mut relay = RelayHost::new(hosts, 4).expect("relay");
+        relay.set_roster_names(vec!["Claude".into(), "Codex".into()]);
+        relay.relay_mut().set_strategy(CollaborationStrategy::Pair);
+        relay.start().await.expect("start");
+        assert!(matches!(
+            relay.run_turn("task", 0).await.expect("implementer turn"),
+            RelayDecision::Dispatch {
+                slot: 0,
+                can_stop: false,
+                ..
+            }
+        ));
+        let implementer_prompt = &relay.dispatches()[0].1;
+        assert!(implementer_prompt.contains("you are the implementer"));
+        assert!(implementer_prompt.contains("pair reviewer will review the result next"));
+        assert!(!implementer_prompt.contains("you are the reviewer"));
+        assert!(implementer_prompt.contains("Do not use"));
+        assert!(matches!(
+            relay.run_turn("", 0).await.expect("reviewer turn"),
+            RelayDecision::Dispatch {
+                slot: 1,
+                can_stop: true,
+                ..
+            }
+        ));
+        let reviewer_prompt = &relay.dispatches()[1].1;
+        assert!(reviewer_prompt.contains("you are the reviewer"));
+        assert!(reviewer_prompt.contains("Claude handed off"));
+        assert!(reviewer_prompt.contains("concrete defects"));
+        assert!(reviewer_prompt.contains("concise approval"));
+        assert!(reviewer_prompt.contains(STOP_TOKEN));
+        assert!(!reviewer_prompt.contains("you are the implementer"));
+        relay.run_turn("", 0).await.unwrap();
+        assert!(relay.dispatches()[2].1.contains("you are the implementer"));
+        assert!(relay.dispatches()[2].1.contains("Do not use"));
+        assert!(matches!(
+            relay.run_turn("", 0).await.unwrap(),
+            RelayDecision::Dispatch { slot: 1, .. }
+        ));
+        assert!(relay.dispatches()[3].1.contains("you are the reviewer"));
+        assert!(relay.relay_mut().enqueue_human("new task", Some(1)));
+        relay.run_turn("", 1).await.unwrap();
+        assert!(relay.dispatches()[4].1.contains("you are the implementer"));
+    }
+
+    #[tokio::test]
+    async fn solo_roster_and_direct_prompts_omit_pair_roles() {
+        let solo = ScriptedAdapter::new(
+            0,
+            AgentCapabilities::default(),
+            [
+                AgentEvent::Text {
+                    slot: 0,
+                    text: "solo".into(),
+                },
+                AgentEvent::TurnComplete { slot: 0 },
+            ],
+        );
+        let mut solo_relay =
+            RelayHost::new(vec![AdapterHost::new(Box::new(solo), None)], 4).expect("relay");
+        solo_relay
+            .relay_mut()
+            .set_strategy(CollaborationStrategy::Pair);
+        solo_relay.start().await.expect("start");
+        solo_relay.run_turn("task", 0).await.expect("solo turn");
+        assert!(!solo_relay.dispatches()[0].1.contains("Pair role"));
+
+        let roster_first = ScriptedAdapter::new(
+            0,
+            AgentCapabilities::default(),
+            [AgentEvent::TurnComplete { slot: 0 }],
+        );
+        let roster_second = ScriptedAdapter::new(
+            1,
+            AgentCapabilities::default(),
+            [AgentEvent::TurnComplete { slot: 1 }],
+        );
+        let mut roster = RelayHost::new(
+            vec![
+                AdapterHost::new(Box::new(roster_first), None),
+                AdapterHost::new(Box::new(roster_second), None),
+            ],
+            4,
+        )
+        .expect("relay");
+        roster.start().await.expect("start");
+        roster.run_turn("task", 0).await.expect("first turn");
+        roster.run_turn("", 0).await.expect("second turn");
+        assert!(!roster.dispatches()[0].1.contains("Pair role"));
+        assert!(!roster.dispatches()[1].1.contains("Pair role"));
+
+        let pair_first = ScriptedAdapter::new(
+            0,
+            AgentCapabilities::default(),
+            [AgentEvent::TurnComplete { slot: 0 }],
+        );
+        let pair_second = ScriptedAdapter::new(
+            1,
+            AgentCapabilities::default(),
+            [AgentEvent::TurnComplete { slot: 1 }],
+        );
+        let mut pair = RelayHost::new(
+            vec![
+                AdapterHost::new(Box::new(pair_first), None),
+                AdapterHost::new(Box::new(pair_second), None),
+            ],
+            4,
+        )
+        .expect("relay");
+        pair.relay_mut().set_strategy(CollaborationStrategy::Pair);
+        assert_eq!(pair.relay_mut().enqueue_direct(1, "private"), Ok(true));
+        pair.start().await.expect("start");
+        assert!(matches!(
+            pair.run_turn("ignored", 0).await.expect("direct turn"),
+            RelayDecision::Dispatch {
+                slot: 1,
+                direct: true,
+                ..
+            }
+        ));
+        let direct_prompt = &pair.dispatches()[0].1;
+        assert!(direct_prompt.contains("private"));
+        assert!(!direct_prompt.contains("Pair role"));
     }
 
     #[tokio::test]

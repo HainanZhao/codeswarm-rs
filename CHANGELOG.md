@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-06
+
+### Added
+
+- Local multi-session archives and `/sessions` browsing with history previews.
+- Offline history opening; providers reconnect only on explicit continuation.
+- `/status` for running-binary and roster diagnostics, and `/summary` for observed
+  tool outcomes, response text, and optional working-tree evidence.
+- Stable worker/reviewer roles in the existing Pair review workflow.
+
+### Fixed
+
+- Message routing now follows the footer arrow and preserves queued recipients.
+- Suppressed redundant "working" ribbon notifications.
+- Completed tool previews hide while thoughts stream; active tool details and
+  manually expanded details remain visible.
+
 ## [0.9.9] - 2026-09-06
 
 ### Fixed

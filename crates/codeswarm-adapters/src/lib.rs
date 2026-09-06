@@ -23,8 +23,10 @@ pub mod persistence;
 pub mod policy;
 pub mod relay;
 pub mod resources;
+pub mod session_archive;
 pub mod settings;
 pub mod trace;
+pub mod workflow;
 pub use adapters::*;
 pub use relay::{Relay, RelayDecision};
 
@@ -141,6 +143,10 @@ pub enum HistoryContent {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AgentEvent {
+    /// Coordinator snapshot used for local recovery; never live activity.
+    SessionMetadataUpdated {
+        metadata: serde_json::Value,
+    },
     History {
         slot: RosterSlot,
         content: HistoryContent,
@@ -289,7 +295,9 @@ impl SessionState {
 /// never performed in the reducer.
 pub fn reduce(state: &mut SessionState, event: AgentEvent) -> Vec<Effect> {
     match event {
-        AgentEvent::History { .. } => vec![Effect::Render],
+        AgentEvent::History { .. } | AgentEvent::SessionMetadataUpdated { .. } => {
+            vec![Effect::Render]
+        }
         AgentEvent::GoalUpdated { goal } => {
             state.goal = goal;
             vec![Effect::Render]

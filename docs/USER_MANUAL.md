@@ -21,17 +21,38 @@ session in a different workspace.
 compatibility with the previous launcher. `codeswarm --help` and
 `codeswarm --version` work before the terminal UI starts.
 
-`codeswarm resume [PATH]` restores the saved roster and provider conversation
-for the project when the previous owner supports session loading. A normal
-`codeswarm` launch always starts a fresh provider session.
+`codeswarm resume [PATH]` opens the most recent local project archive without
+starting providers. Inside chat, `/sessions` lists saved conversations with
+their title, roster, last activity and response preview. Navigate with arrows
+or the mouse wheel, press Enter to open, and Esc to return. `/resume` opens the
+previous saved session. Switching is blocked during active work or queued input.
 
-Inside chat, `/resume` restores the project session saved before the current
-session started, including its roster, provider handles, and shared goal.
-Restored messages are history only: agents stay idle until you send a new prompt.
-Cancel active work and clear queued prompts before switching. If no saved
-session can be loaded, the status ribbon explains why and the current chat
-stays open. `/resume` takes no arguments; use `codeswarm resume PATH` from the
-terminal to resume another project.
+History is owned by CodeSwarm and remains readable if a provider is missing or
+its session has expired. A new message reconnects the selected saved provider;
+Ctrl+Enter continues privately. Older provider-only sessions may have no local
+transcript until you continue and the provider replays it. A normal `codeswarm`
+launch still starts a fresh provider session and a separate archive.
+
+Archives live under `$XDG_STATE_HOME/codeswarm/archive` (normally
+`~/.local/state/codeswarm/archive`) as per-session metadata and ordered events.
+Writes are buffered away from rendering, checkpointed at turn boundaries and
+periodically during work, and flushed on exit. No telemetry or automatic sharing
+is added.
+
+`/status` shows the running binary version/path, workspace, provider connection,
+resumable slots, selected recipient, role/handoff context and current app state.
+This identifies an old running process even after a newer binary is installed.
+`/summary` shows the last agent response, actual observed tool outcomes and an
+optional working-tree snapshot. Agent prose is not proof of passing tests, and
+missing execution evidence is shown as unknown. Working-tree paths may include
+pre-existing changes. Both views support scrolling and Esc; Ctrl+C retains its
+normal cancel/exit behavior.
+
+Pair review is the worker/reviewer workflow, not an additional routing mode.
+The first agent responding to a human task is its worker; its partner reviews
+concrete changes and hands defects back to the same worker. A new human task
+can select a new worker. Only the reviewer may end a multi-agent pair batch;
+worker changes return for review. Solo and manual routing are unchanged.
 
 The store reads custom agents from
 `$XDG_CONFIG_HOME/codeswarm/codeswarm.json` (default:
@@ -72,7 +93,9 @@ bounded to preserve tmux responsiveness.
   toggles the focused detail. Collapsed
   thoughts show their newest two word-wrapped lines, scrolling up as each new
   line begins. Tools show a single-line tail preview. Both follow the agent's
-  message and use faint gray italics.
+  message and use faint gray italics. While thinking, finished tool summaries
+  move out of the live preview and remain in `/summary`; running tools keep
+  their output visible. Manually expanded details stay open.
 - `Ctrl+Enter` sends to the selected roster agent.
 - `Ctrl+C` cancels active work; while idle it exits.
 - `Esc` closes the active picker, help, permission, or settings surface.
