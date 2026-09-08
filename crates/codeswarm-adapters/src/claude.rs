@@ -1,7 +1,7 @@
 //! Native adapter for Claude Code's print-mode JSONL stream.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -30,6 +30,7 @@ use super::{
 #[derive(Debug, Default)]
 struct ParserState {
     tools: BTreeMap<String, ToolUpdate>,
+    finished_tools: BTreeSet<String>,
 }
 
 fn content_text(value: &Value) -> Option<String> {
@@ -43,14 +44,106 @@ fn content_text(value: &Value) -> Option<String> {
                 .join("\n");
             (!text.is_empty()).then_some(text)
         }
-        Value::Object(content) => content
-            .get("text")
-            .and_then(Value::as_str)
+        Value::Object(content) => {
+            let direct = [
+                "text",
+                "stdout",
+                "stderr",
+                "error",
+                "error_code",
+                "error_message",
+                "message",
+            ]
+            .into_iter()
+            .filter_map(|key| content.get(key).and_then(Value::as_str))
             .filter(|text| !text.is_empty())
-            .map(str::to_owned)
-            .or_else(|| content.get("content").and_then(content_text)),
+            .collect::<Vec<_>>()
+            .join("\n");
+            (!direct.is_empty())
+                .then_some(direct)
+                .or_else(|| content.get("content").and_then(content_text))
+        }
         _ => None,
     }
+}
+
+fn is_tool_use_type(kind: &str) -> bool {
+    matches!(kind, "tool_use" | "server_tool_use" | "mcp_tool_use")
+}
+
+fn is_tool_result_type(kind: &str) -> bool {
+    matches!(
+        kind,
+        "tool_result"
+            | "tool_search_tool_result"
+            | "web_fetch_tool_result"
+            | "web_search_tool_result"
+            | "code_execution_tool_result"
+            | "bash_code_execution_tool_result"
+            | "text_editor_code_execution_tool_result"
+            | "mcp_tool_result"
+    )
+}
+
+fn tool_title(block: &Value) -> String {
+    let name = block
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Tool call")
+        .replace('_', " ");
+    let description = block
+        .get("input")
+        .and_then(|input| input.get("description"))
+        .and_then(Value::as_str)
+        .filter(|description| !description.is_empty());
+    description.map_or(name.clone(), |description| format!("{name}: {description}"))
+}
+
+fn parse_tool_uses(slot: RosterSlot, value: &Value, state: &mut ParserState) -> Vec<AgentEvent> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(content) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    content
+        .iter()
+        .filter(|block| {
+            block
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_tool_use_type)
+        })
+        .filter_map(|block| {
+            let id = block
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())?;
+            let title = tool_title(block);
+            if state.finished_tools.contains(id) {
+                return None;
+            }
+            let update = state
+                .tools
+                .entry(id.to_owned())
+                .or_insert_with(|| ToolUpdate {
+                    id: id.to_owned(),
+                    title: title.clone(),
+                    status: ToolStatus::Running,
+                    detail: None,
+                });
+            update.title = title;
+            Some(AgentEvent::Tool {
+                slot,
+                update: update.clone(),
+            })
+        })
+        .collect()
 }
 
 fn parse_stream_event(
@@ -89,7 +182,11 @@ fn parse_stream_event(
         "content_block_start" => {
             let index = index?;
             let block = event.get("content_block")?;
-            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            if !block
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_tool_use_type)
+            {
                 return None;
             }
             let id = block
@@ -97,11 +194,8 @@ fn parse_stream_event(
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
                 .map_or_else(|| format!("claude-tool-{index}"), str::to_owned);
-            let title = block
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("Tool call")
-                .replace('_', " ");
+            let title = tool_title(block);
+            state.finished_tools.remove(&id);
             state.tools.insert(
                 id.clone(),
                 ToolUpdate {
@@ -144,7 +238,12 @@ fn parse_tool_results(slot: RosterSlot, value: &Value, state: &mut ParserState) 
     };
     content
         .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .filter(|block| {
+            block
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_tool_result_type)
+        })
         .filter_map(|block| {
             let id = block
                 .get("tool_use_id")
@@ -159,22 +258,67 @@ fn parse_tool_results(slot: RosterSlot, value: &Value, state: &mut ParserState) 
                     status: ToolStatus::Running,
                     detail: None,
                 });
+            let result_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let result = block.get("content");
+            let structured_result_type = result
+                .and_then(|result| result.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let nonzero_exit = result.is_some_and(|result| {
+                ["return_code", "exit_code"]
+                    .into_iter()
+                    .filter_map(|key| result.get(key).and_then(Value::as_i64))
+                    .any(|code| code != 0)
+            });
             tool.status = if block
                 .get("is_error")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
+                || result_type.ends_with("_error")
+                || structured_result_type.ends_with("_error")
+                || nonzero_exit
             {
                 ToolStatus::Failed
             } else {
                 ToolStatus::Completed
             };
-            tool.detail = block.get("content").and_then(content_text);
+            tool.detail = result.and_then(content_text);
+            state.finished_tools.insert(id.to_owned());
             Some(AgentEvent::Tool {
                 slot,
                 update: tool.clone(),
             })
         })
         .collect()
+}
+
+fn parse_tool_progress(
+    slot: RosterSlot,
+    value: &Value,
+    state: &mut ParserState,
+) -> Option<AgentEvent> {
+    if value.get("type").and_then(Value::as_str) != Some("tool_progress") {
+        return None;
+    }
+    let reported = value.get("tool_use_id").and_then(Value::as_str);
+    let parent = value.get("parent_tool_use_id").and_then(Value::as_str);
+    let id = reported
+        .filter(|id| state.tools.contains_key(*id) && !state.finished_tools.contains(*id))
+        .or_else(|| {
+            parent.filter(|id| state.tools.contains_key(*id) && !state.finished_tools.contains(*id))
+        })?;
+    let update = state.tools.get_mut(id)?;
+    update.status = ToolStatus::Running;
+    if let Some(seconds) = value.get("elapsed_time_seconds").and_then(Value::as_u64) {
+        update.detail = Some(format!("running for {seconds}s"));
+    }
+    Some(AgentEvent::Tool {
+        slot,
+        update: update.clone(),
+    })
 }
 
 fn result_text(value: &Value) -> Option<String> {
@@ -398,6 +542,16 @@ impl AgentAdapter for ClaudeAdapter {
                         break;
                     }
                 }
+                for event in parse_tool_uses(slot, &value, &mut state) {
+                    if sender.send(Ok(event)).await.is_err() {
+                        break;
+                    }
+                }
+                if let Some(event) = parse_tool_progress(slot, &value, &mut state)
+                    && sender.send(Ok(event)).await.is_err()
+                {
+                    break;
+                }
                 for event in parse_tool_results(slot, &value, &mut state) {
                     if sender.send(Ok(event)).await.is_err() {
                         break;
@@ -547,7 +701,10 @@ impl AgentAdapter for ClaudeAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeAdapter, ParserState, parse_stream_event, parse_tool_results};
+    use super::{
+        ClaudeAdapter, ParserState, parse_stream_event, parse_tool_progress, parse_tool_results,
+        parse_tool_uses,
+    };
     use crate::{AgentAdapter, AgentEvent, ToolStatus};
     use serde_json::json;
 
@@ -623,6 +780,151 @@ mod tests {
                     && update.id == "tool-without-partial-start"
                     && update.detail.as_deref() == Some("permission denied")
         ));
+    }
+
+    #[test]
+    fn consolidated_tool_use_and_sdk_result_variants_match_claude_acp() {
+        let mut state = ParserState::default();
+        let refined = parse_tool_uses(
+            1,
+            &json!({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "server_tool_use",
+                    "id": "server-tool",
+                    "name": "bash_code_execution",
+                    "input": {"description": "Compile the project"}
+                }]}
+            }),
+            &mut state,
+        );
+        assert!(matches!(
+            refined.as_slice(),
+            [AgentEvent::Tool { update, .. }]
+                if update.status == ToolStatus::Running
+                    && update.title == "bash code execution: Compile the project"
+        ));
+
+        let completed = parse_tool_results(
+            1,
+            &json!({
+                "type": "user",
+                "message": {"content": [{
+                    "type": "bash_code_execution_tool_result",
+                    "tool_use_id": "server-tool",
+                    "content": {
+                        "type": "bash_code_execution_result",
+                        "stdout": "partial output",
+                        "stderr": "compiler error",
+                        "return_code": 2
+                    }
+                }]}
+            }),
+            &mut state,
+        );
+        assert!(matches!(
+            completed.as_slice(),
+            [AgentEvent::Tool { update, .. }]
+                if update.status == ToolStatus::Failed
+                    && update.title == "bash code execution: Compile the project"
+                    && update.detail.as_deref() == Some("partial output\ncompiler error")
+        ));
+        assert!(
+            parse_tool_progress(
+                1,
+                &json!({
+                    "type": "tool_progress",
+                    "tool_use_id": "server-tool-heartbeat-1",
+                    "parent_tool_use_id": "server-tool",
+                    "tool_name": "bash_code_execution",
+                    "elapsed_time_seconds": 30
+                }),
+                &mut state,
+            )
+            .is_none(),
+            "a late heartbeat must not reopen a completed tool"
+        );
+    }
+
+    #[test]
+    fn tool_progress_uses_the_real_parent_id_without_creating_phantom_tools() {
+        let mut state = ParserState::default();
+        let _ = parse_stream_event(
+            3,
+            &json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "tool_use", "id": "tool-3", "name": "Bash"}
+                }
+            }),
+            &mut state,
+        );
+        assert!(matches!(
+            parse_tool_progress(
+                3,
+                &json!({
+                    "type": "tool_progress",
+                    "tool_use_id": "tool-3-heartbeat-1",
+                    "parent_tool_use_id": "tool-3",
+                    "tool_name": "Bash",
+                    "elapsed_time_seconds": 30
+                }),
+                &mut state,
+            ),
+            Some(AgentEvent::Tool { update, .. })
+                if update.id == "tool-3"
+                    && update.status == ToolStatus::Running
+                    && update.detail.as_deref() == Some("running for 30s")
+        ));
+        assert_eq!(state.tools.len(), 1);
+    }
+
+    #[test]
+    fn structured_sdk_error_results_are_failed_with_their_details() {
+        for (outer, inner) in [
+            ("tool_search_tool_result", "tool_search_tool_result_error"),
+            ("web_fetch_tool_result", "web_fetch_tool_result_error"),
+            ("web_search_tool_result", "web_search_tool_result_error"),
+            (
+                "code_execution_tool_result",
+                "code_execution_tool_result_error",
+            ),
+            (
+                "bash_code_execution_tool_result",
+                "bash_code_execution_tool_result_error",
+            ),
+            (
+                "text_editor_code_execution_tool_result",
+                "text_editor_code_execution_tool_result_error",
+            ),
+        ] {
+            let mut state = ParserState::default();
+            let events = parse_tool_results(
+                5,
+                &json!({
+                    "type": "user",
+                    "message": {"content": [{
+                        "type": outer,
+                        "tool_use_id": "failed-tool",
+                        "content": {
+                            "type": inner,
+                            "error_code": "execution_failed",
+                            "error_message": "provider rejected the tool"
+                        }
+                    }]}
+                }),
+                &mut state,
+            );
+            assert!(matches!(
+                events.as_slice(),
+                [AgentEvent::Tool { update, .. }]
+                    if update.status == ToolStatus::Failed
+                        && update.detail.as_deref()
+                            == Some("execution_failed\nprovider rejected the tool")
+            ));
+        }
     }
 
     #[tokio::test]

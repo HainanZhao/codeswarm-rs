@@ -752,6 +752,7 @@ pub struct RelayHost {
     pair_implementer: Option<RosterSlot>,
     event_sink: Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
     cancel_requested: Arc<AtomicBool>,
+    active_turn_slot: Arc<AtomicUsize>,
     cancel_notify: Arc<Notify>,
 }
 
@@ -760,7 +761,18 @@ pub struct RelayHost {
 #[derive(Clone, Debug)]
 pub struct RelayCancellation {
     requested: Arc<AtomicBool>,
+    active_turn_slot: Arc<AtomicUsize>,
     notify: Arc<Notify>,
+}
+
+const NO_ACTIVE_TURN: usize = usize::MAX;
+
+struct ActiveTurnGuard(Arc<AtomicUsize>);
+
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        self.0.store(NO_ACTIVE_TURN, Ordering::Release);
+    }
 }
 
 /// A permission response delivered while a relay turn is still streaming.
@@ -897,6 +909,17 @@ impl RelayCancellation {
         self.requested.store(true, Ordering::Release);
         self.notify.notify_one();
     }
+
+    /// Cancel only when `slot` is the turn currently borrowing the relay.
+    /// Reloading an idle or previously failed peer is deferred to the turn
+    /// boundary without interrupting a healthy collaborator.
+    pub fn request_if_active(&self, slot: RosterSlot) -> bool {
+        if self.active_turn_slot.load(Ordering::Acquire) != slot {
+            return false;
+        }
+        self.request();
+        true
+    }
 }
 
 impl std::fmt::Debug for RelayHost {
@@ -942,6 +965,7 @@ impl RelayHost {
             goal: None,
             event_sink: None,
             cancel_requested: Arc::new(AtomicBool::new(false)),
+            active_turn_slot: Arc::new(AtomicUsize::new(NO_ACTIVE_TURN)),
             cancel_notify: Arc::new(Notify::new()),
         })
     }
@@ -1469,6 +1493,7 @@ impl RelayHost {
     pub fn cancellation(&self) -> RelayCancellation {
         RelayCancellation {
             requested: Arc::clone(&self.cancel_requested),
+            active_turn_slot: Arc::clone(&self.active_turn_slot),
             notify: Arc::clone(&self.cancel_notify),
         }
     }
@@ -1514,6 +1539,8 @@ impl RelayHost {
         else {
             return Ok(decision);
         };
+        self.active_turn_slot.store(*slot, Ordering::Release);
+        let _active_turn = ActiveTurnGuard(Arc::clone(&self.active_turn_slot));
         let event_sink = self.event_sink.clone();
         // Recover a broken ACP transport before collecting context or building
         // the prompt. Reload rewinds the slot's context watermark and clears

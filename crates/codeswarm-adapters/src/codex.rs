@@ -131,10 +131,9 @@ fn tool_status(item: &Value, event_type: &str) -> ToolStatus {
     {
         Some("completed") | Some("success") | Some("item.completed") => ToolStatus::Completed,
         Some("failed") | Some("error") | Some("errored") | Some("declined") | Some("cancelled")
-        | Some("item.failed") => ToolStatus::Failed,
-        Some("in_progress") | Some("running") | Some("item.started") | Some("item.updated") => {
-            ToolStatus::Running
-        }
+        | Some("interrupted") | Some("item.failed") => ToolStatus::Failed,
+        Some("in_progress") | Some("inProgress") | Some("running") | Some("item.started")
+        | Some("item.updated") => ToolStatus::Running,
         _ => ToolStatus::Pending,
     }
 }
@@ -751,6 +750,10 @@ mod tests {
         assert!(matches!(
             parse_value(1, &json!({"type":"item.failed","item":{"id":"c3","type":"command_execution","status":"error","error":"spawn failed"}}), &mut state),
             Some(AgentEvent::Tool { update, .. }) if update.status == ToolStatus::Failed && update.detail.as_deref() == Some("spawn failed")
+        ));
+        assert!(matches!(
+            parse_value(1, &json!({"type":"item.updated","item":{"id":"c4","type":"command_execution","status":"inProgress"}}), &mut state),
+            Some(AgentEvent::Tool { update, .. }) if update.status == ToolStatus::Running
         ));
         assert!(parse_value(1, &json!({"type":"turn.completed"}), &mut state).is_none());
         assert!(
