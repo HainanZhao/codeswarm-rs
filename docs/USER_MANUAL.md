@@ -17,9 +17,7 @@ the UI without an external agent.
 Use `--project-dir PATH` (or pass a directory positionally) to start the
 session in a different workspace.
 
-`codeswarm run PATH` and `codeswarm acp COMMAND [PATH]` remain accepted for
-compatibility with the previous launcher. `codeswarm --help` and
-`codeswarm --version` work before the terminal UI starts.
+`codeswarm --help` and `codeswarm --version` work before the terminal UI starts.
 
 `codeswarm resume [PATH]` opens the most recent local project archive without
 starting providers. Inside chat, `/sessions` lists saved conversations with
@@ -70,6 +68,8 @@ highlighted agent when none is selected).
 
 CodeSwarm supports both native adapters and ACP adapters. They share the same
 normalized event model, but a custom adapter does not need to implement ACP.
+Claude and Codex use the locally installed `claude` and `codex` executables;
+CodeSwarm does not fetch Node ACP bridges with `npx` at startup.
 
 ```bash
 codeswarm --agy "summarize the repository"

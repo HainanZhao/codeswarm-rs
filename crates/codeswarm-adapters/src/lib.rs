@@ -420,7 +420,7 @@ pub fn reduce(state: &mut SessionState, event: AgentEvent) -> Vec<Effect> {
             started,
             detail: _,
         } => {
-            if let Some(agent) = state.slots.get_mut(slot) {
+            if !started && let Some(agent) = state.slots.get_mut(slot) {
                 agent.active = false;
             }
             if state.active_slot == Some(slot) {
@@ -676,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_tombstones_slot_and_uses_crash_copy() {
+    fn post_start_failure_keeps_slot_selected_and_uses_crash_copy() {
         let mut state = SessionState::new(2);
         reduce(
             &mut state,
@@ -693,11 +693,21 @@ mod tests {
                 detail: "process exited".into(),
             },
         );
-        assert!(!state.slots[1].active);
+        assert!(state.slots[1].active);
         assert!(effects.contains(&Effect::OfferReload {
             slot: 1,
             crashed: true,
         }));
+
+        reduce(
+            &mut state,
+            AgentEvent::Failed {
+                slot: 0,
+                started: false,
+                detail: "startup failed".into(),
+            },
+        );
+        assert!(!state.slots[0].active);
     }
 
     #[test]

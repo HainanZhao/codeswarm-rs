@@ -22,6 +22,78 @@ pub(super) struct SavedConversation {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RestoredRelayContext {
+    SharedTask(String),
+    Public { speaker: String, text: String },
+    Seen(usize),
+    Rewind(usize),
+}
+
+pub(super) fn restored_relay_context(
+    conversation: &SavedConversation,
+) -> Vec<RestoredRelayContext> {
+    let mut actions = Vec::new();
+    let mut response = std::collections::BTreeMap::<usize, String>::new();
+    let mut incomplete = std::collections::BTreeSet::new();
+    let mut direct = false;
+    let mut shared_task_set = false;
+    for event in &conversation.events {
+        match event {
+            SavedEvent::Human {
+                text,
+                direct: private,
+            } => {
+                direct = *private;
+                if !direct {
+                    if !shared_task_set {
+                        actions.push(RestoredRelayContext::SharedTask(text.clone()));
+                        shared_task_set = true;
+                    }
+                    actions.push(RestoredRelayContext::Public {
+                        speaker: "User (saved)".into(),
+                        text: text.clone(),
+                    });
+                }
+            }
+            SavedEvent::Agent(AgentEvent::TurnStarted { slot }) => {
+                incomplete.insert(*slot);
+            }
+            SavedEvent::Agent(AgentEvent::Text { slot, text }) if !direct => {
+                response.entry(*slot).or_default().push_str(text);
+            }
+            SavedEvent::Agent(AgentEvent::TurnComplete { slot }) => {
+                incomplete.remove(slot);
+                if !direct
+                    && let Some(text) = response.remove(slot).filter(|text| !text.trim().is_empty())
+                {
+                    let name = conversation
+                        .roster
+                        .get(*slot)
+                        .cloned()
+                        .unwrap_or_else(|| format!("Agent {}", slot.saturating_add(1)));
+                    actions.push(RestoredRelayContext::Public {
+                        speaker: format!("{name} (saved)"),
+                        text,
+                    });
+                }
+                actions.push(RestoredRelayContext::Seen(*slot));
+            }
+            SavedEvent::Agent(
+                AgentEvent::UsageLimitReached { slot, .. } | AgentEvent::Failed { slot, .. },
+            ) => {
+                response.remove(slot);
+                incomplete.insert(*slot);
+            }
+            _ => {}
+        }
+    }
+    for slot in incomplete {
+        actions.push(RestoredRelayContext::Rewind(slot));
+    }
+    actions
+}
+
 pub(super) fn replay_conversation(app: &mut App, conversation: &SavedConversation) {
     seed_saved_roster(app, &conversation.roster, &conversation.metadata);
     for event in &conversation.events {
@@ -155,6 +227,18 @@ pub(super) fn resumable_slots(metadata: &SessionMetadata) -> Vec<usize> {
             (load && handle).then_some(slot)
         })
         .collect()
+}
+
+/// An archived roster can continue when at least one provider handle anchors
+/// the old session. Other saved slots may start fresh in that same roster.
+pub(super) fn continuable_slots(metadata: &SessionMetadata) -> Vec<usize> {
+    if resumable_slots(metadata).is_empty() {
+        return Vec::new();
+    }
+    metadata
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .map_or_else(Vec::new, |agents| (0..agents.len()).collect())
 }
 
 /// Running-binary information is deliberately read from this process, not a

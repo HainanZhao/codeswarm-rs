@@ -32,6 +32,15 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWri
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 
+#[path = "codex.rs"]
+mod codex;
+#[path = "native.rs"]
+mod native;
+pub use codex::CodexAdapter;
+#[path = "claude.rs"]
+mod claude;
+pub use claude::ClaudeAdapter;
+
 pub type AdapterResult<T> = Result<T, AdapterError>;
 
 /// Keep a peer from allocating unbounded memory for one newline-delimited
@@ -379,6 +388,13 @@ pub trait AgentAdapter: Send {
     fn protocol(&self) -> &'static str {
         "custom"
     }
+    /// Whether the adapter lost its underlying transport and needs a
+    /// coordinator-owned reload before the next prompt. Most adapters keep
+    /// their transport alive between turns; ACP overrides this for EOF or
+    /// broken-pipe recovery.
+    fn needs_restart(&self) -> bool {
+        false
+    }
     fn capabilities(&self) -> AgentCapabilities;
     async fn start(&mut self) -> AdapterResult<()>;
     async fn send_prompt(&mut self, prompt: String) -> AdapterResult<()>;
@@ -510,6 +526,10 @@ impl AgentAdapter for SlotMappedAdapter {
 
     fn capabilities(&self) -> AgentCapabilities {
         self.inner.capabilities()
+    }
+
+    fn needs_restart(&self) -> bool {
+        self.inner.needs_restart()
     }
 
     async fn start(&mut self) -> AdapterResult<()> {
@@ -1083,39 +1103,17 @@ impl RelayHost {
     }
 
     pub async fn start(&mut self) -> AdapterResult<()> {
-        let event_sink = self.event_sink.clone();
-        let startups = self.hosts.iter_mut().map(|host| {
-            let event_sink = event_sink.clone();
-            async move {
-                host.start().await?;
-                refresh_adapter_startup(host, &event_sink).await
-            }
-        });
-        let results = futures::future::join_all(startups).await;
-        if let Some(error) = results.into_iter().find_map(Result::err) {
-            // Startup is transactional even though independent adapters are
-            // warmed concurrently. Every host gets a cleanup attempt.
-            for host in &mut self.hosts {
-                let _ = host.stop().await;
-            }
-            return Err(error);
-        }
-        if let Err(error) = self
-            .set_policy(crate::policy::DEFAULT_POLICY_ID.into())
-            .await
-        {
-            for host in &mut self.hosts {
-                let _ = host.stop().await;
-            }
-            return Err(error);
-        }
-        let _ = self.queue_session_metadata();
-        Ok(())
+        self.start_isolating_failures("agent could not start").await
     }
 
     /// Restore each provider independently. An expired saved handle must not
     /// tear down healthy peers; failed slots are immediately unroutable.
     pub async fn start_resuming(&mut self) -> AdapterResult<()> {
+        self.start_isolating_failures("saved session could not be restored")
+            .await
+    }
+
+    async fn start_isolating_failures(&mut self, failure_prefix: &str) -> AdapterResult<()> {
         let event_sink = self.event_sink.clone();
         let policy = self.desired_policy.clone();
         let starts = self.hosts.iter_mut().map(|host| {
@@ -1137,7 +1135,7 @@ impl RelayHost {
                     sink(AgentEvent::Failed {
                         slot,
                         started: false,
-                        detail: format!("saved session could not be restored: {error}"),
+                        detail: format!("{failure_prefix}: {error}"),
                     });
                 }
                 if first_error.is_none() {
@@ -1146,9 +1144,8 @@ impl RelayHost {
             }
         }
         if self.relay.active_slots().next().is_none() {
-            return Err(first_error.unwrap_or_else(|| {
-                AdapterError::Transport("no saved providers could be restored".into())
-            }));
+            return Err(first_error
+                .unwrap_or_else(|| AdapterError::Transport("no agents could be started".into())));
         }
         let _ = self.queue_session_metadata();
         Ok(())
@@ -1156,11 +1153,13 @@ impl RelayHost {
 
     pub async fn stop(&mut self) -> AdapterResult<()> {
         // A third-party adapter can fail during shutdown (for example after
-        // its transport has already disappeared). Always give every roster
+        // its transport has already disappeared). Always give every still-active
         // member a chance to clean up, then return the first error so callers
         // still get an actionable failure without leaking later processes.
         let mut first_error = None;
-        for host in &mut self.hosts {
+        let active = self.relay.active_slots().collect::<Vec<_>>();
+        for slot in active {
+            let host = &mut self.hosts[slot];
             if let Err(error) = host.stop().await
                 && first_error.is_none()
             {
@@ -1261,10 +1260,34 @@ impl RelayHost {
     /// advertised native mode, falling back to conventional IDs before the
     /// first catalog update arrives.
     pub async fn set_policy(&mut self, policy: String) -> AdapterResult<()> {
-        self.desired_policy = canonical_policy_id(&policy).to_owned();
-        let desired_policy = self.desired_policy.clone();
-        let mut first_error = None;
+        let desired_policy = canonical_policy_id(&policy).to_owned();
+        // Preflight every active catalog before mutating any adapter. A
+        // mixed roster must never end up with only some agents on the new
+        // policy when another selected agent cannot represent it.
         let active = self.relay.active_slots().collect::<Vec<_>>();
+        for active_slot in &active {
+            let Some(host) = self.hosts.get(*active_slot) else {
+                continue;
+            };
+            if !host.adapter().capabilities().supports_modes {
+                continue;
+            }
+            let advertised = host
+                .state
+                .slots
+                .get(*active_slot)
+                .map(|agent| agent.modes.as_slice())
+                .unwrap_or_default();
+            if !advertised.is_empty()
+                && crate::policy::resolve(&desired_policy, advertised).is_none()
+            {
+                return Err(AdapterError::Unsupported(
+                    "desired policy is unavailable for an active adapter",
+                ));
+            }
+        }
+        self.desired_policy = desired_policy.clone();
+        let mut first_error = None;
         for active_slot in active {
             let Some(host) = self.hosts.get_mut(active_slot) else {
                 continue;
@@ -1491,6 +1514,27 @@ impl RelayHost {
         else {
             return Ok(decision);
         };
+        let event_sink = self.event_sink.clone();
+        // Recover a broken ACP transport before collecting context or building
+        // the prompt. Reload rewinds the slot's context watermark and clears
+        // its introduction flag, so those values must be read afterward.
+        if self
+            .hosts
+            .get(*slot)
+            .is_some_and(|host| host.adapter().needs_restart())
+            && let Err(error) = self.reload(*slot).await
+        {
+            let limited =
+                report_relay_failure(&mut self.relay, &event_sink, *slot, true, error.to_string());
+            if limited {
+                self.relay.finish(*slot, *direct, false);
+            }
+            let _ = self.queue_session_metadata();
+            if limited {
+                return Ok(decision);
+            }
+            return Err(error);
+        }
         let speaker_name = self
             .roster_names
             .get(*slot)
@@ -1616,7 +1660,6 @@ impl RelayHost {
             },
             separator = if introduction.is_empty() { "" } else { "\n\n" },
         );
-        let event_sink = self.event_sink.clone();
         let host = self
             .hosts
             .get_mut(*slot)
@@ -1652,20 +1695,14 @@ impl RelayHost {
         let completion_event = loop {
             if self.cancel_requested.swap(false, Ordering::AcqRel) {
                 if let Err(error) = cancel_with_timeout(host).await {
-                    let limited = report_relay_failure(
+                    report_relay_failure(
                         &mut self.relay,
                         &event_sink,
                         *slot,
                         true,
                         error.to_string(),
                     );
-                    if limited {
-                        self.relay.finish(*slot, *direct, false);
-                    }
                     let _ = self.queue_session_metadata();
-                    if limited {
-                        return Ok(decision);
-                    }
                     return Err(error);
                 }
                 return Err(AdapterError::Transport("relay turn cancelled".into()));
@@ -1714,20 +1751,14 @@ impl RelayHost {
                         continue;
                     }
                     if let Err(error) = cancel_with_timeout(host).await {
-                        let limited = report_relay_failure(
+                        report_relay_failure(
                             &mut self.relay,
                             &event_sink,
                             *slot,
                             true,
                             error.to_string(),
                         );
-                        if limited {
-                            self.relay.finish(*slot, *direct, false);
-                        }
                         let _ = self.queue_session_metadata();
-                        if limited {
-                            return Ok(decision);
-                        }
                         return Err(error);
                     }
                     return Err(AdapterError::Transport("relay turn cancelled".into()));
@@ -1878,8 +1909,9 @@ fn report_relay_failure(
     started: bool,
     detail: String,
 ) -> bool {
-    // A quota rejection is not a crash: route around the agent without
-    // tombstoning the slot so a recharge can restore it.
+    // A post-start failure is scoped to this automated batch. Keep the
+    // user's roster selection and provider handle so the next human prompt
+    // retries it; repeated failures remain for the user to resolve.
     if is_usage_limit_response(&detail) {
         let _ = relay.mark_limited(slot);
         if let Some(sink) = event_sink {
@@ -1887,7 +1919,11 @@ fn report_relay_failure(
         }
         return true;
     }
-    let _ = relay.tombstone(slot);
+    if started {
+        let _ = relay.mark_limited(slot);
+    } else {
+        let _ = relay.tombstone(slot);
+    }
     if let Some(sink) = event_sink {
         sink(AgentEvent::Failed {
             slot,
@@ -1895,7 +1931,7 @@ fn report_relay_failure(
             detail,
         });
     }
-    false
+    started
 }
 
 /// Deterministic in-memory adapter used for contract and relay tests.
@@ -2333,23 +2369,29 @@ impl AgentAdapter for AgyAdapter {
 
     async fn next_event(&mut self) -> Option<AdapterResult<AgentEvent>> {
         let event = self.receiver.recv().await;
-        if matches!(event.as_ref(), Some(Ok(AgentEvent::TurnComplete { .. })))
-            && self.session_id.is_none()
-            && let Ok(session) = self.announced_session.lock()
-        {
-            self.session_id = session.clone();
-        }
-        if matches!(event.as_ref(), Some(Ok(AgentEvent::TurnComplete { .. })))
-            && let Some(mut child) = self.child.take()
-        {
-            let _ = child.wait().await;
+        if matches!(
+            event.as_ref(),
+            Some(Ok(
+                AgentEvent::TurnComplete { .. } | AgentEvent::Failed { .. }
+            ))
+        ) {
+            if self.session_id.is_none()
+                && let Ok(session) = self.announced_session.lock()
+            {
+                self.session_id = session.clone();
+            }
+            // A failed turn is terminal for this process too. Reap it here
+            // so the next user prompt starts a fresh native process instead
+            // of trying to write to a dead child.
+            if let Some(mut child) = self.child.take() {
+                let _ = child.wait().await;
+            }
         }
         event
     }
 }
 
 #[cfg(test)]
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_agy_line(slot: RosterSlot, line: &str) -> AdapterResult<Option<AgentEvent>> {
     let value: Value =
         serde_json::from_str(line).map_err(|error| AdapterError::Protocol(error.to_string()))?;
@@ -2570,6 +2612,25 @@ impl AcpAdapter {
             .write_all(b"\n")
             .await
             .map_err(|error| AdapterError::Transport(error.to_string()))
+    }
+
+    /// Tear down a broken ACP stream while retaining the provider session
+    /// handle. The coordinator reloads the slot before its next prompt.
+    async fn reset_transport(&mut self) {
+        let terminals = std::mem::take(&mut self.terminals);
+        for terminal in terminals.values() {
+            terminal.stop().await;
+        }
+        self.queued_events.clear();
+        self.tool_updates.clear();
+        if let Some(mut child) = self.child.take() {
+            let _ = terminate_child(&mut child).await;
+        }
+        self.reader = None;
+        if let Some(task) = self.stderr_task.take() {
+            task.abort();
+        }
+        self.prompt_request_id = None;
     }
 
     /// ACP permission requests are JSON-RPC requests, not fire-and-forget
@@ -3243,6 +3304,10 @@ impl AgentAdapter for AcpAdapter {
         "acp"
     }
 
+    fn needs_restart(&self) -> bool {
+        self.reader.is_none() || self.child.is_none()
+    }
+
     fn capabilities(&self) -> AgentCapabilities {
         self.capabilities.clone()
     }
@@ -3254,6 +3319,11 @@ impl AgentAdapter for AcpAdapter {
     }
 
     async fn send_prompt(&mut self, prompt: String) -> AdapterResult<()> {
+        if self.needs_restart() {
+            return Err(AdapterError::Transport(
+                "ACP agent transport is not running; reload the agent before retrying".into(),
+            ));
+        }
         let session_id = self
             .session_id
             .as_ref()
@@ -3262,16 +3332,21 @@ impl AgentAdapter for AcpAdapter {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let prompt_blocks = prompt_content_blocks(&self.cwd, &prompt);
-        self.write_json(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "session/prompt",
-            "params": {
-                "sessionId": session_id,
-                "prompt": prompt_blocks,
-            },
-        }))
-        .await?;
+        let write_result = self
+            .write_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": prompt_blocks,
+                },
+            }))
+            .await;
+        if let Err(error) = write_result {
+            self.reset_transport().await;
+            return Err(error);
+        }
         self.prompt_request_id = Some(request_id);
         Ok(())
     }
@@ -3436,7 +3511,13 @@ impl AgentAdapter for AcpAdapter {
         loop {
             let line = match self.read_line().await {
                 Ok(line) => line,
-                Err(error) => return Some(Err(error)),
+                Err(error) => {
+                    // EOF or a broken pipe ends this transport. Reap the
+                    // process now; `send_prompt` will reconnect it for the
+                    // next human turn while preserving `session_id`.
+                    self.reset_transport().await;
+                    return Some(Err(error));
+                }
             };
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
@@ -3839,12 +3920,13 @@ mod tests {
     use super::{isolate_process_group, terminate_child};
     use crate::TerminalEvent;
     use crate::{
-        AgentCapabilities, AgentEvent, EventLog, Mode, PermissionAnswer, ToolStatus,
+        AdapterError, AgentCapabilities, AgentEvent, EventLog, Mode, PermissionAnswer, ToolStatus,
         persistence::SessionMetadataStore,
         relay::{CollaborationStrategy, DEFAULT_STOP_ACKNOWLEDGMENT, RelayDecision, STOP_TOKEN},
     };
     use async_trait::async_trait;
     use serde_json::Value;
+    use std::collections::VecDeque;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -4078,12 +4160,12 @@ mod tests {
     #[test]
     fn parses_configured_commands_with_shell_style_quotes_without_a_shell() {
         assert_eq!(
-            parse_command_line(r#"npx -y "@agentclientprotocol/codex-acp" --flag 'two words'"#),
+            parse_command_line(r#"agent --name "local bridge" --flag 'two words'"#),
             Ok((
-                "npx".into(),
+                "agent".into(),
                 vec![
-                    "-y".into(),
-                    "@agentclientprotocol/codex-acp".into(),
+                    "--name".into(),
+                    "local bridge".into(),
                     "--flag".into(),
                     "two words".into(),
                 ]
@@ -4146,6 +4228,112 @@ mod tests {
     struct ConcurrentStartAdapter {
         slot: usize,
         barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[derive(Debug)]
+    struct ReloadProbeAdapter {
+        slot: usize,
+        crashed: bool,
+        reloaded: bool,
+        events: VecDeque<AgentEvent>,
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl AgentAdapter for ReloadProbeAdapter {
+        fn slot(&self) -> usize {
+            self.slot
+        }
+
+        fn display_name(&self) -> String {
+            "Reload probe".into()
+        }
+
+        fn protocol(&self) -> &'static str {
+            "native"
+        }
+
+        fn capabilities(&self) -> AgentCapabilities {
+            AgentCapabilities {
+                supports_modes: true,
+                ..AgentCapabilities::default()
+            }
+        }
+
+        fn needs_restart(&self) -> bool {
+            self.crashed && !self.reloaded
+        }
+
+        async fn start(&mut self) -> super::AdapterResult<()> {
+            self.events.push_back(AgentEvent::ModesReplaced {
+                slot: self.slot,
+                modes: vec![
+                    Mode {
+                        id: "codeswarm:mode:full-access".into(),
+                        label: "Auto pilot".into(),
+                    },
+                    Mode {
+                        id: "codeswarm:mode:plan".into(),
+                        label: "Plan".into(),
+                    },
+                ],
+                current_mode: Some("codeswarm:mode:full-access".into()),
+            });
+            self.events.push_back(AgentEvent::Ready {
+                slot: self.slot,
+                capabilities: self.capabilities(),
+            });
+            Ok(())
+        }
+
+        async fn send_prompt(&mut self, prompt: String) -> super::AdapterResult<()> {
+            self.prompts.lock().expect("prompts").push(prompt);
+            if !self.crashed {
+                self.crashed = true;
+                self.events.push_back(AgentEvent::Failed {
+                    slot: self.slot,
+                    started: true,
+                    detail: "probe crashed".into(),
+                });
+            } else {
+                self.events.push_back(AgentEvent::Text {
+                    slot: self.slot,
+                    text: "recovered".into(),
+                });
+                self.events
+                    .push_back(AgentEvent::TurnComplete { slot: self.slot });
+            }
+            Ok(())
+        }
+
+        async fn cancel(&mut self) -> super::AdapterResult<bool> {
+            Ok(false)
+        }
+
+        async fn answer_permission(
+            &mut self,
+            _request_id: String,
+            _answer: PermissionAnswer,
+        ) -> super::AdapterResult<()> {
+            Err(super::AdapterError::Unsupported("permission answer"))
+        }
+
+        async fn set_mode(&mut self, _mode: String) -> super::AdapterResult<()> {
+            Ok(())
+        }
+
+        async fn reload(&mut self) -> super::AdapterResult<()> {
+            self.reloaded = true;
+            self.start().await
+        }
+
+        async fn stop(&mut self) -> super::AdapterResult<()> {
+            Ok(())
+        }
+
+        async fn next_event(&mut self) -> Option<super::AdapterResult<AgentEvent>> {
+            self.events.pop_front().map(Ok)
+        }
     }
 
     #[async_trait]
@@ -4642,7 +4830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_start_cleans_up_the_adapter_that_failed_startup() {
+    async fn relay_start_isolates_a_failed_adapter_and_keeps_healthy_peers() {
         let stopped = Arc::new(AtomicUsize::new(0));
         let mut relay = RelayHost::new(
             vec![
@@ -4666,7 +4854,10 @@ mod tests {
         )
         .expect("relay");
 
-        assert!(relay.start().await.is_err());
+        relay.start().await.expect("healthy peer remains available");
+        assert_eq!(relay.relay().active_slots().collect::<Vec<_>>(), [0]);
+        assert_eq!(stopped.load(Ordering::Relaxed), 1);
+        relay.stop().await.unwrap();
         assert_eq!(stopped.load(Ordering::Relaxed), 2);
     }
 
@@ -5060,6 +5251,53 @@ printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"timeou
     }
 
     #[tokio::test]
+    async fn native_crash_reaps_process_and_retries_on_next_prompt() {
+        let script_path = unique_test_path("codeswarm-agy-retry", "sh");
+        let marker_path = unique_test_path("codeswarm-agy-retry-marker", "txt");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\ncount=0\nif [ -f '{}' ]; then count=$(cat '{}'); fi\ncount=$((count + 1))\nprintf '%s' \"$count\" > '{}'\nif [ \"$count\" = 1 ]; then\n  printf '%s\\n' '{{\"event\":\"result\",\"result\":{{\"status\":\"FAILURE\",\"error\":\"first crash\"}}}}'\nelse\n  printf '%s\\n' '{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"recovered\"}}}}'\nfi\n",
+                marker_path.display(),
+                marker_path.display(),
+                marker_path.display(),
+            ),
+        )
+        .expect("write retry script");
+        let mut adapter = AgyAdapter::new(
+            0,
+            std::env::current_dir().expect("cwd"),
+            format!("sh {}", script_path.display()),
+        );
+        adapter.start().await.expect("start native adapter");
+        assert!(adapter.next_event().await.is_some());
+        assert!(adapter.next_event().await.is_some());
+        adapter
+            .send_prompt("first".into())
+            .await
+            .expect("first prompt");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Failed { detail, .. })) if detail == "first crash"
+        ));
+        adapter
+            .send_prompt("retry".into())
+            .await
+            .expect("retry prompt starts a fresh process");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Text { text, .. })) if text == "recovered"
+        ));
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::TurnComplete { .. }))
+        ));
+        adapter.stop().await.expect("stop native adapter");
+        std::fs::remove_file(script_path).expect("cleanup retry script");
+        std::fs::remove_file(marker_path).expect("cleanup retry marker");
+    }
+
+    #[tokio::test]
     async fn acp_adapter_initializes_session_and_completes_a_prompt() {
         let script = r#"read _; echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true}}}'; read _; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session-1","modes":{"currentModeId":"plan","availableModes":[{"id":"plan","name":"Plan"}]}}}'; read _; echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello"}}}}'; echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'"#;
         let cwd = std::env::current_dir().expect("cwd");
@@ -5418,6 +5656,120 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         assert!(adapter.start().await.is_err());
         assert!(adapter.child.is_none());
         assert!(adapter.reader.is_none());
+    }
+
+    #[tokio::test]
+    async fn acp_transport_crash_is_reloaded_before_the_next_prompt() {
+        let marker = unique_test_path("codeswarm-acp-retry", "count");
+        let script = format!(
+            r#"count=0
+if [ -f '{0}' ]; then count=$(cat '{0}'); fi
+count=$((count + 1))
+printf '%s' "$count" > '{0}'
+while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$request" in
+    *initialize*) printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"agentCapabilities":{{"loadSession":true}}}}}}' ;;
+    *session/new*) printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"sessionId":"saved-session"}}}}' ;;
+    *session/load*) printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{}}}}' ;;
+    *session/prompt*)
+      if [ "$count" = 1 ]; then exit 0; fi
+      printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"recovered"}}}}}}}}'
+      printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"stopReason":"end_turn"}}}}'
+      ;;
+  esac
+done
+"#,
+            marker.display()
+        );
+        let mut adapter = AcpAdapter::new(
+            0,
+            std::env::current_dir().expect("cwd"),
+            "sh",
+            vec!["-c".into(), script],
+        );
+        adapter.start().await.expect("initial ACP startup");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Ready { .. }))
+        ));
+        adapter
+            .send_prompt("first".into())
+            .await
+            .expect("first prompt");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Err(AdapterError::Transport(_)))
+        ));
+        assert!(adapter.child.is_none());
+        assert!(adapter.reader.is_none());
+        assert_eq!(adapter.session_id(), Some("saved-session".into()));
+
+        adapter.reload().await.expect("reload ACP transport");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Ready { .. }))
+        ));
+        adapter
+            .send_prompt("retry".into())
+            .await
+            .expect("retry prompt");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Text { text, .. })) if text == "recovered"
+        ));
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::TurnComplete { .. }))
+        ));
+        adapter.stop().await.expect("stop ACP");
+        std::fs::remove_file(marker).expect("cleanup marker");
+    }
+
+    #[tokio::test]
+    async fn coordinator_reload_replays_context_and_reintroduces_a_crashed_slot() {
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let healthy = ScriptedAdapter::new(
+            0,
+            AgentCapabilities::default(),
+            [
+                AgentEvent::Text {
+                    slot: 0,
+                    text: "peer context".into(),
+                },
+                AgentEvent::TurnComplete { slot: 0 },
+            ],
+        );
+        let probe = ReloadProbeAdapter {
+            slot: 1,
+            crashed: false,
+            reloaded: false,
+            events: VecDeque::new(),
+            prompts: Arc::clone(&prompts),
+        };
+        let mut relay = RelayHost::new(
+            vec![
+                AdapterHost::new(Box::new(healthy), None),
+                AdapterHost::new(Box::new(probe), None),
+            ],
+            8,
+        )
+        .expect("relay");
+        relay.start().await.expect("start");
+        relay
+            .run_turn("original task", 0)
+            .await
+            .expect("first turn");
+        relay.run_turn("", 0).await.expect("crashed turn");
+        relay.relay_mut().enqueue_human("retry", Some(1));
+        relay.run_turn("", 0).await.expect("reloaded turn");
+
+        let prompts = prompts.lock().expect("prompts");
+        let retry = prompts.last().expect("retry prompt");
+        assert!(retry.contains("You are Reload probe"), "{retry}");
+        assert!(retry.contains("original task"), "{retry}");
+        assert!(retry.contains("peer context"), "{retry}");
+        assert!(retry.contains("retry"), "{retry}");
     }
 
     #[tokio::test]
@@ -6273,7 +6625,7 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
     }
 
     #[tokio::test]
-    async fn relay_failure_is_tombstoned_and_reported_to_the_ui_sink() {
+    async fn relay_failure_is_skipped_for_one_batch_without_changing_the_roster() {
         let failed = ScriptedAdapter::new(
             0,
             AgentCapabilities::default(),
@@ -6301,9 +6653,12 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         relay.set_event_sink(move |event| captured.lock().expect("lock").push(event));
         relay.start().await.expect("start");
 
-        let error = relay.run_turn("task", 0).await.expect_err("failure");
-        assert!(error.to_string().contains("connection lost"));
-        assert_eq!(relay.relay().active_slots().collect::<Vec<_>>(), vec![1]);
+        assert!(matches!(
+            relay.run_turn("task", 0).await.expect("handled failure"),
+            crate::relay::RelayDecision::Dispatch { slot: 0, .. }
+        ));
+        assert_eq!(relay.relay().active_slots().collect::<Vec<_>>(), vec![0, 1]);
+        assert!(relay.relay().is_limited(0));
         assert!(events.lock().expect("lock").iter().any(|event| {
             matches!(
                 event,
@@ -6314,6 +6669,10 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                 }
             )
         }));
+        assert!(matches!(
+            relay.run_turn("", 0).await.expect("healthy peer"),
+            crate::relay::RelayDecision::Dispatch { slot: 1, .. }
+        ));
     }
 
     #[tokio::test]

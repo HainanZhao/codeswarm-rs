@@ -17,6 +17,10 @@ Install the published binary with Cargo:
 cargo install codeswarm --locked
 ```
 
+Claude and Codex use their locally installed `claude` and `codex` CLIs directly;
+CodeSwarm does not install or invoke an npm ACP bridge. Other built-in agents
+use their own native or ACP CLI commands.
+
 Or build the release binary from this repository:
 
 ```bash
@@ -51,9 +55,6 @@ codeswarm --project-dir ~/projects/example
 # A directory may also be supplied positionally.
 codeswarm ~/projects/example
 
-# Legacy entry-point spellings remain accepted:
-codeswarm run ~/projects/example
-codeswarm acp "codex-acp" ~/projects/example
 codeswarm --help
 ```
 
@@ -64,7 +65,10 @@ codeswarm --roster "acp:codex-acp" --roster "agy:agy" "review the patch"
 ```
 
 Catalog agents can also be selected by name with repeated `-a`/`--agent`
-options, for example `codeswarm run -a claude -a codex "review the patch"`.
+options, for example `codeswarm -a claude -a codex "review the patch"`.
+
+Claude and Codex use their locally installed `claude` and `codex` CLIs directly.
+CodeSwarm does not invoke `npx` or contact an npm registry during startup.
 
 Adapters are intentionally not forced through ACP. Native adapters and custom
 ACP commands can coexist in one roster.
@@ -147,10 +151,11 @@ uses your terminal's canvas and ANSI accent colors. Light and Dark use explicit
 palettes with readable text and status colors. `Ctrl+S` saves the choice;
 `Esc` restores the previous theme.
 
-`/settings` is also where live ACP models are selected. Highlight a running
+`/settings` is also where live agent models are selected. Highlight a running
 agent and use `←/→` to cycle the model catalog advertised by that agent, then
 press `Ctrl+S`. Agents that do not advertise model configuration show no
-synthetic choices.
+synthetic choices. Claude exposes documented aliases and full model IDs;
+Codex reads its locally cached model catalog when available.
 
 Relay context is incremental. Each agent receives the new human prompt and
 only public human/agent messages it has not seen since its previous turn. Tool

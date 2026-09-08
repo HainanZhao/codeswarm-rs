@@ -24,12 +24,14 @@
 - The coordinator owns the session record. Roster positions only express
   order; any agent may be dropped as long as at least one remains active.
   Each active agent persists its own optional provider session handle.
-- A failed adapter is tombstoned immediately so nothing can be dispatched to
-  a dead process, and the user is then offered a reload. Reloading puts a
-  fresh adapter in the same roster slot, reuses the session id only when the
-  dead adapter advertised session loading, and rewinds that slot's
-  shared-context watermark so its next turn replays the conversation it
-  missed. Declining leaves the agent dropped for the rest of the session.
+- A post-start adapter or usage-limit failure suppresses that slot only for
+  the rest of the current automated batch. The agent remains selected and is
+  retried on the next human prompt; the user may reload it or unselect it in
+  `/settings` after repeated failures. A startup failure stays unavailable
+  because no live adapter exists. Reloading puts a fresh adapter in the same
+  roster slot, reuses the session id only when the dead adapter advertised
+  session loading, and rewinds that slot's shared-context watermark so its
+  next turn replays the conversation it missed.
   Failures that happen after start-up carry `help="crashed"`; the default
   `help="fail"` text is about installing the agent and must not be shown for
   an adapter that started and then stopped.

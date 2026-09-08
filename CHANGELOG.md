@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.6] - 2026-09-08
+
+### Added
+
+- Replace the built-in Claude and Codex Node ACP bridges with native Rust
+  adapters. Shared process plumbing delivers prompts over stdin, forwards
+  streamed text, thoughts, tools, sessions, and models, and reaps cancelled
+  processes safely.
+
+### Fixed
+
+- Rebuild the coordinator's ordered public journal when continuing an archived
+  session, and replay missed context to agents whose previous turn was
+  interrupted or usage-limited without duplicating it for completed peers.
+- Hide ACP-advertised `/model` commands and direct manually entered `/model`
+  requests to CodeSwarm's per-agent model control under `/settings`.
+- Keep agents selected after post-start errors and usage-limit responses. A
+  failed slot is skipped only for the current automated batch and retried on
+  the next human prompt; permanent removal remains a user action.
+- Launch Claude and Codex through their locally installed native CLI executables
+  and detect those exact commands, avoiding runtime `npx` registry failures.
+
 ## [0.10.5] - 2026-09-08
 
 ### Added

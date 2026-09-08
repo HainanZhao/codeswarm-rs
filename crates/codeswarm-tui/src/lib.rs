@@ -203,6 +203,13 @@ fn local_command_spec(command: &str) -> Option<&'static CommandSpec> {
     LOCAL_COMMANDS.iter().find(|spec| spec.name == command)
 }
 
+fn blocked_provider_command(command: &str) -> bool {
+    command
+        .trim()
+        .trim_start_matches('/')
+        .eq_ignore_ascii_case("model")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigKey {
     Up,
@@ -1222,6 +1229,10 @@ impl App {
             .trim_start()
             .split_once(char::is_whitespace)
             .map_or("", |(_, rest)| rest.trim());
+        if blocked_provider_command(&command) {
+            self.status = "use /settings to choose a model for each agent".into();
+            return Some(LocalCommand::Handled);
+        }
         let spec = local_command_spec(&command);
         if let Some(spec) = spec
             && spec.name != "/agent"
@@ -2472,7 +2483,7 @@ impl App {
             .filter(|(slot, _)| {
                 self.agent_states
                     .get(slot)
-                    .is_none_or(|state| state != "dropped" && state != "error")
+                    .is_none_or(|state| state != "dropped" && state != "unavailable")
             })
             .map(|(_, modes)| modes)
             .map(|(modes, _)| modes.clone())
@@ -2544,9 +2555,9 @@ impl App {
             .keys()
             .copied()
             .filter(|slot| {
-                self.agent_states.get(slot).is_none_or(|state| {
-                    state != "dropped" && state != "error" && state != "limited"
-                })
+                self.agent_states
+                    .get(slot)
+                    .is_none_or(|state| state != "dropped" && state != "unavailable")
             })
             .collect()
     }
@@ -2627,7 +2638,7 @@ impl App {
                     && self
                         .agent_states
                         .get(candidate_slot)
-                        .is_none_or(|state| state != "dropped" && state != "error"))
+                        .is_none_or(|state| state != "dropped" && state != "unavailable"))
                 .then_some(*candidate_slot)
             })
             .collect::<Vec<_>>();
@@ -2684,12 +2695,12 @@ impl App {
             .filter(|slot| {
                 self.agent_states
                     .get(slot)
-                    .is_some_and(|state| state == "error")
+                    .is_some_and(|state| matches!(state.as_str(), "error" | "unavailable"))
             })
             .or_else(|| {
-                self.agent_states
-                    .iter()
-                    .find_map(|(slot, state)| (state == "error").then_some(*slot))
+                self.agent_states.iter().find_map(|(slot, state)| {
+                    matches!(state.as_str(), "error" | "unavailable").then_some(*slot)
+                })
             })
     }
 
@@ -3459,7 +3470,14 @@ impl App {
                 self.agent_states.insert(*slot, "working".into());
             }
             AgentEvent::CommandsReplaced { slot, commands } => {
-                self.agent_commands.insert(*slot, commands.clone());
+                self.agent_commands.insert(
+                    *slot,
+                    commands
+                        .iter()
+                        .filter(|command| !blocked_provider_command(&command.name))
+                        .cloned()
+                        .collect(),
+                );
                 self.refresh_prompt_completions();
             }
             AgentEvent::UsageUpdated { slot, usage } => {
@@ -3674,7 +3692,7 @@ impl App {
                 }
                 let name = self.agent_name(*slot);
                 self.status = format!(
-                    "{name} out of credits — routed around · /reload or manage agents in /settings once recharged ({detail})"
+                    "{name} out of credits — skipped for this batch and retried next prompt · unselect in /settings if it persists ({detail})"
                 );
             }
             AgentEvent::Failed {
@@ -3700,13 +3718,16 @@ impl App {
                     self.permission = None;
                 }
                 self.active_agent = self.agent_name(*slot);
-                self.agent_states.insert(*slot, "error".into());
+                self.agent_states
+                    .insert(*slot, if *started { "error" } else { "unavailable" }.into());
                 if self.next_agent == Some(*slot) {
                     self.next_agent = self.next_roster_slot_after(*slot);
                 }
                 self.failed_agent = Some(*slot);
                 self.status = if *started {
-                    format!("crashed: {detail} · /reload or remove in /settings")
+                    format!(
+                        "turn failed: {detail} · agent remains selected and retries next prompt; /reload or unselect in /settings"
+                    )
                 } else {
                     format!("failed to start: {detail}")
                 };
@@ -6703,7 +6724,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_limit_marks_the_agent_limited_until_reload() {
+    fn usage_limit_keeps_the_agent_selected_for_the_next_prompt() {
         let mut app = App::default();
         app.set_agent_name(0, "Codex");
         app.set_agent_name(1, "Claude");
@@ -6720,15 +6741,12 @@ mod tests {
             "status={:?}",
             app.status
         );
+        assert_eq!(app.active_roster_slots(), vec![0, 1]);
         assert!(
-            app.status.contains("/reload"),
-            "status should point at recovery: {:?}",
+            app.status.contains("retried next prompt"),
+            "{:?}",
             app.status
         );
-        assert_eq!(app.active_roster_slots(), vec![1]);
-        // A reload puts the agent back into the roster flow.
-        app.mark_agent_reloaded(0);
-        assert_eq!(app.active_roster_slots(), vec![0, 1]);
     }
 
     #[test]
@@ -7767,7 +7785,7 @@ mod tests {
         let mut app = App::default();
         app.set_prompt_completions(super::LOCAL_COMMANDS.iter().map(|spec| spec.name));
         for commands in [
-            vec!["/exit", "review", "/settings"],
+            vec!["/exit", "review", "/settings", "/model", "MODEL"],
             vec!["review-new"],
             vec![],
         ] {
@@ -7784,15 +7802,21 @@ mod tests {
             app.sync_prompt_editor();
             let suggestions = app.prompt_editor.slash_suggestions();
             assert!(suggestions.contains(&"/exit"));
-            assert!(
-                !suggestions
-                    .iter()
-                    .any(|command| matches!(*command, "/close" | "/quit" | "/config" | "/to"))
-            );
+            assert!(!suggestions.iter().any(|command| matches!(
+                *command,
+                "/close" | "/quit" | "/config" | "/to" | "/model" | "/MODEL"
+            )));
             assert_eq!(
                 app.handle_local_command("/review-new").is_none(),
                 commands.contains(&"review-new")
             );
+        }
+        for command in ["/model", "/MODEL opus"] {
+            assert_eq!(
+                app.handle_local_command(command),
+                Some(LocalCommand::Handled)
+            );
+            assert_eq!(app.status, "use /settings to choose a model for each agent");
         }
         app.prompt = "/ex".into();
         let mut terminal = Terminal::new(TestBackend::new(96, 16)).unwrap();
@@ -7958,6 +7982,50 @@ mod tests {
         assert_eq!(
             app.take_requested_mode(),
             Some("codeswarm:mode:plan".into())
+        );
+    }
+
+    #[test]
+    fn recoverable_error_stays_in_the_shared_mode_intersection() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Claude");
+        app.set_agent_name(1, "Codex");
+        for slot in [0, 1] {
+            app.apply_event(&codeswarm_adapters::AgentEvent::ModesReplaced {
+                slot,
+                modes: vec![
+                    codeswarm_adapters::Mode {
+                        id: "plan".into(),
+                        label: "Plan".into(),
+                    },
+                    codeswarm_adapters::Mode {
+                        id: "bypassPermissions".into(),
+                        label: "Full Access".into(),
+                    },
+                ],
+                current_mode: Some("bypassPermissions".into()),
+            });
+            app.apply_event(&codeswarm_adapters::AgentEvent::Ready {
+                slot,
+                capabilities: codeswarm_adapters::AgentCapabilities {
+                    supports_modes: true,
+                    ..Default::default()
+                },
+            });
+        }
+        app.apply_event(&codeswarm_adapters::AgentEvent::Failed {
+            slot: 1,
+            started: true,
+            detail: "crashed".into(),
+        });
+        let options = app
+            .mode_options()
+            .into_iter()
+            .map(|mode| mode.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            options,
+            ["codeswarm:mode:plan", "codeswarm:mode:full-access"]
         );
     }
 

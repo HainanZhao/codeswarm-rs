@@ -145,9 +145,8 @@ pub enum RelayDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Relay {
     active: Vec<bool>,
-    /// Slots whose provider plan is exhausted. Unlike a tombstone this is
-    /// expected to clear (recharge or reload), so queued prompts targeting a
-    /// limited slot are preserved instead of discarded.
+    /// Slots skipped for the remainder of the current automated batch after
+    /// a turn error. New human input clears these flags.
     limited: Vec<bool>,
     max_rounds: usize,
     rounds: usize,
@@ -225,15 +224,15 @@ impl Relay {
         Ok(())
     }
 
-    /// Flag a slot whose provider plan is exhausted. Routing skips it but its
-    /// queued prompts and roster identity are preserved for a later recharge.
+    /// Suppress a failed slot for the rest of the current automated batch.
+    /// Its roster identity and queued prompts remain intact.
     pub fn mark_limited(&mut self, slot: RosterSlot) -> Result<(), &'static str> {
         let limited = self.limited.get_mut(slot).ok_or("slot out of range")?;
         *limited = true;
         Ok(())
     }
 
-    /// Clear a usage-limit flag after a recharge or adapter reload.
+    /// Clear a temporary failure flag after a new prompt or adapter reload.
     pub fn clear_limited(&mut self, slot: RosterSlot) -> Result<(), &'static str> {
         let limited = self.limited.get_mut(slot).ok_or("slot out of range")?;
         *limited = false;
@@ -244,7 +243,7 @@ impl Relay {
         self.limited.get(slot).copied().unwrap_or(false)
     }
 
-    /// A slot is routable when it is active and not usage-limited.
+    /// A slot is routable when it is active and has not failed this batch.
     fn routable(&self, slot: RosterSlot) -> bool {
         self.active.get(slot).copied().unwrap_or(false)
             && !self.limited.get(slot).copied().unwrap_or(false)
@@ -392,6 +391,10 @@ impl Relay {
         self.context.mark_seen(slot);
     }
 
+    pub fn rewind_context(&mut self, slot: RosterSlot) {
+        self.context.rewind(slot);
+    }
+
     pub fn unseen_context(&mut self, slot: RosterSlot) -> String {
         self.context.unseen(slot)
     }
@@ -405,14 +408,22 @@ impl Relay {
 
     /// Select the next causal turn. Direct work always precedes steering work.
     pub fn begin(&mut self, initial_prompt: impl Into<String>, first: RosterSlot) -> RelayDecision {
+        let initial_prompt = initial_prompt.into();
         if self.paused {
             return RelayDecision::Paused;
         }
         if self.active_slots().next().is_none() {
             return RelayDecision::Collapsed;
         }
-        // Every live slot may be usage-limited; never spin the batch against
-        // an exhausted plan. The queued work survives for the next begin().
+        // A turn failure suppresses redispatch only for the remainder of its
+        // current automated batch. Every new human/direct prompt gets one
+        // fresh attempt without changing the user's roster selection.
+        if !initial_prompt.trim().is_empty() || !self.direct.is_empty() || !self.steering.is_empty()
+        {
+            self.limited.fill(false);
+        }
+        // Every live slot may have failed; never spin the current batch
+        // against those slots. Queued work survives for new human input.
         if !self.any_routable_except(usize::MAX) {
             self.stopped = true;
             return RelayDecision::Paused;
@@ -456,7 +467,7 @@ impl Relay {
             ),
             None => {
                 let slot = self.next_automatic_slot(first);
-                (slot, initial_prompt.into(), false, false)
+                (slot, initial_prompt, false, false)
             }
         };
         // A human steering prompt starts a fresh review batch. Even when it
@@ -489,7 +500,7 @@ impl Relay {
     /// turns never become shared relay context.
     pub fn finish(&mut self, slot: RosterSlot, direct: bool, accepted_stop: bool) {
         self.handoff_next = None;
-        self.next = Some(self.next_active(slot));
+        self.next = self.next_routable(slot);
         if !direct {
             self.previous_slot = Some(slot);
             self.participated[slot] = true;
@@ -518,8 +529,7 @@ impl Relay {
         }
     }
 
-    /// Pop the first queued prompt whose target is routable. Prompts aimed at
-    /// a limited slot stay queued until the slot recovers.
+    /// Pop the first queued prompt whose target is routable.
     fn pop_routable(
         active: &[bool],
         limited: &[bool],
@@ -539,10 +549,14 @@ impl Relay {
             .expect("callers require a routable roster")
     }
 
-    fn next_active(&self, slot: RosterSlot) -> RosterSlot {
+    fn next_routable(&self, slot: RosterSlot) -> Option<RosterSlot> {
         (1..=self.active.len())
             .map(|offset| (slot + offset) % self.active.len())
             .find(|candidate| self.routable(*candidate))
+    }
+
+    fn next_active(&self, slot: RosterSlot) -> RosterSlot {
+        self.next_routable(slot)
             .expect("callers require a routable roster")
     }
 
@@ -1061,29 +1075,27 @@ mod tests {
         relay.swap_agents(0, 2).expect("swap limited agent");
         assert!(relay.is_limited(0));
         assert!(!relay.is_limited(2));
-        assert!(matches!(
-            relay.begin("task", 0),
-            RelayDecision::Dispatch { slot: 1, .. }
-        ));
+        assert_eq!(relay.routable_slots().collect::<Vec<_>>(), [1, 2]);
     }
 
     #[test]
-    fn a_limited_slot_is_routed_around_until_cleared() {
+    fn a_failed_slot_is_routed_around_for_the_current_batch() {
         let mut relay = Relay::new(2, 10);
-        relay.mark_limited(0).expect("mark limited");
-        assert!(relay.is_limited(0));
         assert!(matches!(
             relay.begin("task", 0),
-            RelayDecision::Dispatch {
-                slot: 1,
-                can_stop: false,
-                ..
-            }
+            RelayDecision::Dispatch { slot: 0, .. }
+        ));
+        relay.mark_limited(0).expect("mark limited");
+        relay.finish(0, false, false);
+        assert!(relay.is_limited(0));
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch { slot: 1, .. }
         ));
         relay.finish(1, false, false);
-        // The ring still skips the limited slot after a full loop.
+        // The ring still skips the failed slot after a full loop.
         assert!(matches!(
-            relay.begin("again", 1),
+            relay.begin("", 1),
             RelayDecision::Dispatch { slot: 1, .. }
         ));
         relay.clear_limited(0).expect("clear limited");
@@ -1096,41 +1108,45 @@ mod tests {
     }
 
     #[test]
-    fn prompts_targeting_a_limited_slot_wait_for_recovery() {
+    fn a_new_human_prompt_retries_a_slot_skipped_in_the_previous_batch() {
         let mut relay = Relay::new(2, 10);
         relay.mark_limited(1).expect("mark limited");
         assert_eq!(relay.enqueue_direct(1, "private work"), Ok(true));
         assert!(matches!(
             relay.begin("task", 0),
-            RelayDecision::Dispatch { slot: 0, .. }
+            RelayDecision::Dispatch { slot: 1, direct: true, prompt, .. }
+                if prompt == "private work"
         ));
-        relay.finish(0, false, false);
-        // The direct prompt is not dropped while slot 1 is limited...
+        assert!(!relay.is_limited(1));
+
+        relay.mark_limited(0).expect("mark limited again");
+        relay.finish(1, true, false);
+        assert!(relay.enqueue_human("new public task", Some(0)));
         assert!(matches!(
             relay.begin("", 0),
             RelayDecision::Dispatch { slot: 0, .. }
         ));
-        relay.finish(0, false, false);
-        // ...and dispatches once the slot recovers.
-        relay.clear_limited(1).expect("clear limited");
-        assert!(matches!(
-            relay.begin("", 0),
-            RelayDecision::Dispatch { slot: 1, direct: true, prompt, .. } if prompt == "private work"
-        ));
+        assert!(!relay.is_limited(0));
     }
 
     #[test]
     fn an_all_limited_roster_pauses_instead_of_spinning() {
         let mut relay = Relay::new(2, 10);
+        assert!(matches!(
+            relay.begin("task", 0),
+            RelayDecision::Dispatch { slot: 0, .. }
+        ));
         relay.mark_limited(0).expect("mark limited");
         relay.mark_limited(1).expect("mark limited");
-        assert_eq!(relay.begin("task", 0), RelayDecision::Paused);
+        relay.finish(0, false, false);
+        assert_eq!(relay.begin("", 0), RelayDecision::Paused);
         // Queued work is preserved for the next begin().
         assert!(relay.enqueue_human("queued", Some(1)));
-        relay.clear_limited(1).expect("recharge one agent");
         assert!(matches!(
             relay.begin("", 0),
             RelayDecision::Dispatch { slot: 1, prompt, .. } if prompt == "queued"
         ));
+        assert!(!relay.is_limited(0));
+        assert!(!relay.is_limited(1));
     }
 }

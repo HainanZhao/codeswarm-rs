@@ -25,8 +25,8 @@ use codeswarm_adapters::persistence::{SessionMetadata, SessionMetadataStore};
 use codeswarm_adapters::relay::{CollaborationStrategy, RelayDecision};
 use codeswarm_adapters::settings;
 use codeswarm_adapters::{
-    AcpAdapter, AdapterError, AdapterHost, AdapterResult, AgentAdapter, AgyAdapter, RelayHost,
-    RelayPermissionAnswer, parse_command_line,
+    AcpAdapter, AdapterError, AdapterHost, AdapterResult, AgentAdapter, AgyAdapter, ClaudeAdapter,
+    CodexAdapter, RelayHost, RelayPermissionAnswer, parse_command_line,
 };
 use codeswarm_adapters::{AgentEvent, BufferedEventLog, EventLog};
 use crossterm::{
@@ -615,12 +615,17 @@ enum Launch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AgentSpec {
     Agy(String),
+    Claude(String),
+    Codex(String),
     Acp(String),
 }
 
 fn agent_spec_command(spec: &AgentSpec) -> &str {
     match spec {
-        AgentSpec::Agy(command) | AgentSpec::Acp(command) => command,
+        AgentSpec::Agy(command)
+        | AgentSpec::Claude(command)
+        | AgentSpec::Codex(command)
+        | AgentSpec::Acp(command) => command,
     }
 }
 
@@ -831,51 +836,16 @@ fn run_launch_session(launch: Launch, resume_requested: bool) -> std::io::Result
     result.and_then(|outcome| restore_result.map(|()| outcome))
 }
 
-/// Keep the compact flag-based interface while accepting the two documented
-/// Python-era entry-point spellings (`run` and `acp COMMAND`).
+/// Normalize the compact flag-based interface without introducing alternate
+/// command spellings. A positional directory remains a convenience alias for
+/// `--project-dir`.
 fn normalize_arguments(mut arguments: Vec<String>) -> Vec<String> {
-    match arguments.first().map(String::as_str) {
-        Some("run") => {
-            arguments.remove(0);
-            arguments
-        }
-        Some("acp") => {
-            arguments.remove(0);
-            let Some(command) = arguments.first().cloned() else {
-                return vec!["--acp".into()];
-            };
-            arguments.remove(0);
-            let mut normalized = vec!["--acp".into(), command];
-            // The legacy ACP subcommand's optional positional argument was a
-            // workspace path, not a prompt. Preserve that distinction.
-            if arguments
-                .first()
-                .is_some_and(|argument| !argument.starts_with('-'))
-            {
-                normalized.push("--project-dir".into());
-                normalized.push(arguments.remove(0));
-            }
-            normalized.extend(arguments);
-            normalized
-        }
-        _ => {
-            normalize_default_project_path(&mut arguments);
-            arguments
-        }
-    }
+    normalize_default_project_path(&mut arguments);
+    arguments
 }
 
 fn prepare_launch_arguments(arguments: Vec<String>) -> Vec<String> {
-    let explicit_run = arguments.first().is_some_and(|argument| argument == "run");
-    let mut arguments = normalize_arguments(arguments);
-    if explicit_run
-        && arguments
-            .first()
-            .is_some_and(|argument| !argument.starts_with('-') && looks_like_project_path(argument))
-    {
-        arguments.insert(0, "--project-dir".into());
-    }
-    arguments
+    normalize_arguments(arguments)
 }
 
 fn normalize_default_project_path(arguments: &mut Vec<String>) {
@@ -887,16 +857,6 @@ fn normalize_default_project_path(arguments: &mut Vec<String>) {
     }
 }
 
-fn looks_like_project_path(argument: &str) -> bool {
-    let path = PathBuf::from(argument);
-    path.is_dir()
-        || argument.starts_with('/')
-        || argument.starts_with("./")
-        || argument.starts_with("../")
-        || argument == "."
-        || argument == ".."
-}
-
 fn print_help() {
     println!(
         r#"CodeSwarm — fast full-screen terminal workspace
@@ -904,8 +864,6 @@ fn print_help() {
 Usage:
   codeswarm [OPTIONS] [PROMPT]
   codeswarm resume [PATH]
-  codeswarm run [PATH] [OPTIONS] [PROMPT]
-  codeswarm acp COMMAND [PATH]
 
 Options:
   -a, --agent NAME                Select a catalog agent (repeatable)
@@ -1169,18 +1127,98 @@ fn resume_launch_from_metadata(
                 .flatten()
         })
         .collect::<Vec<_>>();
+    let models = agents
+        .iter()
+        .map(|agent| {
+            agent
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
     if session_ids.iter().all(Option::is_none) {
         return Err("The previous agents did not provide a resumable session".into());
     }
     Ok(Launch::Roster {
         specs,
         identities: saved_identities,
-        models: Vec::new(),
+        models,
         session_ids,
         prompt: None,
         first_slot: 0,
         max_rounds: 100,
     })
+}
+
+fn update_saved_conversation_roster(
+    conversation: &mut product::SavedConversation,
+    roster: &[RosterSlot],
+    settings: &str,
+) -> Result<Vec<String>, String> {
+    let catalog = catalog_from_settings(settings);
+    let existing = conversation
+        .metadata
+        .get("agents")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut used = vec![false; existing.len()];
+    let mut agents = Vec::with_capacity(roster.len());
+    let mut names = Vec::with_capacity(roster.len());
+    for (slot, selection) in roster.iter().enumerate() {
+        let definition = catalog
+            .iter()
+            .find(|agent| agent.active && agent.identity.eq_ignore_ascii_case(&selection.agent))
+            .ok_or_else(|| format!("saved agent is no longer available: {}", selection.agent))?;
+        let previous = existing.iter().enumerate().find_map(|(index, agent)| {
+            (!used[index]
+                && agent
+                    .get("identity")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|identity| identity.eq_ignore_ascii_case(&selection.agent)))
+            .then_some((index, agent.clone()))
+        });
+        let mut agent = previous
+            .map(|(index, agent)| {
+                used[index] = true;
+                agent
+            })
+            .and_then(|agent| agent.as_object().cloned())
+            .unwrap_or_default();
+        agent.insert("slot".into(), serde_json::json!(slot));
+        agent.insert("name".into(), serde_json::json!(definition.name));
+        agent.insert("identity".into(), serde_json::json!(definition.identity));
+        agent.insert(
+            "protocol".into(),
+            serde_json::json!(match definition.adapter {
+                AdapterKind::Native => "native",
+                AdapterKind::Acp => "acp",
+            }),
+        );
+        agent.insert("command".into(), serde_json::json!(definition.command));
+        agent.insert("supports_load_session".into(), serde_json::json!(true));
+        if let Some(model) = &selection.model {
+            agent.insert("model".into(), serde_json::json!(model));
+        } else {
+            agent.remove("model");
+        }
+        names.push(definition.name.clone());
+        agents.push(serde_json::Value::Object(agent));
+    }
+    let mut metadata = conversation.metadata.clone();
+    metadata.insert("agents", serde_json::Value::Array(agents));
+    if let Some(id) = conversation.id.as_deref() {
+        let saved_metadata = metadata.clone();
+        product::archive_store()
+            .update_metadata(id, move |current| *current = saved_metadata)
+            .map_err(|error| error.to_string())?;
+        let saved_names = names.clone();
+        product::archive_store()
+            .update_entry(id, move |entry| entry.roster = saved_names)
+            .map_err(|error| error.to_string())?;
+    }
+    conversation.metadata = metadata;
+    Ok(names)
 }
 
 fn bare_launch_from_settings(settings: &str) -> Launch {
@@ -1238,8 +1276,23 @@ fn agent_spec(agent: &AgentDefinition) -> AgentSpec {
             |argument| append_command_argument(&agent.command, argument),
         );
     match agent.adapter {
-        AdapterKind::Native => AgentSpec::Agy(command),
+        AdapterKind::Native => match agent.identity.as_str() {
+            "claude.com" => AgentSpec::Claude(command),
+            "openai.com" => AgentSpec::Codex(command),
+            _ => AgentSpec::Agy(command),
+        },
         AdapterKind::Acp => AgentSpec::Acp(command),
+    }
+}
+
+fn configured_agent_spec(agent: &StoreAgent) -> AgentSpec {
+    if !agent.adapter.eq_ignore_ascii_case("native") {
+        return AgentSpec::Acp(agent.command.clone());
+    }
+    match agent.identity.to_ascii_lowercase().as_str() {
+        "claude.com" => AgentSpec::Claude(agent.command.clone()),
+        "openai.com" => AgentSpec::Codex(agent.command.clone()),
+        _ => AgentSpec::Agy(agent.command.clone()),
     }
 }
 
@@ -1316,6 +1369,8 @@ fn parse_agent_spec(value: &str) -> Option<AgentSpec> {
         return None;
     }
     match kind.to_ascii_lowercase().as_str() {
+        "claude" => Some(AgentSpec::Claude(command.to_owned())),
+        "codex" => Some(AgentSpec::Codex(command.to_owned())),
         "agy" | "native" => Some(AgentSpec::Agy(command.to_owned())),
         "acp" => Some(AgentSpec::Acp(command.to_owned())),
         _ => None,
@@ -1323,7 +1378,7 @@ fn parse_agent_spec(value: &str) -> Option<AgentSpec> {
 }
 
 fn display_agent_name(command: &str) -> String {
-    let Ok((program, arguments)) = parse_command_line(command) else {
+    let Ok((program, _arguments)) = parse_command_line(command) else {
         return "Agent".into();
     };
     let executable = Path::new(&program)
@@ -1331,22 +1386,9 @@ fn display_agent_name(command: &str) -> String {
         .and_then(OsStr::to_str)
         .unwrap_or(program.as_str())
         .to_ascii_lowercase();
-    let arguments = arguments
-        .iter()
-        .map(|argument| argument.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    if executable == "claude"
-        || arguments
-            .iter()
-            .any(|argument| argument.contains("claude-agent-acp"))
-    {
+    if executable == "claude" {
         "Claude".into()
-    } else if executable == "codex"
-        || executable == "codex-acp"
-        || arguments
-            .iter()
-            .any(|argument| argument.contains("codex-acp"))
-    {
+    } else if executable == "codex" {
         "Codex".into()
     } else if executable == "qwen" {
         "Qwen".into()
@@ -1941,11 +1983,7 @@ fn reconcile_config_roster(
             return Ok(false);
         } else {
             let agent = &desired[0];
-            let spec = if agent.adapter.eq_ignore_ascii_case("native") {
-                AgentSpec::Agy(agent.command.clone())
-            } else {
-                AgentSpec::Acp(agent.command.clone())
-            };
+            let spec = configured_agent_spec(agent);
             *pending_first = Some(agent.identity.clone());
             controls
                 .send(AdapterControl::Add {
@@ -2010,11 +2048,7 @@ fn reconcile_config_roster(
         if *occurrence <= live_counts.get(&key).copied().unwrap_or(0) {
             continue;
         }
-        let spec = if agent.adapter.eq_ignore_ascii_case("native") {
-            AgentSpec::Agy(agent.command.clone())
-        } else {
-            AgentSpec::Acp(agent.command.clone())
-        };
+        let spec = configured_agent_spec(agent);
         controls
             .send(AdapterControl::Add {
                 spec,
@@ -2371,12 +2405,19 @@ fn run_roster(
 ) -> std::io::Result<SessionOutcome> {
     let saved_resume = saved_chat_resume();
     let mut app = App::default();
+    let restored_context = restored
+        .as_ref()
+        .map(product::restored_relay_context)
+        .unwrap_or_default();
     if let Some(saved) = &restored {
         product::replay_conversation(&mut app, saved);
     }
     for (slot, spec) in specs.iter().enumerate() {
         let name = match spec {
-            AgentSpec::Agy(command) | AgentSpec::Acp(command) => command,
+            AgentSpec::Agy(command)
+            | AgentSpec::Claude(command)
+            | AgentSpec::Codex(command)
+            | AgentSpec::Acp(command) => command,
         };
         app.set_agent_name(slot, display_agent_name(name));
         if let Some(identity) = identities.get(slot) {
@@ -2395,6 +2436,7 @@ fn run_roster(
         if initial_direct { None } else { prompt },
         first_slot,
         max_rounds,
+        restored_context,
     );
     if initial_direct && let Some(prompt) = &initial_prompt {
         let _ = controls.send(AdapterControl::Direct {
@@ -2552,6 +2594,76 @@ async fn start_standalone(adapter: &mut impl AgentAdapter) -> AdapterResult<()> 
             .await?;
     }
     Ok(())
+}
+
+/// Reload a standalone ACP adapter at a turn boundary and forward its new
+/// catalogs/readiness before the next prompt. RelayHost owns this ordering for
+/// rosters; standalone `--acp` sessions need the same recovery contract.
+async fn reload_standalone_acp(
+    adapter: &mut AcpAdapter,
+    sender: &Sender<AdapterResult<AgentEvent>>,
+    desired_mode: &str,
+    desired_model: Option<&str>,
+) -> AdapterResult<()> {
+    adapter.reload().await?;
+    loop {
+        let event = adapter
+            .next_event()
+            .await
+            .ok_or_else(|| AdapterError::Transport("ACP ended during reload".into()))??;
+        let ready = matches!(event, AgentEvent::Ready { .. });
+        sender
+            .send(Ok(event))
+            .map_err(|_| AdapterError::Transport("standalone event receiver closed".into()))?;
+        if ready {
+            break;
+        }
+    }
+    if adapter.capabilities().supports_modes {
+        adapter.set_mode(desired_mode.to_owned()).await?;
+        if let Some(event) = adapter.next_event().await {
+            let event = event?;
+            sender
+                .send(Ok(event))
+                .map_err(|_| AdapterError::Transport("standalone event receiver closed".into()))?;
+        }
+    }
+    if let Some(model) = desired_model
+        && adapter.capabilities().supports_models
+    {
+        adapter.set_model(model.to_owned()).await?;
+        sender
+            .send(Ok(AgentEvent::ModelUpdated {
+                slot: 0,
+                current_model: model.to_owned(),
+            }))
+            .map_err(|_| AdapterError::Transport("standalone event receiver closed".into()))?;
+    }
+    Ok(())
+}
+
+async fn ensure_standalone_acp(
+    adapter: &mut AcpAdapter,
+    sender: &Sender<AdapterResult<AgentEvent>>,
+    desired_mode: &str,
+    desired_model: Option<&str>,
+) -> AdapterResult<()> {
+    if adapter.needs_restart() {
+        reload_standalone_acp(adapter, sender, desired_mode, desired_model).await
+    } else {
+        Ok(())
+    }
+}
+
+async fn send_standalone_acp_prompt(
+    adapter: &mut AcpAdapter,
+    sender: &Sender<AdapterResult<AgentEvent>>,
+    desired_mode: &str,
+    desired_model: Option<&str>,
+    prompt: String,
+) -> AdapterResult<()> {
+    ensure_standalone_acp(adapter, sender, desired_mode, desired_model).await?;
+    adapter.send_prompt(prompt).await
 }
 
 async fn await_startup(
@@ -2837,7 +2949,10 @@ fn run_acp_task(
         let mut goal = load_goal(&cwd, resume);
         if goal.is_some() { let _ = sender.send(Ok(AgentEvent::GoalUpdated { goal: goal.clone() })); }
         let mut turn_running = prompt.is_some();
+        let mut desired_mode = codeswarm_adapters::policy::DEFAULT_POLICY_ID.to_owned();
+        let mut desired_model: Option<String> = None;
         let mut pending_goals = VecDeque::new();
+        // Standalone ACP prompts use the recovery helper below at each turn.
         let mut startup_commands = match await_startup(start_standalone(&mut adapter), &mut controls).await {
             Ok(commands) => commands,
             Err(error) => { let _ = adapter.stop().await; let _ = sender.send(Err(error)); return; }
@@ -2853,7 +2968,15 @@ fn run_acp_task(
             &sender,
         );
         if let Some(prompt) = prompt {
-            if let Err(error) = adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt)).await {
+            if let Err(error) = send_standalone_acp_prompt(
+                &mut adapter,
+                &sender,
+                &desired_mode,
+                desired_model.as_deref(),
+                codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt),
+            )
+            .await
+            {
                 let _ = sender.send(Err(error));
                 let _ = adapter.stop().await;
                 if let Some(writer) = &metadata_writer {
@@ -2866,7 +2989,7 @@ fn run_acp_task(
         let mut response_tail = String::new();
         'events: loop {
             tokio::select! {
-                event = adapter.next_event() => match event {
+                event = adapter.next_event(), if !adapter.needs_restart() => match event {
                     Some(event) => {
                         match event {
                             Ok(event) => {
@@ -2908,7 +3031,15 @@ fn run_acp_task(
                 },
                 control = async { match startup_commands.pop_front() { Some(command) => Some(command), None => controls.recv().await } } => match control {
                     Some(AdapterControl::Prompt(prompt) | AdapterControl::FollowUp(prompt) | AdapterControl::Queue { slot: 0, prompt } | AdapterControl::Direct { slot: 0, prompt }) => {
-                        if let Err(error) = adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt)).await {
+                        if let Err(error) = send_standalone_acp_prompt(
+                            &mut adapter,
+                            &sender,
+                            &desired_mode,
+                            desired_model.as_deref(),
+                            codeswarm_adapters::goal::prompt(goal.as_ref(), &prompt),
+                        )
+                        .await
+                        {
                             let _ = sender.send(Err(error));
                         } else {
                             turn_running = true;
@@ -2927,7 +3058,15 @@ fn run_acp_task(
                                 let _ = sender.send(Ok(AgentEvent::GoalUpdated { goal: goal.clone() }));
                                 queue_standalone_metadata(metadata_writer.as_ref(), &cwd, &name, &identity, &command, &adapter, goal.as_ref(), &sender);
                                 if let Some(task) = task {
-                                    match adapter.send_prompt(codeswarm_adapters::goal::prompt(goal.as_ref(), &task)).await {
+                                    let result = send_standalone_acp_prompt(
+                                        &mut adapter,
+                                        &sender,
+                                        &desired_mode,
+                                        desired_model.as_deref(),
+                                        codeswarm_adapters::goal::prompt(goal.as_ref(), &task),
+                                    )
+                                    .await;
+                                    match result {
                                         Ok(()) => { turn_running = true; let _ = sender.send(Ok(AgentEvent::TurnStarted { slot: 0 })); }
                                         Err(error) => { let _ = sender.send(Err(error)); }
                                     }
@@ -2942,13 +3081,16 @@ fn run_acp_task(
                         }
                     }
                     Some(AdapterControl::SetMode(mode)) => {
-                        if let Err(error) = adapter.set_mode(mode).await {
+                        if let Err(error) = adapter.set_mode(mode.clone()).await {
                             let _ = sender.send(Err(error));
+                        } else {
+                            desired_mode = mode;
                         }
                     }
                     Some(AdapterControl::SetModel { model, .. }) => {
                         match adapter.set_model(model.clone()).await {
                             Ok(()) => {
+                                desired_model = Some(model.clone());
                                 let _ = sender.send(Ok(AgentEvent::ModelUpdated {
                                     slot: 0,
                                     current_model: model,
@@ -2962,7 +3104,14 @@ fn run_acp_task(
                     Some(AdapterControl::Reload(_)) => {
                         turn_running = false;
                         while let Some(command) = pending_goals.pop_back() { startup_commands.push_front(AdapterControl::Goal(command, None)); }
-                        if let Err(error) = adapter.reload().await {
+                        if let Err(error) = reload_standalone_acp(
+                            &mut adapter,
+                            &sender,
+                            &desired_mode,
+                            desired_model.as_deref(),
+                        )
+                        .await
+                        {
                             let _ = sender.send(Err(error));
                         }
                     }
@@ -2983,6 +3132,7 @@ fn run_acp_task(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_relay(
     specs: Vec<AgentSpec>,
     identities: Vec<String>,
@@ -2991,6 +3141,7 @@ fn spawn_relay(
     prompt: Option<String>,
     first_slot: usize,
     max_rounds: usize,
+    restored_context: Vec<product::RestoredRelayContext>,
 ) -> (
     Receiver<AdapterResult<AgentEvent>>,
     tokio::sync::mpsc::UnboundedSender<AdapterControl>,
@@ -3009,6 +3160,7 @@ fn spawn_relay(
             prompt,
             first_slot,
             max_rounds,
+            restored_context,
         )
     });
     (receiver, controls, worker)
@@ -3177,6 +3329,7 @@ fn run_relay_task(
     prompt: Option<String>,
     first_slot: usize,
     max_rounds: usize,
+    restored_context: Vec<product::RestoredRelayContext>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -3194,14 +3347,17 @@ fn run_relay_task(
         let roster_names = specs
             .iter()
             .map(|spec| match spec {
-                AgentSpec::Agy(command) | AgentSpec::Acp(command) => display_agent_name(command),
+                AgentSpec::Agy(command)
+                | AgentSpec::Claude(command)
+                | AgentSpec::Codex(command)
+                | AgentSpec::Acp(command) => display_agent_name(command),
             })
             .collect::<Vec<_>>();
         let roster_launch_specs = specs
             .iter()
             .map(|spec| {
                 let protocol = match spec {
-                    AgentSpec::Agy(_) => "native",
+                    AgentSpec::Agy(_) | AgentSpec::Claude(_) | AgentSpec::Codex(_) => "native",
                     AgentSpec::Acp(_) => "acp",
                 };
                 (protocol.to_owned(), agent_spec_command(spec).to_owned())
@@ -3220,6 +3376,34 @@ fn run_relay_task(
                             || AgyAdapter::new(slot, cwd.clone(), command.clone()),
                             |session_id| {
                                 AgyAdapter::with_session_id(
+                                    slot,
+                                    cwd.clone(),
+                                    command.clone(),
+                                    session_id,
+                                )
+                            },
+                        );
+                        Ok(Box::new(adapter) as Box<dyn AgentAdapter>)
+                    }
+                    AgentSpec::Claude(command) => {
+                        let adapter = session_id.as_ref().map_or_else(
+                            || ClaudeAdapter::new(slot, cwd.clone(), command.clone()),
+                            |session_id| {
+                                ClaudeAdapter::with_session_id(
+                                    slot,
+                                    cwd.clone(),
+                                    command.clone(),
+                                    session_id,
+                                )
+                            },
+                        );
+                        Ok(Box::new(adapter) as Box<dyn AgentAdapter>)
+                    }
+                    AgentSpec::Codex(command) => {
+                        let adapter = session_id.as_ref().map_or_else(
+                            || CodexAdapter::new(slot, cwd.clone(), command.clone()),
+                            |session_id| {
+                                CodexAdapter::with_session_id(
                                     slot,
                                     cwd.clone(),
                                     command.clone(),
@@ -3274,6 +3458,7 @@ fn run_relay_task(
         relay.set_roster_identities(identities);
         relay.set_roster_launch_specs(roster_launch_specs);
         relay.set_session_metadata_workspace(cwd.display().to_string());
+        restore_relay_context(&mut relay, restored_context);
         if let Some(writer) = runtime_metadata_writer(&cwd, &sender) {
             relay.set_session_metadata_writer(writer);
         }
@@ -3559,6 +3744,14 @@ fn run_relay_task(
                             Ok(Box::new(AgyAdapter::new(slot, cwd.clone(), command))
                                 as Box<dyn AgentAdapter>)
                         }
+                        AgentSpec::Claude(command) => {
+                            Ok(Box::new(ClaudeAdapter::new(slot, cwd.clone(), command))
+                                as Box<dyn AgentAdapter>)
+                        }
+                        AgentSpec::Codex(command) => {
+                            Ok(Box::new(CodexAdapter::new(slot, cwd.clone(), command))
+                                as Box<dyn AgentAdapter>)
+                        }
                         AgentSpec::Acp(command) => match parse_command_line(&command) {
                             Ok((program, args)) => {
                                 Ok(Box::new(AcpAdapter::new(slot, cwd.clone(), program, args))
@@ -3572,7 +3765,10 @@ fn run_relay_task(
                     match adapter {
                         Ok(adapter) => {
                             let name = match spec {
-                                AgentSpec::Agy(command) | AgentSpec::Acp(command) => {
+                                AgentSpec::Agy(command)
+                                | AgentSpec::Claude(command)
+                                | AgentSpec::Codex(command)
+                                | AgentSpec::Acp(command) => {
                                     display_agent_name(&command)
                                 }
                             };
@@ -3611,6 +3807,21 @@ fn run_relay_task(
         }
         let _ = relay.stop().await;
     });
+}
+
+fn restore_relay_context(relay: &mut RelayHost, actions: Vec<product::RestoredRelayContext>) {
+    for action in actions {
+        match action {
+            product::RestoredRelayContext::SharedTask(task) => {
+                relay.relay_mut().set_shared_task(task)
+            }
+            product::RestoredRelayContext::Public { speaker, text } => {
+                relay.relay_mut().record_public(speaker, text)
+            }
+            product::RestoredRelayContext::Seen(slot) => relay.relay_mut().mark_context_seen(slot),
+            product::RestoredRelayContext::Rewind(slot) => relay.relay_mut().rewind_context(slot),
+        }
+    }
 }
 
 /// Bound the work performed between terminal frames. Adapter output is
@@ -3814,13 +4025,17 @@ fn run_terminal(
                                     mode_capable_slots.remove(slot);
                                 }
                             }
-                            AgentEvent::Failed { slot, .. } => {
-                                mode_catalog_slots.remove(slot);
-                                mode_capable_slots.remove(slot);
+                            AgentEvent::Failed { slot, started, .. } => {
+                                // Post-start failures remain recoverable and
+                                // retain their advertised mode catalog for
+                                // settings/policy intersection. Startup
+                                // failures are unavailable until reloaded.
+                                if !started {
+                                    mode_catalog_slots.remove(slot);
+                                    mode_capable_slots.remove(slot);
+                                }
                             }
-                            AgentEvent::UsageLimitReached { slot, .. } => {
-                                mode_catalog_slots.remove(slot);
-                                mode_capable_slots.remove(slot);
+                            AgentEvent::UsageLimitReached { .. } => {
                                 turn_active = false;
                                 cancel_requested_at = None;
                             }
@@ -4182,8 +4397,39 @@ fn run_terminal(
                             if controls.is_none() {
                                 match save_roster_slots(&roster) {
                                     Ok(()) => {
-                                        app.mark_config_roster_saved();
-                                        app.status = "roster saved for the next launch".into();
+                                        if let Some(conversation) = &mut saved_conversation {
+                                            let settings = settings_path()
+                                                .and_then(|path| std::fs::read_to_string(path).ok())
+                                                .unwrap_or_default();
+                                            match update_saved_conversation_roster(
+                                                conversation,
+                                                &roster,
+                                                &settings,
+                                            ) {
+                                                Ok(names) => {
+                                                    let old_count = app.agent_count();
+                                                    for slot in 0..old_count {
+                                                        app.remove_agent(slot);
+                                                    }
+                                                    product::seed_saved_roster(
+                                                        app,
+                                                        &names,
+                                                        &conversation.metadata,
+                                                    );
+                                                    app.mark_config_roster_saved();
+                                                    app.status =
+                                                        "roster saved for resumed session".into();
+                                                }
+                                                Err(error) => {
+                                                    app.status = format!(
+                                                        "unable to update resumed roster: {error}"
+                                                    )
+                                                }
+                                            }
+                                        } else {
+                                            app.mark_config_roster_saved();
+                                            app.status = "roster saved for the next launch".into();
+                                        }
                                     }
                                     Err(error) => {
                                         app.status = format!("unable to save roster: {error}");
@@ -4417,7 +4663,7 @@ fn run_terminal(
                             && let Some(conversation) = &saved_conversation
                         {
                             let slot = app.next_agent_slot().expect("guarded recipient");
-                            if product::resumable_slots(&conversation.metadata).contains(&slot) {
+                            if product::continuable_slots(&conversation.metadata).contains(&slot) {
                                 return Ok(SessionOutcome::ContinueSaved {
                                     conversation: Box::new(conversation.clone()),
                                     prompt: app.take_prompt(),
@@ -4529,7 +4775,7 @@ fn run_terminal(
                                                     if let Some(prompt) = task {
                                                         let slot =
                                                             app.next_agent_slot().unwrap_or(0);
-                                                        if product::resumable_slots(
+                                                        if product::continuable_slots(
                                                             &conversation.metadata,
                                                         )
                                                         .contains(&slot)
@@ -4714,7 +4960,8 @@ fn run_terminal(
                             {
                                 let slot =
                                     selected_slot.or_else(|| app.next_agent_slot()).unwrap_or(0);
-                                if product::resumable_slots(&conversation.metadata).contains(&slot)
+                                if product::continuable_slots(&conversation.metadata)
+                                    .contains(&slot)
                                 {
                                     return Ok(SessionOutcome::ContinueSaved {
                                         conversation: Box::new(conversation.clone()),
@@ -5042,18 +5289,20 @@ mod tests {
         mouse_scroll_delta, next_event_batch, normalize_arguments, normalize_selected_slot,
         parse_launch, prepare_launch_arguments, program_available, project_dir_argument,
         project_prompt_history_path, reconcile_config_roster,
-        rejection_interrupts_roster_reconcile, resume_launch_from_metadata,
+        rejection_interrupts_roster_reconcile, restore_relay_context, resume_launch_from_metadata,
         run_relay_sequence_with_controls, sanitize_direct_event, save_roster_slots_at,
         session_metadata_path_for, should_apply_configured_models, standalone_session_metadata,
-        terminal_capture_enabled_for, validate_project_directory,
+        terminal_capture_enabled_for, update_saved_conversation_roster, validate_project_directory,
     };
+    use crate::product;
     use async_trait::async_trait;
     use codeswarm::tui::{App, ConfigKey, PermissionAction, QueuedPrompt, StoreAgent};
+    use codeswarm_adapters::launcher::RosterSlot;
     use codeswarm_adapters::persistence::{SessionMetadata, SessionMetadataStore};
+    use codeswarm_adapters::{AdapterError, AgentCapabilities, AgentEvent, PermissionAnswer};
     use codeswarm_adapters::{
         AdapterHost, AdapterResult, AgentAdapter, RelayHost, ScriptedAdapter,
     };
-    use codeswarm_adapters::{AgentCapabilities, AgentEvent, PermissionAnswer};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
     use ratatui::{buffer::Buffer, style::Modifier};
     use std::ffi::OsStr;
@@ -5187,6 +5436,81 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn standalone_acp_reconnects_before_the_next_prompt() {
+        let marker = std::env::temp_dir().join(format!(
+            "codeswarm-standalone-acp-retry-{}",
+            std::process::id()
+        ));
+        let script_path = std::env::temp_dir().join(format!(
+            "codeswarm-standalone-acp-retry-{}.sh",
+            std::process::id()
+        ));
+        let script = format!(
+            r#"count=0
+if [ -f '{0}' ]; then count=$(cat '{0}'); fi
+count=$((count + 1))
+printf '%s' "$count" > '{0}'
+while IFS= read -r request; do
+  id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$request" in
+    *initialize*) printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"agentCapabilities":{{"loadSession":true}}}}}}' ;;
+    *session/new*) printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"sessionId":"standalone-session"}}}}' ;;
+    *session/load*) printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{}}}}' ;;
+    *session/set_mode*) printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{}}}}' ;;
+    *session/prompt*)
+      if [ "$count" = 1 ]; then exit 0; fi
+      printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"recovered"}}}}}}}}'
+      printf '%s\n' '{{"jsonrpc":"2.0","id":'$id',"result":{{"stopReason":"end_turn"}}}}'
+      ;;
+  esac
+done
+"#,
+            marker.display()
+        );
+        std::fs::write(&script_path, script).expect("write ACP retry script");
+        let (events, controls, worker) =
+            super::spawn_acp(format!("sh {}", script_path.display()), None, false);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let recv = |events: &std::sync::mpsc::Receiver<AdapterResult<AgentEvent>>| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            events.recv_timeout(remaining).expect("standalone event")
+        };
+        loop {
+            if matches!(recv(&events), Ok(AgentEvent::Ready { .. })) {
+                break;
+            }
+        }
+        controls
+            .send(AdapterControl::Prompt("first".into()))
+            .expect("first prompt control");
+        let mut saw_failure = false;
+        while !saw_failure {
+            saw_failure = matches!(recv(&events), Err(AdapterError::Transport(_)));
+        }
+        controls
+            .send(AdapterControl::Prompt("retry".into()))
+            .expect("retry prompt control");
+        let mut recovered = false;
+        let mut completed = false;
+        while !completed {
+            match recv(&events) {
+                Ok(AgentEvent::Text { text, .. }) if text == "recovered" => recovered = true,
+                Ok(AgentEvent::TurnComplete { .. }) => completed = true,
+                Ok(_) => {}
+                Err(error) => panic!("retry failed: {error}"),
+            }
+        }
+        assert!(recovered);
+        controls.send(AdapterControl::Stop).expect("stop control");
+        worker
+            .expect("standalone worker")
+            .join()
+            .expect("worker join");
+        std::fs::remove_file(marker).expect("cleanup marker");
+        std::fs::remove_file(script_path).expect("cleanup script");
     }
 
     #[test]
@@ -5914,34 +6238,126 @@ mod tests {
     }
 
     #[test]
+    fn offline_resume_settings_can_add_a_fresh_agent_to_saved_peers() {
+        let root = std::env::temp_dir().join(format!(
+            "codeswarm-offline-roster-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut conversation = product::SavedConversation {
+            id: None,
+            roster: vec!["Codex".into()],
+            metadata: SessionMetadata::new(
+                serde_json::json!({
+                    "cwd": root.display().to_string(),
+                    "agents": [{
+                        "slot": 0, "name": "Codex", "identity": "openai.com",
+                        "protocol": "acp", "command": "codex-acp",
+                        "supports_load_session": true, "session_id": "codex-session"
+                    }]
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            events: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let roster = vec![
+            RosterSlot {
+                agent: "openai.com".into(),
+                model: Some("gpt".into()),
+            },
+            RosterSlot {
+                agent: "claude.com".into(),
+                model: None,
+            },
+        ];
+
+        assert_eq!(
+            update_saved_conversation_roster(&mut conversation, &roster, "{}").unwrap(),
+            ["Codex", "Claude"]
+        );
+        assert_eq!(product::continuable_slots(&conversation.metadata), [0, 1]);
+        assert!(matches!(
+            resume_launch_from_metadata(&conversation.metadata, &root, "{}"),
+            Ok(Launch::Roster { specs, session_ids, models, .. })
+                if specs.len() == 2
+                    && session_ids == [Some("codex-session".into()), None]
+                    && models == [Some("gpt".into()), None]
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resumed_relay_replays_public_context_to_limited_and_unseen_agents() {
+        let conversation = product::SavedConversation {
+            id: Some("saved".into()),
+            roster: vec!["Claude".into(), "Codex".into(), "Antigravity".into()],
+            metadata: SessionMetadata::empty(),
+            events: vec![
+                product::SavedEvent::Human {
+                    text: "original task".into(),
+                    direct: false,
+                },
+                product::SavedEvent::Agent(AgentEvent::TurnStarted { slot: 0 }),
+                product::SavedEvent::Agent(AgentEvent::Text {
+                    slot: 0,
+                    text: "Claude result".into(),
+                }),
+                product::SavedEvent::Agent(AgentEvent::TurnComplete { slot: 0 }),
+                product::SavedEvent::Agent(AgentEvent::TurnStarted { slot: 1 }),
+                product::SavedEvent::Agent(AgentEvent::UsageLimitReached {
+                    slot: 1,
+                    detail: "quota exhausted".into(),
+                }),
+                product::SavedEvent::Human {
+                    text: "private note".into(),
+                    direct: true,
+                },
+            ],
+            warnings: Vec::new(),
+        };
+        let hosts = (0..3)
+            .map(|slot| {
+                AdapterHost::new(
+                    Box::new(ScriptedAdapter::new(slot, AgentCapabilities::default(), [])),
+                    None,
+                )
+            })
+            .collect();
+        let mut relay = RelayHost::new(hosts, 10).unwrap();
+        restore_relay_context(&mut relay, product::restored_relay_context(&conversation));
+
+        assert_eq!(relay.relay_mut().unseen_context(0), "");
+        for slot in [1, 2] {
+            let unseen = relay.relay_mut().unseen_context(slot);
+            assert!(unseen.contains("original task"), "{unseen}");
+            assert!(unseen.contains("Claude result"), "{unseen}");
+            assert!(!unseen.contains("private note"), "{unseen}");
+        }
+        assert_eq!(relay.relay().shared_task(), Some("original task"));
+    }
+
+    #[test]
     fn parses_native_agent_prompt_without_treating_it_as_acp() {
         assert!(matches!(
             parse_launch(&["--agy".into(), "summarize".into()]),
             Some(Launch::Agy { prompt: Some(prompt) }) if prompt == "summarize"
         ));
-    }
-
-    #[test]
-    fn accepts_help_era_entry_point_aliases_without_reinterpreting_arguments() {
         assert_eq!(
-            normalize_arguments(vec!["run".into(), "/tmp".into()]),
-            vec![String::from("/tmp")]
+            super::parse_agent_spec("claude:claude"),
+            Some(AgentSpec::Claude("claude".into()))
         );
         assert_eq!(
-            normalize_arguments(vec!["acp".into(), "codex-acp".into(), "/tmp".into()]),
-            vec![
-                String::from("--acp"),
-                String::from("codex-acp"),
-                String::from("--project-dir"),
-                String::from("/tmp"),
-            ]
+            super::parse_agent_spec("codex:codex"),
+            Some(AgentSpec::Codex("codex".into()))
         );
     }
 
     #[test]
-    fn run_path_stays_separate_from_named_agent_options_and_prompt() {
+    fn project_path_stays_separate_from_named_agent_options_and_prompt() {
         let arguments = prepare_launch_arguments(vec![
-            "run".into(),
             "/tmp".into(),
             "--agent".into(),
             "claude".into(),
@@ -5958,8 +6374,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_run_can_take_a_prompt_without_a_workspace_path() {
-        let arguments = prepare_launch_arguments(vec!["run".into(), "summarize this".into()]);
+    fn a_prompt_without_a_workspace_path_remains_positional() {
+        let arguments = prepare_launch_arguments(vec!["summarize this".into()]);
         assert_eq!(arguments, vec!["summarize this"]);
     }
 
@@ -6060,12 +6476,7 @@ mod tests {
             super::catalog_identity_for_command("agy --dangerously-skip-permissions"),
             "antigravity.google.com"
         );
-        assert_eq!(
-            super::catalog_identity_for_command(
-                "npx -y --package=@agentclientprotocol/codex-acp codex-acp",
-            ),
-            "openai.com"
-        );
+        assert_eq!(super::catalog_identity_for_command("codex"), "openai.com");
     }
 
     #[test]
@@ -6515,8 +6926,8 @@ mod tests {
             ]),
             Some(Launch::Roster { specs, prompt: Some(prompt), first_slot: 1, .. })
                 if specs == [
-                    AgentSpec::Acp("npx -y @agentclientprotocol/claude-agent-acp".into()),
-                    AgentSpec::Acp("npx -y --package=@agentclientprotocol/codex-acp codex-acp".into()),
+                    AgentSpec::Claude("claude".into()),
+                    AgentSpec::Codex("codex".into()),
                 ] && prompt == "review the patch"
         ));
     }
@@ -6546,7 +6957,7 @@ mod tests {
             ),
             Launch::Roster { specs, prompt: None, first_slot: 0, max_rounds: 100, .. }
                 if specs == [
-                    AgentSpec::Acp("npx -y --package=@agentclientprotocol/codex-acp codex-acp".into()),
+                    AgentSpec::Codex("codex".into()),
                     AgentSpec::Agy("agy --dangerously-skip-permissions".into())
                 ]
         ));
@@ -6611,7 +7022,7 @@ mod tests {
                     identity: "claude.com".into(),
                     name: "Claude".into(),
                     adapter: "ACP".into(),
-                    command: "npx -y @agentclientprotocol/claude-agent-acp".into(),
+                    command: "claude-agent-acp".into(),
                     available: true,
                     selected: true,
                     model: Some("default".into()),
@@ -6634,7 +7045,7 @@ mod tests {
             identity: "claude.com".into(),
             name: "Claude".into(),
             adapter: "ACP".into(),
-            command: "npx -y @agentclientprotocol/claude-agent-acp".into(),
+            command: "claude-agent-acp".into(),
             available: true,
             selected: true,
             model: None,

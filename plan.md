@@ -127,8 +127,8 @@ Completed on branch \`rewrite/rust-ratatui-architecture\`:
   public context.
 - [x] Restored Python-compatible prompt-history records and atomic user settings
   updates, including malformed-input preservation and file-mode safety.
-- [x] Added legacy `run`/`acp` entry-point aliases, `--help`, `--version`,
-  optional standalone prompts, bounded ACP framing, and bounded stderr.
+- [x] Added the flag-based `--help`/`--version` entry points, optional
+  standalone prompts, bounded ACP framing, and bounded stderr.
 - [x] Added root-bound ACP filesystem mediation and asynchronous client-side
   terminal create/output/wait/kill/release handling.
 - [x] Added per-roster first-turn identity/collaborator introductions and

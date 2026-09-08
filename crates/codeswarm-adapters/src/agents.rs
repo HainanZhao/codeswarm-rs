@@ -100,8 +100,8 @@ pub fn default_catalog() -> Vec<AgentDefinition> {
             "claude.com",
             "Claude",
             "claude",
-            AdapterKind::Acp,
-            "npx -y @agentclientprotocol/claude-agent-acp",
+            AdapterKind::Native,
+            "claude",
             "claude",
             &[],
             None,
@@ -120,8 +120,8 @@ pub fn default_catalog() -> Vec<AgentDefinition> {
             "openai.com",
             "Codex",
             "codex",
-            AdapterKind::Acp,
-            "npx -y --package=@agentclientprotocol/codex-acp codex-acp",
+            AdapterKind::Native,
+            "codex",
             "codex",
             &["openai"],
             None,
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn builtins_keep_python_aliases_and_detect_real_cli_not_npx_bridge() {
+    fn builtins_keep_aliases_and_detect_the_exact_local_bridge() {
         let catalog = default_catalog();
         let antigravity = catalog
             .iter()
@@ -303,10 +303,16 @@ mod tests {
             .expect("codex");
         assert_eq!(codex.aliases, ["openai"]);
         assert_eq!(codex.detect_command.as_deref(), Some("codex"));
-        assert_ne!(
+        assert_eq!(
             codex.detect_command.as_deref(),
             Some(codex.command.as_str())
         );
+        let claude = catalog
+            .iter()
+            .find(|agent| agent.identity == "claude.com")
+            .expect("claude");
+        assert_eq!(claude.command, "claude");
+        assert_eq!(claude.detect_command.as_deref(), Some("claude"));
         let gemini = catalog
             .iter()
             .find(|agent| agent.identity == "geminicli.com")
