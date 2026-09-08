@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use codeswarm::transcript::{BlockKind, fixtures};
 use codeswarm::tui::{
     App, ConfigAction, ConfigKey, FooterAction, Input, Key as TuiKey, LocalCommand,
@@ -39,7 +40,7 @@ use crossterm::{
         EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
     },
 };
-use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
+use ratatui::{Terminal, backend::CrosstermBackend, buffer::Buffer, layout::Rect, style::Modifier};
 use sha2::{Digest, Sha256};
 
 fn terminal_capture_enabled_for(
@@ -87,6 +88,100 @@ const MAX_WHEEL_EVENTS_PER_FRAME: usize = 256;
 #[derive(Default)]
 struct WheelScroll {
     last_applied: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TextSelection {
+    anchor: Option<(u16, u16)>,
+    cursor: Option<(u16, u16)>,
+    dragged: bool,
+}
+
+impl TextSelection {
+    fn begin(&mut self, column: u16, row: u16) {
+        self.anchor = Some((column, row));
+        self.cursor = Some((column, row));
+        self.dragged = false;
+    }
+
+    fn drag_to(&mut self, column: u16, row: u16) {
+        if self.anchor.is_some() {
+            self.cursor = Some((column, row));
+            self.dragged |= self.anchor != self.cursor;
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn bounds(&self) -> Option<((u16, u16), (u16, u16))> {
+        let anchor = self.anchor?;
+        let cursor = self.cursor?;
+        Some(if (anchor.1, anchor.0) <= (cursor.1, cursor.0) {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        })
+    }
+
+    fn highlight(&self, buffer: &mut Buffer) {
+        let Some(((start_x, start_y), (end_x, end_y))) = self.bounds() else {
+            return;
+        };
+        let area = *buffer.area();
+        for y in start_y.max(area.y)..=end_y.min(area.bottom().saturating_sub(1)) {
+            let left = if y == start_y { start_x } else { area.x };
+            let right = if y == end_y {
+                end_x
+            } else {
+                area.right().saturating_sub(1)
+            };
+            for x in left.max(area.x)..=right.min(area.right().saturating_sub(1)) {
+                if let Some(cell) = buffer.cell_mut((x, y)) {
+                    cell.modifier.insert(Modifier::REVERSED);
+                }
+            }
+        }
+    }
+
+    fn selected_text(&self, buffer: &Buffer) -> Option<String> {
+        if !self.dragged {
+            return None;
+        }
+        let ((start_x, start_y), (end_x, end_y)) = self.bounds()?;
+        let area = *buffer.area();
+        if start_y >= area.bottom() || end_y < area.y {
+            return None;
+        }
+        let mut lines = Vec::new();
+        for y in start_y.max(area.y)..=end_y.min(area.bottom().saturating_sub(1)) {
+            let left = if y == start_y { start_x } else { area.x };
+            let right = if y == end_y {
+                end_x
+            } else {
+                area.right().saturating_sub(1)
+            };
+            let mut line = String::new();
+            for x in left.max(area.x)..=right.min(area.right().saturating_sub(1)) {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    line.push_str(cell.symbol());
+                }
+            }
+            lines.push(line.trim_end().to_owned());
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        let text = lines.join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+}
+
+fn copy_text_to_terminal_clipboard(output: &mut impl Write, text: &str) -> std::io::Result<()> {
+    let encoded = BASE64.encode(text.as_bytes());
+    write!(output, "\x1b]52;c;{encoded}\x07")?;
+    output.flush()
 }
 
 impl WheelScroll {
@@ -151,19 +246,6 @@ fn request_agent_reload(
     } else {
         app.status = "no silent or crashed agent to reload".into();
     }
-}
-
-fn restore_mouse_after_selection_window(
-    output: &mut impl Write,
-    deadline: &mut Option<Instant>,
-    now: Instant,
-) -> std::io::Result<bool> {
-    if !deadline.is_some_and(|deadline| now >= deadline) {
-        return Ok(false);
-    }
-    execute!(output, EnableMouseCapture)?;
-    *deadline = None;
-    Ok(true)
 }
 
 #[derive(Debug)]
@@ -838,7 +920,7 @@ Options:
   -h, --help                      Show this help
   -v, --version                   Show the version
 
-Prompt commands include /help, /settings, /goal, /cancel, /reload, /agent, /select,
+Prompt commands include /help, /settings, /goal, /cancel, /reload, /agent,
 /export, /clear, and /exit."#
     );
 }
@@ -2996,11 +3078,16 @@ async fn run_relay_sequence_with_controls(
     first_slot: usize,
 ) -> (bool, Vec<AdapterControl>) {
     let mut task = task;
+    let mut elapsed_by_slot = std::collections::BTreeMap::<usize, u64>::new();
     loop {
+        let turn_started = Instant::now();
         let (stopping, deferred, decision) =
             run_relay_turn_with_controls(relay, controls, sender, task, first_slot).await;
         if stopping {
             return (true, deferred);
+        }
+        if let Some(RelayDecision::Dispatch { slot, .. }) = &decision {
+            *elapsed_by_slot.entry(*slot).or_default() += turn_started.elapsed().as_secs();
         }
         let mut blocking = Vec::new();
         for command in deferred {
@@ -3015,6 +3102,10 @@ async fn run_relay_sequence_with_controls(
             }
         }
         if !blocking.is_empty() {
+            return (false, blocking);
+        }
+        if matches!(decision, Some(RelayDecision::Complete)) {
+            send_batch_complete(sender, &elapsed_by_slot);
             return (false, blocking);
         }
         if !matches!(decision, Some(RelayDecision::Dispatch { .. })) {
@@ -3032,12 +3123,30 @@ async fn run_relay_sequence_with_controls(
             (&decision, sole_routable),
             (Some(RelayDecision::Dispatch { slot, .. }), Some(sole)) if *slot == sole
         ) {
+            send_batch_complete(sender, &elapsed_by_slot);
             return (false, blocking);
         }
         // The first invocation carries the human task. Subsequent invocations
         // let Relay choose its next slot and use the prior response/context.
         task = String::new();
     }
+}
+
+fn send_batch_complete(
+    sender: &Sender<AdapterResult<AgentEvent>>,
+    elapsed_by_slot: &std::collections::BTreeMap<usize, u64>,
+) {
+    if elapsed_by_slot.is_empty() {
+        return;
+    }
+    let elapsed = elapsed_by_slot
+        .iter()
+        .map(|(slot, seconds)| codeswarm_adapters::BatchElapsed {
+            slot: *slot,
+            seconds: *seconds,
+        })
+        .collect();
+    let _ = sender.send(Ok(AgentEvent::BatchComplete { elapsed }));
 }
 
 fn enqueue_fresh_roster_prompt(
@@ -3596,11 +3705,12 @@ fn run_terminal(
     } else {
         Duration::from_millis(650)
     });
-    let mut selection_until: Option<Instant> = None;
     let mut turn_active = false;
     let mut cancel_requested_at: Option<Instant> = None;
     let mut title_blink_at = Instant::now();
     let mut wheel_scroll = WheelScroll::default();
+    let mut text_selection = TextSelection::default();
+    let mut selection_buffer: Option<Buffer> = None;
     let mut pending_input = None;
     let mut last_terminal_title = String::new();
     let manage_terminal_title = terminal_capture_enabled();
@@ -3628,15 +3738,6 @@ fn run_terminal(
         }
         if !app.config_visible() {
             config_input.reset();
-        }
-        if restore_mouse_after_selection_window(
-            terminal.backend_mut(),
-            &mut selection_until,
-            Instant::now(),
-        )? {
-            app.set_mouse_selection_mode(false);
-            app.status = "mouse scrolling restored".into();
-            redraw.invalidate();
         }
         selected_slot = normalize_selected_slot(app, selected_slot);
         app.set_selected_agent(selected_slot);
@@ -3705,6 +3806,7 @@ fn run_terminal(
                                 turn_active = false;
                                 cancel_requested_at = None;
                             }
+                            AgentEvent::BatchComplete { .. } => {}
                             AgentEvent::Ready { slot, capabilities } => {
                                 if capabilities.supports_modes {
                                     mode_capable_slots.insert(*slot);
@@ -3750,7 +3852,10 @@ fn run_terminal(
                             // chunks stay off the terminal thread's fsync
                             // path while still making completed turns
                             // recoverable after an abrupt process exit.
-                            if matches!(&event, AgentEvent::TurnComplete { .. }) {
+                            if matches!(
+                                &event,
+                                AgentEvent::TurnComplete { .. } | AgentEvent::BatchComplete { .. }
+                            ) {
                                 let _ = log.flush();
                             }
                         }
@@ -3892,7 +3997,17 @@ fn run_terminal(
             redraw.invalidate();
         }
         if redraw.needs_draw(Instant::now()) {
-            frame_area = terminal.draw(|frame| render(frame, app))?.area;
+            frame_area = terminal
+                .draw(|frame| {
+                    render(frame, app);
+                    if text_selection.anchor.is_some() {
+                        selection_buffer = Some(frame.buffer_mut().clone());
+                        text_selection.highlight(frame.buffer_mut());
+                    } else {
+                        selection_buffer = None;
+                    }
+                })?
+                .area;
             redraw.did_draw(app.next_visual_deadline(Instant::now()));
         }
         if pending_input.is_none() && !event::poll(Duration::from_millis(50))? {
@@ -3915,6 +4030,7 @@ fn run_terminal(
             Event::Mouse(mouse)
                 if app.product_panel_visible() && mouse_scroll_delta(mouse.kind).is_some() =>
             {
+                text_selection.clear();
                 let delta = mouse_scroll_delta(mouse.kind).unwrap_or(0);
                 for _ in 0..delta.unsigned_abs() {
                     app.handle_product_panel_key(Input {
@@ -3927,6 +4043,7 @@ fn run_terminal(
                 continue;
             }
             Event::Mouse(mouse) if mouse_scroll_delta(mouse.kind).is_some() => {
+                text_selection.clear();
                 let (kind, next) = coalesce_wheel_input(mouse.kind, || {
                     if event::poll(Duration::ZERO)? {
                         event::read().map(Some)
@@ -3974,6 +4091,29 @@ fn run_terminal(
                         app.open_mode_config();
                     }
                     FooterAction::Ignored => {}
+                }
+                continue;
+            }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                text_selection.begin(mouse.column, mouse.row);
+                continue;
+            }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Drag(MouseButton::Left) => {
+                text_selection.drag_to(mouse.column, mouse.row);
+                continue;
+            }
+            Event::Mouse(mouse) if mouse.kind == MouseEventKind::Up(MouseButton::Left) => {
+                text_selection.drag_to(mouse.column, mouse.row);
+                if let Some(text) = selection_buffer
+                    .as_ref()
+                    .and_then(|buffer| text_selection.selected_text(buffer))
+                {
+                    match copy_text_to_terminal_clipboard(terminal.backend_mut(), &text) {
+                        Ok(()) => app.status = "selected text copied".into(),
+                        Err(error) => app.status = format!("unable to copy selection: {error}"),
+                    }
+                } else {
+                    text_selection.clear();
                 }
                 continue;
             }
@@ -4557,13 +4697,6 @@ fn run_terminal(
                                             app.status = format!("agent {slot} is unavailable");
                                         }
                                     }
-                                    LocalCommand::SelectText => {
-                                        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-                                        selection_until =
-                                            Some(Instant::now() + Duration::from_secs(15));
-                                        app.set_mouse_selection_mode(true);
-                                        app.status = "text selection enabled for 15 seconds".into();
-                                    }
                                     LocalCommand::Export => match export_conversation(app) {
                                         Ok(path) => {
                                             app.status = format!(
@@ -4900,19 +5033,19 @@ fn notify_permission_request(agent: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterControl, AgentSpec, ConfigInputDecoder, Launch, MAX_EVENTS_PER_FRAME,
+        AdapterControl, AgentSpec, ConfigInputDecoder, Launch, MAX_EVENTS_PER_FRAME, TextSelection,
         apply_mouse_scroll, apply_navigation_scroll, apply_notification_preferences,
         bare_launch_from_settings, cancel_standalone_turn, consume_one_shot_route,
-        control_for_queued, dispatch_permission_action, dispatch_queued_prompt,
-        enqueue_fresh_roster_prompt, finish_pending_cancellation, interaction_height,
-        load_prompt_history_from, load_session_metadata_candidates, mouse_scroll_delta,
-        next_event_batch, normalize_arguments, normalize_selected_slot, parse_launch,
-        prepare_launch_arguments, program_available, project_dir_argument,
+        control_for_queued, copy_text_to_terminal_clipboard, dispatch_permission_action,
+        dispatch_queued_prompt, enqueue_fresh_roster_prompt, finish_pending_cancellation,
+        interaction_height, load_prompt_history_from, load_session_metadata_candidates,
+        mouse_scroll_delta, next_event_batch, normalize_arguments, normalize_selected_slot,
+        parse_launch, prepare_launch_arguments, program_available, project_dir_argument,
         project_prompt_history_path, reconcile_config_roster,
-        rejection_interrupts_roster_reconcile, restore_mouse_after_selection_window,
-        resume_launch_from_metadata, run_relay_sequence_with_controls, sanitize_direct_event,
-        save_roster_slots_at, session_metadata_path_for, should_apply_configured_models,
-        standalone_session_metadata, terminal_capture_enabled_for, validate_project_directory,
+        rejection_interrupts_roster_reconcile, resume_launch_from_metadata,
+        run_relay_sequence_with_controls, sanitize_direct_event, save_roster_slots_at,
+        session_metadata_path_for, should_apply_configured_models, standalone_session_metadata,
+        terminal_capture_enabled_for, validate_project_directory,
     };
     use async_trait::async_trait;
     use codeswarm::tui::{App, ConfigKey, PermissionAction, QueuedPrompt, StoreAgent};
@@ -4922,6 +5055,7 @@ mod tests {
     };
     use codeswarm_adapters::{AgentCapabilities, AgentEvent, PermissionAnswer};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+    use ratatui::{buffer::Buffer, style::Modifier};
     use std::ffi::OsStr;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -5358,26 +5492,26 @@ mod tests {
     }
 
     #[test]
-    fn selection_window_restores_mouse_capture_automatically() {
-        let now = Instant::now();
-        let mut deadline = Some(now - Duration::from_millis(1));
-        let mut output = Vec::new();
-        assert!(
-            restore_mouse_after_selection_window(&mut output, &mut deadline, now)
-                .expect("restore capture")
-        );
-        assert!(deadline.is_none());
-        let sequence = String::from_utf8(output).expect("terminal sequence");
-        assert!(sequence.contains("?1000h"), "sequence={sequence:?}");
+    fn captured_left_drag_selects_rendered_text_without_changing_mouse_capture() {
+        let buffer = Buffer::with_lines(["alpha beta", "gamma"]);
+        let mut selection = TextSelection::default();
+        selection.begin(2, 0);
+        selection.drag_to(3, 1);
 
-        let mut future = Some(now + Duration::from_secs(1));
-        let mut untouched = Vec::new();
-        assert!(
-            !restore_mouse_after_selection_window(&mut untouched, &mut future, now)
-                .expect("keep selection window")
+        assert_eq!(
+            selection.selected_text(&buffer).as_deref(),
+            Some("pha beta\ngamm")
         );
-        assert!(untouched.is_empty());
-        assert!(future.is_some());
+
+        let mut highlighted = buffer.clone();
+        selection.highlight(&mut highlighted);
+        assert!(highlighted[(2, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(highlighted[(3, 1)].modifier.contains(Modifier::REVERSED));
+        assert!(!highlighted[(1, 0)].modifier.contains(Modifier::REVERSED));
+
+        let mut output = Vec::new();
+        copy_text_to_terminal_clipboard(&mut output, "pha beta\ngamm").unwrap();
+        assert_eq!(output, b"\x1b]52;c;cGhhIGJldGEKZ2FtbQ==\x07");
     }
 
     #[test]
@@ -6676,7 +6810,7 @@ mod tests {
         );
         let mut relay = RelayHost::new(vec![host], 10).expect("single-agent host");
         relay.start().await.expect("start");
-        let (sender, _events) = std::sync::mpsc::channel::<AdapterResult<AgentEvent>>();
+        let (sender, events) = std::sync::mpsc::channel::<AdapterResult<AgentEvent>>();
         let (_control_sender, mut controls) = tokio::sync::mpsc::unbounded_channel();
         let (stopping, deferred) =
             run_relay_sequence_with_controls(&mut relay, &mut controls, &sender, "task".into(), 0)
@@ -6684,6 +6818,11 @@ mod tests {
         assert!(!stopping);
         assert!(deferred.is_empty());
         assert_eq!(relay.dispatches().len(), 1);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Ok(AgentEvent::BatchComplete { elapsed }))
+                if elapsed.len() == 1 && elapsed[0].slot == 0
+        ));
     }
 
     #[tokio::test]
@@ -6720,7 +6859,7 @@ mod tests {
         ];
         let mut relay = RelayHost::new(hosts, 2).expect("two-agent relay");
         relay.start().await.expect("scripted adapters start");
-        let (sender, _events) = std::sync::mpsc::channel::<AdapterResult<AgentEvent>>();
+        let (sender, events) = std::sync::mpsc::channel::<AdapterResult<AgentEvent>>();
         let (_control_sender, mut controls) = tokio::sync::mpsc::unbounded_channel();
         let (_stopping, deferred) = run_relay_sequence_with_controls(
             &mut relay,
@@ -6740,6 +6879,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Ok(AgentEvent::BatchComplete { elapsed }))
+                if elapsed.iter().map(|timing| timing.slot).collect::<Vec<_>>() == vec![0, 1]
+        ));
     }
 
     #[tokio::test]

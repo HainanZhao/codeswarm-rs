@@ -69,6 +69,7 @@ pub(super) fn replay_display_event(app: &mut App, event: &AgentEvent) {
             });
             None
         }
+        AgentEvent::BatchComplete { .. } => Some(event.clone()),
         _ => None,
     };
     if let Some(history) = history {
@@ -480,6 +481,11 @@ impl ConversationJournal {
                     }
                 })
                 .map_err(|error| error.to_string())?;
+            self.writer
+                .checkpoint()
+                .map_err(|error| error.to_string())?;
+        }
+        if matches!(event, AgentEvent::BatchComplete { .. }) {
             self.writer
                 .checkpoint()
                 .map_err(|error| error.to_string())?;

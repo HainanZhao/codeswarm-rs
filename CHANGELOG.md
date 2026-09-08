@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.5] - 2026-09-08
+
+### Added
+
+- Restore a persistent per-agent elapsed-time line when a relay batch
+  completes, such as `Batch complete · Claude 0:42 · Codex 0:08`; archived
+  sessions retain the summary.
+- Left-button dragging selects visible text and copies it through the terminal
+  clipboard protocol while captured wheel scrolling remains active.
+
 ## [0.10.4] - 2026-09-08
 
 ### Added

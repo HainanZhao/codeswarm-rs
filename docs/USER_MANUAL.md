@@ -118,7 +118,8 @@ bounded to preserve tmux responsiveness.
   in place. Two minutes without activity shows a warning in the status ribbon;
   silence never cancels a turn automatically.
 - `/agent SLOT` — select an active agent by zero-based roster slot for the next message.
-- `/select` — temporarily enable terminal text selection.
+- Left-drag selects and copies visible text without disabling transcript wheel
+  scrolling.
 - `/clear` — clear the local transcript.
 - `/cancel` — cancel the active turn when an adapter supports cancellation.
 - `/exit` — leave the session.

@@ -144,7 +144,7 @@ impl CompletionSummary {
     /// count as live turns or fabricate outcomes.
     pub fn observe(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::History { .. } => {}
+            AgentEvent::History { .. } | AgentEvent::BatchComplete { .. } => {}
             AgentEvent::TurnStarted { .. } => {
                 self.commit_pending();
                 self.turns_observed += 1;

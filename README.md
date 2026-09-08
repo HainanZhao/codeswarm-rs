@@ -128,7 +128,8 @@ Inside the conversation prompt:
 - `/reload` cancels and restarts a silent agent, or retries the most recently
   crashed agent in its roster slot.
 - `/agent SLOT` selects any active roster slot for the next message.
-- `/select` temporarily enables terminal text selection.
+- Left-drag selects and copies visible text while transcript wheel scrolling
+  remains active.
 - `/clear` clears the local transcript; `/exit` exits the session.
 
 Typing `/` opens a compact command palette with descriptions. The conversation

@@ -114,7 +114,6 @@ pub enum LocalCommand {
     Resume,
     Sessions,
     SelectAgent(usize),
-    SelectText,
     Status,
     Summary,
 }
@@ -177,11 +176,6 @@ pub const LOCAL_COMMANDS: &[CommandSpec] = &[
         name: "/sessions",
         description: "Browse saved project sessions",
         usage: "/sessions",
-    },
-    CommandSpec {
-        name: "/select",
-        description: "Temporarily enable text selection",
-        usage: "/select",
     },
     CommandSpec {
         name: "/settings",
@@ -1013,7 +1007,6 @@ pub struct App {
     terminal_title_flash: usize,
     terminal_title_blink: bool,
     terminal_focused: bool,
-    mouse_selection_mode: bool,
     show_thoughts: bool,
     expand_tools: bool,
     density: Density,
@@ -1084,7 +1077,9 @@ const CONFIG_SETTING_COUNT: usize = 13;
 
 fn agent_event_slot(event: &AgentEvent) -> Option<usize> {
     match event {
-        AgentEvent::GoalUpdated { .. } | AgentEvent::SessionMetadataUpdated { .. } => None,
+        AgentEvent::GoalUpdated { .. }
+        | AgentEvent::SessionMetadataUpdated { .. }
+        | AgentEvent::BatchComplete { .. } => None,
         AgentEvent::History { slot, .. }
         | AgentEvent::Ready { slot, .. }
         | AgentEvent::TurnStarted { slot }
@@ -1135,7 +1130,6 @@ impl Default for App {
             terminal_title_flash: 0,
             terminal_title_blink: false,
             terminal_focused: true,
-            mouse_selection_mode: false,
             show_thoughts: false,
             expand_tools: false,
             density: Density::Comfortable,
@@ -1268,7 +1262,6 @@ impl App {
                     LocalCommand::Handled
                 }
             },
-            "/select" => LocalCommand::SelectText,
             "/help" => {
                 self.keyboard_help = !self.keyboard_help;
                 self.status = if self.keyboard_help {
@@ -2384,10 +2377,6 @@ impl App {
 
     pub fn terminal_focused(&self) -> bool {
         self.terminal_focused
-    }
-
-    pub fn set_mouse_selection_mode(&mut self, enabled: bool) {
-        self.mouse_selection_mode = enabled;
     }
 
     pub fn thoughts_enabled(&self) -> bool {
@@ -3649,6 +3638,18 @@ impl App {
                 self.agent_states.insert(*slot, "ready".into());
                 self.next_agent = self.next_roster_slot_after(*slot);
             }
+            AgentEvent::BatchComplete { elapsed } => {
+                let mut text = "Batch complete".to_owned();
+                for timing in elapsed {
+                    text.push_str(" · ");
+                    text.push_str(&self.agent_name(timing.slot));
+                    text.push(' ');
+                    text.push_str(&format_elapsed_seconds(timing.seconds));
+                }
+                self.transcript
+                    .append(crate::transcript::BlockKind::Notice, text, false);
+                self.status = "batch complete".into();
+            }
             AgentEvent::UsageLimitReached { slot, detail } => {
                 self.thinking_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
@@ -4168,11 +4169,7 @@ fn footer_mode_label(app: &App) -> String {
     } else {
         app.mode.as_str()
     };
-    if app.mouse_selection_mode {
-        format!(" Select text · {mode} ")
-    } else {
-        format!(" {mode} ")
-    }
+    format!(" {mode} ")
 }
 
 fn footer_collaboration_label(app: &App) -> String {
@@ -4186,7 +4183,10 @@ fn footer_collaboration_label(app: &App) -> String {
 }
 
 fn format_turn_elapsed(started: Instant) -> String {
-    let seconds = started.elapsed().as_secs();
+    format_elapsed_seconds(started.elapsed().as_secs())
+}
+
+fn format_elapsed_seconds(seconds: u64) -> String {
     let minutes = seconds / 60;
     format!("{minutes}:{:02}", seconds % 60)
 }
@@ -4781,12 +4781,12 @@ fn render_queue(buffer: &mut Buffer, area: Rect, app: &App) {
 fn render_keyboard_help(buffer: &mut Buffer, area: Rect) {
     let lines = [
         " Help · Esc / F1 / ? close · /help toggles",
-        " Scroll: wheel or PgUp/PgDn · Ctrl+↑/↓ fine · End follow tail",
+        " Mouse: drag copy · wheel scroll · PgUp/PgDn · End follow tail",
         " Input: Enter send · Shift+Enter newline · Tab complete · Alt+←/→ word",
         " Turn: Ctrl+Enter direct · Ctrl+C cancel · Ctrl+K cancel queued",
         " Agents: /agent SLOT /reload · Goal: /goal [objective|run|done|clear]",
         " Session: /resume /sessions /status /summary /clear /exit",
-        " Tools: /settings /export /select",
+        " Tools: /settings /export",
     ];
     Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>())
         .style(Style::default().fg(Color::Gray).bg(PANEL_BG))
@@ -7113,6 +7113,32 @@ mod tests {
     }
 
     #[test]
+    fn completed_batch_appends_a_persistent_per_agent_time_summary() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Claude");
+        app.set_agent_name(1, "Codex");
+
+        app.apply_event(&codeswarm_adapters::AgentEvent::BatchComplete {
+            elapsed: vec![
+                codeswarm_adapters::BatchElapsed {
+                    slot: 0,
+                    seconds: 42,
+                },
+                codeswarm_adapters::BatchElapsed {
+                    slot: 1,
+                    seconds: 8,
+                },
+            ],
+        });
+
+        assert!(
+            app.export_markdown()
+                .contains("Batch complete · Claude 0:42 · Codex 0:08")
+        );
+        assert_eq!(app.status, "batch complete");
+    }
+
+    #[test]
     fn silent_turn_warning_uses_ribbon_and_clears_on_activity_and_reload() {
         use codeswarm_adapters::AgentEvent;
         let mut app = App::default();
@@ -7846,8 +7872,9 @@ mod tests {
         );
         assert_eq!(
             app.handle_local_command("/select"),
-            Some(LocalCommand::SelectText)
+            Some(LocalCommand::Handled)
         );
+        assert!(app.status.starts_with("unknown command:"));
     }
 
     #[test]
@@ -9779,22 +9806,6 @@ mod tests {
             .collect::<String>();
         assert_eq!(footer_before, footer_after);
         assert!(footer_after.contains("Codex"));
-
-        app.set_mouse_selection_mode(true);
-        terminal
-            .draw(|frame| render(frame, &mut app))
-            .expect("draw selection window");
-        let selection_footer = terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(60)
-            .last()
-            .expect("footer")
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(selection_footer.contains("Select text"));
     }
 
     #[test]

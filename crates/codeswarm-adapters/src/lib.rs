@@ -141,6 +141,13 @@ pub enum HistoryContent {
     Tool(ToolUpdate),
 }
 
+/// Wall-clock time spent by one roster slot during a completed relay batch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BatchElapsed {
+    pub slot: RosterSlot,
+    pub seconds: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AgentEvent {
     /// Coordinator snapshot used for local recovery; never live activity.
@@ -217,6 +224,10 @@ pub enum AgentEvent {
     },
     TurnComplete {
         slot: RosterSlot,
+    },
+    /// Coordinator-owned boundary emitted after the complete relay batch.
+    BatchComplete {
+        elapsed: Vec<BatchElapsed>,
     },
     /// A provider plan is exhausted for this slot. The relay routes around
     /// the agent until it is recharged or reloaded.
@@ -397,6 +408,7 @@ pub fn reduce(state: &mut SessionState, event: AgentEvent) -> Vec<Effect> {
             }
             effects
         }
+        AgentEvent::BatchComplete { .. } => vec![Effect::Render],
         AgentEvent::UsageLimitReached { slot, .. } => {
             if state.active_slot == Some(slot) {
                 state.active_slot = None;

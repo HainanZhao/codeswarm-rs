@@ -476,6 +476,7 @@ fn map_event_slot(event: AgentEvent, slot: RosterSlot) -> AgentEvent {
         AgentEvent::Permission { request, .. } => AgentEvent::Permission { slot, request },
         AgentEvent::Terminal { event, .. } => AgentEvent::Terminal { slot, event },
         AgentEvent::TurnComplete { .. } => AgentEvent::TurnComplete { slot },
+        AgentEvent::BatchComplete { elapsed } => AgentEvent::BatchComplete { elapsed },
         AgentEvent::UsageLimitReached { detail, .. } => {
             AgentEvent::UsageLimitReached { slot, detail }
         }
