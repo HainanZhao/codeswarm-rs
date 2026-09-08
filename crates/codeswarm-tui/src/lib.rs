@@ -1724,12 +1724,15 @@ impl App {
                     .or(current);
                 let position = current
                     .as_ref()
-                    .and_then(|current| models.iter().position(|model| &model.id == current))
-                    .unwrap_or(0);
-                let next = if key == ConfigKey::NextValue {
-                    (position + 1) % models.len()
-                } else {
-                    position.checked_sub(1).unwrap_or(models.len() - 1)
+                    .and_then(|current| models.iter().position(|model| &model.id == current));
+                let next = match (key, position) {
+                    (ConfigKey::NextValue, Some(position)) => (position + 1) % models.len(),
+                    (ConfigKey::PreviousValue, Some(position)) => {
+                        position.checked_sub(1).unwrap_or(models.len() - 1)
+                    }
+                    (ConfigKey::NextValue, None) => 0,
+                    (ConfigKey::PreviousValue, None) => models.len() - 1,
+                    _ => return ConfigAction::Ignored,
                 };
                 if let Some(slot) = target_slot {
                     self.pending_model_changes
@@ -4944,13 +4947,17 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
                     .model
                     .as_ref()
                     .or_else(|| target_slot.and_then(|slot| app.pending_model_changes.get(&slot)))
-                    .or(current.as_ref())
-                    .or_else(|| models.first().map(|model| &model.id));
+                    .or(current.as_ref());
                 if let Some(model) =
                     selected_model.and_then(|id| models.iter().find(|model| &model.id == id))
                 {
                     spans.push(Span::styled(
                         format!(" · {} ←/→", model.label),
+                        Style::default().fg(ACCENT),
+                    ));
+                } else if selected_model.is_none() {
+                    spans.push(Span::styled(
+                        " · Inherited ←/→",
                         Style::default().fg(ACCENT),
                     ));
                 }
@@ -8131,6 +8138,67 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Smart ←/→"), "rendered={rendered:?}");
         assert_eq!(app.take_config_model_changes(), vec![(0, "smart".into())]);
+    }
+
+    #[test]
+    fn inherited_model_state_is_not_rendered_as_the_first_catalog_choice() {
+        for (name, identity, first_id, first_label) in [
+            ("Claude", "anthropic.com", "default", "Default"),
+            ("Codex", "openai.com", "gpt-first", "GPT First"),
+        ] {
+            let mut app = App::default();
+            app.set_agent_name(0, name);
+            app.set_agent_identity(0, identity);
+            app.set_config_agents(vec![StoreAgent {
+                identity: identity.into(),
+                name: name.into(),
+                adapter: "native".into(),
+                command: name.to_ascii_lowercase(),
+                available: true,
+                selected: true,
+                model: None,
+            }]);
+            app.apply_event(&codeswarm_adapters::AgentEvent::ModelsReplaced {
+                slot: 0,
+                config_id: "model".into(),
+                models: vec![
+                    codeswarm_adapters::Mode {
+                        id: first_id.into(),
+                        label: first_label.into(),
+                    },
+                    codeswarm_adapters::Mode {
+                        id: "second".into(),
+                        label: "Second".into(),
+                    },
+                ],
+                current_model: None,
+            });
+            app.open_config();
+            app.config_selected = CONFIG_SETTING_COUNT;
+
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .expect("draw inherited model");
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Inherited ←/→"), "rendered={rendered:?}");
+            assert!(
+                !rendered.contains(&format!("{first_label} ←/→")),
+                "rendered={rendered:?}"
+            );
+
+            assert_eq!(
+                app.handle_config_key(ConfigKey::NextValue),
+                ConfigAction::Changed
+            );
+            assert_eq!(app.take_config_model_changes(), vec![(0, first_id.into())]);
+        }
     }
 
     #[test]

@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Make `/settings` model selection use Codex app-server's effective
+  configuration and account-aware model catalog, including the persisted model
+  of a resumed thread. Claude's native selector now includes its real Default
+  choice and current documented aliases without promoting fallback or subagent
+  usage into selectable models. Provider-controlled model state stays visibly
+  `Inherited` until the user makes an explicit selection.
 - Surface Codex reasoning summaries by enabling its JSON reasoning output, and
   fall back to consolidated Claude thinking blocks when streaming deltas are
   absent.

@@ -8,16 +8,18 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
+    process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::mpsc,
 };
@@ -258,7 +260,7 @@ fn cached_models_at(path: &std::path::Path) -> Vec<Mode> {
     };
     let mut catalog = Vec::new();
     for model in models {
-        if model.get("visibility").and_then(Value::as_str) == Some("hide") {
+        if model.get("visibility").and_then(Value::as_str) != Some("list") {
             continue;
         }
         let Some(id) = model
@@ -284,18 +286,168 @@ fn cached_models_at(path: &std::path::Path) -> Vec<Mode> {
     catalog
 }
 
-fn load_codex_models() -> Vec<Mode> {
-    let codex_home = std::env::var_os("CODEX_HOME")
+fn load_cached_codex_models() -> Vec<Mode> {
+    codex_home()
+        .map(|path| cached_models_at(&path.join("models_cache.json")))
+        .unwrap_or_default()
+}
+
+fn codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME")
                 .filter(|path| !path.is_empty())
                 .map(|path| PathBuf::from(path).join(".codex"))
-        });
-    codex_home
-        .map(|path| cached_models_at(&path.join("models_cache.json")))
-        .unwrap_or_default()
+        })
+}
+
+#[derive(Debug, Default)]
+struct CodexDiscovery {
+    models: Vec<Mode>,
+    current_model: Option<String>,
+    config_received: bool,
+    models_received: bool,
+    thread_received: bool,
+}
+
+fn apply_discovery_response(value: &Value, discovery: &mut CodexDiscovery) {
+    match value.get("id").and_then(Value::as_u64) {
+        Some(2) => {
+            discovery.config_received = true;
+            discovery.current_model = value
+                .pointer("/result/config/model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned);
+        }
+        Some(3) => {
+            discovery.models_received = true;
+            let Some(models) = value.pointer("/result/data").and_then(Value::as_array) else {
+                return;
+            };
+            discovery.models.clear();
+            for model in models {
+                if model.get("hidden").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                let Some(id) = model
+                    .get("id")
+                    .or_else(|| model.get("model"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                else {
+                    continue;
+                };
+                if discovery.models.iter().any(|candidate| candidate.id == id) {
+                    continue;
+                }
+                let label = model
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or(id);
+                discovery.models.push(Mode {
+                    id: id.to_owned(),
+                    label: label.to_owned(),
+                });
+            }
+        }
+        Some(4) => {
+            discovery.thread_received = true;
+            if let Some(model) = value
+                .pointer("/result/thread/model")
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty())
+            {
+                discovery.current_model = Some(model.to_owned());
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn discover_codex(
+    command_line: &str,
+    cwd: &std::path::Path,
+    session_id: Option<&str>,
+) -> Option<CodexDiscovery> {
+    let (program, args) = parse_command_line(command_line).ok()?;
+    let executable = std::path::Path::new(&program)
+        .file_name()
+        .and_then(|name| name.to_str())?;
+    if !matches!(executable, "codex" | "codex.exe") {
+        return None;
+    }
+    let mut command = Command::new(program);
+    isolate_process_group(&mut command);
+    command
+        .args(args)
+        .arg("app-server")
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let stdout = child.stdout.take()?;
+    let initialize = serde_json::json!({
+        "method": "initialize",
+        "id": 1,
+        "params": {
+            "clientInfo": {"name": "codeswarm", "title": "CodeSwarm", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": null
+        }
+    });
+    let mut requests = vec![
+        initialize,
+        serde_json::json!({"method": "initialized", "params": {}}),
+        serde_json::json!({"method": "config/read", "id": 2, "params": {"includeLayers": false, "cwd": cwd}}),
+        serde_json::json!({"method": "model/list", "id": 3, "params": {"cursor": null, "limit": null}}),
+    ];
+    if let Some(session_id) = session_id {
+        requests.push(serde_json::json!({
+            "method": "thread/read",
+            "id": 4,
+            "params": {"threadId": session_id, "includeTurns": false}
+        }));
+    }
+    for request in requests {
+        if stdin
+            .write_all(request.to_string().as_bytes())
+            .await
+            .is_err()
+            || stdin.write_all(b"\n").await.is_err()
+        {
+            let _ = terminate_child(&mut child).await;
+            return None;
+        }
+    }
+    let mut lines = BufReader::new(stdout).lines();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut discovery = CodexDiscovery::default();
+    loop {
+        let complete = discovery.config_received
+            && discovery.models_received
+            && (session_id.is_none() || discovery.thread_received);
+        if complete {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Ok(Ok(Some(line))) = tokio::time::timeout(remaining, lines.next_line()).await else {
+            break;
+        };
+        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            apply_discovery_response(&value, &mut discovery);
+        }
+    }
+    drop(stdin);
+    let _ = terminate_child(&mut child).await;
+    discovery.models_received.then_some(discovery)
 }
 
 /// Native process-per-turn Codex adapter.
@@ -306,6 +458,7 @@ pub struct CodexAdapter {
     command: String,
     mode: String,
     model: Option<String>,
+    model_overridden: bool,
     models: Vec<Mode>,
     session_id: Option<String>,
     child: Option<Child>,
@@ -324,7 +477,8 @@ impl CodexAdapter {
             command: command.into(),
             mode: MODE_AUTO.into(),
             model: None,
-            models: load_codex_models(),
+            model_overridden: false,
+            models: load_cached_codex_models(),
             session_id: None,
             child: None,
             sender,
@@ -422,9 +576,21 @@ impl AgentAdapter for CodexAdapter {
             self.stop().await?;
         }
         self.cancel_requested.store(false, Ordering::Release);
-        let refreshed_models = load_codex_models();
-        if !refreshed_models.is_empty() {
-            self.models = refreshed_models;
+        if let Some(discovery) =
+            discover_codex(&self.command, &self.cwd, self.session_id.as_deref()).await
+        {
+            self.models = discovery.models;
+            if !self.model_overridden {
+                self.model = discovery.current_model;
+            }
+        } else {
+            let refreshed_models = load_cached_codex_models();
+            if !refreshed_models.is_empty() {
+                self.models = refreshed_models;
+            }
+            if !self.model_overridden {
+                self.model = None;
+            }
         }
         self.retain_selected_model();
         self.emit(Ok(AgentEvent::ModesReplaced {
@@ -476,7 +642,9 @@ impl AgentAdapter for CodexAdapter {
             .arg("show_raw_agent_reasoning=true")
             .arg("-c")
             .arg("model_reasoning_summary=\"detailed\"");
-        if let Some(model) = &self.model {
+        if self.model_overridden
+            && let Some(model) = &self.model
+        {
             command.arg("--model").arg(model);
         }
         self.append_mode_flags(&mut command, fresh);
@@ -598,6 +766,7 @@ impl AgentAdapter for CodexAdapter {
             return Err(AdapterError::Protocol("model must not be empty".into()));
         }
         self.model = Some(model.to_owned());
+        self.model_overridden = true;
         self.retain_selected_model();
         self.emit(Ok(AgentEvent::ModelsReplaced {
             slot: self.slot,
@@ -645,7 +814,10 @@ impl AgentAdapter for CodexAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodexAdapter, ParserState, cached_models_at, parse_value};
+    use super::{
+        CodexAdapter, CodexDiscovery, ParserState, apply_discovery_response, cached_models_at,
+        parse_value,
+    };
     use crate::{AgentAdapter, AgentEvent, ToolStatus};
     use serde_json::json;
 
@@ -686,19 +858,97 @@ mod tests {
             r#"{"models":[
                 {"slug":"gpt-visible","display_name":"GPT Visible","visibility":"list"},
                 {"slug":"gpt-hidden","display_name":"GPT Hidden","visibility":"hide"},
-                {"slug":"gpt-fallback"},
+                {"slug":"gpt-unlisted"},
                 {"slug":"gpt-visible","display_name":"Duplicate"},
                 {"display_name":"Missing slug"}
             ]}"#,
         )
         .expect("cache");
         let models = cached_models_at(&cache_path);
-        assert_eq!(models.len(), 2);
+        assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-visible");
         assert_eq!(models[0].label, "GPT Visible");
-        assert_eq!(models[1].id, "gpt-fallback");
-        assert_eq!(models[1].label, "gpt-fallback");
         std::fs::remove_file(cache_path).expect("cleanup");
+    }
+
+    #[test]
+    fn parses_authoritative_codex_model_discovery() {
+        let mut discovery = CodexDiscovery::default();
+        apply_discovery_response(
+            &json!({"id": 2, "result": {"config": {"model": "gpt-config"}}}),
+            &mut discovery,
+        );
+        apply_discovery_response(
+            &json!({"id": 3, "result": {"data": [
+                {"id": "gpt-config", "displayName": "GPT Config", "hidden": false},
+                {"id": "gpt-hidden", "displayName": "GPT Hidden", "hidden": true},
+                {"model": "gpt-fallback", "displayName": "", "hidden": false}
+            ], "nextCursor": null}}),
+            &mut discovery,
+        );
+        assert_eq!(discovery.current_model.as_deref(), Some("gpt-config"));
+        assert_eq!(discovery.models.len(), 2);
+        assert_eq!(discovery.models[1].label, "gpt-fallback");
+        apply_discovery_response(
+            &json!({"id": 4, "result": {"thread": {"model": "gpt-resumed"}}}),
+            &mut discovery,
+        );
+        assert_eq!(discovery.current_model.as_deref(), Some("gpt-resumed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_uses_app_server_catalog_and_resumed_thread_model() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = unique_test_path("codeswarm-codex-discovery");
+        std::fs::create_dir_all(&directory).expect("directory");
+        let command_path = directory.join("codex");
+        std::fs::write(
+            &command_path,
+            r#"#!/bin/sh
+if [ "$1" = "app-server" ]; then
+  printf '%s\n' \
+    '{"id":1,"result":{}}' \
+    '{"id":2,"result":{"config":{"model":"gpt-config"}}}' \
+    '{"id":3,"result":{"data":[{"id":"gpt-config","displayName":"GPT Config","hidden":false},{"id":"gpt-hidden","displayName":"GPT Hidden","hidden":true}],"nextCursor":null}}' \
+    '{"id":4,"result":{"thread":{"model":"gpt-resumed"}}}'
+  sleep 10
+fi
+"#,
+        )
+        .expect("script");
+        let mut permissions = std::fs::metadata(&command_path)
+            .expect("metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&command_path, permissions).expect("permissions");
+
+        let mut adapter = CodexAdapter::with_session_id(
+            0,
+            std::env::current_dir().expect("cwd"),
+            command_path.to_string_lossy(),
+            "resume-thread",
+        );
+        adapter.start().await.expect("start");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::ModesReplaced { .. }))
+        ));
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::ModelsReplaced { models, current_model, .. }))
+                if current_model.as_deref() == Some("gpt-resumed")
+                    && models.len() == 2
+                    && models[0].id == "gpt-config"
+                    && models[1].id == "gpt-resumed"
+        ));
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Ready { .. }))
+        ));
+        adapter.stop().await.expect("stop");
+        std::fs::remove_dir_all(directory).expect("cleanup");
     }
 
     #[tokio::test]
@@ -833,6 +1083,7 @@ printf '%s\n' '{{"type":"thread.started","thread_id":"thread-native"}}' '{{"type
                     line.contains("-c sandbox_mode=\"read-only\"")
                         && line.contains("exec resume --json")
                 })
+                && !args.contains("--model")
                 && !args.contains("first")
                 && !args.contains("follow-up"),
             "{args}"

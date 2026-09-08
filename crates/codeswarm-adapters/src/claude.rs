@@ -27,6 +27,23 @@ use super::{
     isolate_process_group, parse_command_line, terminate_child,
 };
 
+const MODEL_CONFIG_ID: &str = "claude:model";
+
+fn model_label(model: &str) -> String {
+    match model {
+        "default" => "Default".into(),
+        "best" => "Best".into(),
+        "fable" => "Fable".into(),
+        "opus" => "Opus".into(),
+        "sonnet" => "Sonnet".into(),
+        "haiku" => "Haiku".into(),
+        "sonnet[1m]" => "Sonnet (1M)".into(),
+        "opus[1m]" => "Opus (1M)".into(),
+        "opusplan" => "Opus plan".into(),
+        _ => model.to_owned(),
+    }
+}
+
 #[derive(Debug, Default)]
 struct ParserState {
     tools: BTreeMap<String, ToolUpdate>,
@@ -448,18 +465,27 @@ impl ClaudeAdapter {
     }
 
     fn models(&self) -> Vec<Mode> {
-        let mut models = [
-            ("fable", "Fable"),
-            ("opus", "Opus"),
-            ("sonnet", "Sonnet"),
-            ("haiku", "Haiku"),
-        ]
-        .into_iter()
-        .map(|(id, label)| Mode {
-            id: id.into(),
-            label: label.into(),
-        })
-        .collect::<Vec<_>>();
+        let ids = [
+            "best",
+            "opus",
+            "sonnet",
+            "haiku",
+            "sonnet[1m]",
+            "opus[1m]",
+            "opusplan",
+        ];
+        let mut models = vec![Mode {
+            id: "default".into(),
+            label: "Default".into(),
+        }];
+        for id in ids.map(str::to_owned) {
+            if !models.iter().any(|candidate| candidate.id == id) {
+                models.push(Mode {
+                    label: model_label(&id),
+                    id,
+                });
+            }
+        }
         if let Some(model) = &self.model
             && !models.iter().any(|candidate| candidate.id == *model)
         {
@@ -518,7 +544,7 @@ impl AgentAdapter for ClaudeAdapter {
         .await;
         self.emit(Ok(AgentEvent::ModelsReplaced {
             slot: self.slot,
-            config_id: "claude:model".into(),
+            config_id: MODEL_CONFIG_ID.into(),
             models: self.models(),
             current_model: self.model.clone(),
         }))
@@ -707,22 +733,22 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     async fn set_model(&mut self, model: String) -> AdapterResult<()> {
-        let documented_alias = self.models().iter().any(|candidate| candidate.id == model);
-        let full_model_id = model.strip_prefix("claude-").is_some_and(|suffix| {
-            !suffix.is_empty()
-                && suffix
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        });
-        if !documented_alias && !full_model_id {
+        let model = model.trim();
+        let listed = self.models().iter().any(|candidate| candidate.id == model);
+        let full_model_id = model.starts_with("claude-")
+            && !model.contains(char::is_whitespace)
+            && !model.contains('\0');
+        if !listed && !full_model_id {
             return Err(AdapterError::Protocol(
-                "model must be a documented Claude Code alias or a full claude-* model ID".into(),
+                "model must be a listed Claude alias or a full claude-* model ID".into(),
             ));
         }
-        self.model = Some(model.clone());
-        self.emit(Ok(AgentEvent::ModelUpdated {
+        self.model = Some(model.to_owned());
+        self.emit(Ok(AgentEvent::ModelsReplaced {
             slot: self.slot,
-            current_model: model,
+            config_id: MODEL_CONFIG_ID.into(),
+            models: self.models(),
+            current_model: self.model.clone(),
         }))
         .await;
         Ok(())
@@ -1034,7 +1060,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advertises_only_noninteractive_modes_and_accepts_full_model_ids() {
+    async fn advertises_current_aliases_and_accepts_full_model_ids() {
         let mut adapter = ClaudeAdapter::new(0, std::env::current_dir().unwrap(), "claude");
         assert_eq!(
             ClaudeAdapter::modes()
@@ -1049,7 +1075,16 @@ mod tests {
                 .into_iter()
                 .map(|model| model.id)
                 .collect::<Vec<_>>(),
-            ["fable", "opus", "sonnet", "haiku"]
+            [
+                "default",
+                "best",
+                "opus",
+                "sonnet",
+                "haiku",
+                "sonnet[1m]",
+                "opus[1m]",
+                "opusplan"
+            ]
         );
         assert!(adapter.set_mode("manual".into()).await.is_err());
         adapter
@@ -1062,7 +1097,14 @@ mod tests {
                 .iter()
                 .any(|model| model.id == "claude-sonnet-4-5-20250929")
         );
-        assert!(adapter.set_model("made-up-alias".into()).await.is_err());
+        assert!(
+            adapter
+                .set_model("provider/model:latest".into())
+                .await
+                .is_err()
+        );
+        assert!(adapter.set_model("   ".into()).await.is_err());
+        assert!(adapter.set_model("bad\0model".into()).await.is_err());
     }
 
     #[tokio::test]
@@ -1076,7 +1118,7 @@ mod tests {
         std::fs::write(
             &script_path,
             format!(
-                "printf '%s\\n' \"$*\" >> '{}'\nsed -n 'p' >> '{}'\nprintf '\\n' >> '{}'\nprintf '%s\\n' '{{\"type\":\"system\",\"session_id\":\"session-native\"}}' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"thinking\",\"thinking\":\"checked context\"}}]}}}}' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"hello\",\"session_id\":\"session-native\"}}'\n",
+                "printf '%s\\n' \"$*\" >> '{}'\nsed -n 'p' >> '{}'\nprintf '\\n' >> '{}'\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"provider-runtime-model\",\"session_id\":\"session-native\"}}' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"thinking\",\"thinking\":\"checked context\"}}]}}}}' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"hello\",\"session_id\":\"session-native\"}}'\n",
                 args_path.display(),
                 stdin_path.display(),
                 stdin_path.display()
@@ -1095,7 +1137,10 @@ mod tests {
         ));
         assert!(matches!(
             adapter.next_event().await,
-            Some(Ok(AgentEvent::ModelsReplaced { .. }))
+            Some(Ok(AgentEvent::ModelsReplaced {
+                current_model: None,
+                ..
+            }))
         ));
         assert!(matches!(
             adapter.next_event().await,
@@ -1114,6 +1159,12 @@ mod tests {
             Some(Ok(AgentEvent::TurnComplete { .. }))
         ));
         assert_eq!(adapter.session_id(), Some("session-native".into()));
+        adapter.set_model("default".into()).await.unwrap();
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::ModelsReplaced { current_model, .. }))
+                if current_model.as_deref() == Some("default")
+        ));
         adapter.send_prompt("second prompt".into()).await.unwrap();
         assert!(matches!(
             adapter.next_event().await,
@@ -1128,7 +1179,12 @@ mod tests {
             Some(Ok(AgentEvent::TurnComplete { .. }))
         ));
         let args = std::fs::read_to_string(&args_path).unwrap();
-        assert!(args.contains("--resume session-native"), "{args}");
+        let mut argument_lines = args.lines();
+        let first_args = argument_lines.next().unwrap_or_default();
+        let second_args = argument_lines.next().unwrap_or_default();
+        assert!(!first_args.contains("--model"), "{args}");
+        assert!(second_args.contains("--model default"), "{args}");
+        assert!(second_args.contains("--resume session-native"), "{args}");
         assert!(!args.contains("first prompt"), "{args}");
         assert!(!args.contains("second prompt"), "{args}");
         assert_eq!(
