@@ -10,7 +10,57 @@ use crate::collaboration::CollaborationContext;
 
 pub const MAX_QUEUED_PROMPTS: usize = 100;
 pub const STOP_TOKEN: &str = "[CODESWARM:STOP]";
+pub const NEXT_TOKEN_PREFIX: &str = "[CODESWARM:NEXT:";
 pub const DEFAULT_STOP_ACKNOWLEDGMENT: &str = "👍";
+
+/// Resolve an exact terminal handoff marker to a zero-based roster slot.
+pub fn requested_next_slot(response: &str) -> Option<RosterSlot> {
+    let (_, number) = response.trim_end().rsplit_once(NEXT_TOKEN_PREFIX)?;
+    let number = number.strip_suffix(']')?;
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    number.parse::<usize>().ok()?.checked_sub(1)
+}
+
+/// Hide complete control markers, including stale or unavailable targets.
+pub fn strip_control_tokens(response: &str) -> String {
+    let mut visible = String::new();
+    let mut remaining = response;
+    while let Some(index) = remaining.find(NEXT_TOKEN_PREFIX) {
+        visible.push_str(&remaining[..index]);
+        remaining = &remaining[index..];
+        let digits = remaining[NEXT_TOKEN_PREFIX.len()..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        let end = NEXT_TOKEN_PREFIX.len() + digits;
+        if digits > 0 && remaining[end..].starts_with(']') {
+            remaining = &remaining[end + 1..];
+        } else {
+            visible.push_str(NEXT_TOKEN_PREFIX);
+            remaining = &remaining[NEXT_TOKEN_PREFIX.len()..];
+        }
+    }
+    visible.push_str(remaining);
+    visible.replace(STOP_TOKEN, "")
+}
+
+/// Buffer only a possible control-marker suffix while text is streaming.
+pub fn control_token_visible_end(text: &str) -> usize {
+    let mut end = stop_token_visible_end(text);
+    if let Some(index) = text.rfind('[') {
+        let tail = &text[index..];
+        if NEXT_TOKEN_PREFIX.starts_with(tail)
+            || tail
+                .strip_prefix(NEXT_TOKEN_PREFIX)
+                .is_some_and(|number| number.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            end = end.min(index);
+        }
+    }
+    end
+}
 
 /// End of text safe to display after complete stop markers have been removed.
 /// Retain only a suffix that could become a marker in a later stream chunk.
@@ -105,6 +155,7 @@ pub struct Relay {
     paused: bool,
     last_active: RosterSlot,
     next: Option<RosterSlot>,
+    handoff_next: Option<RosterSlot>,
     steering: VecDeque<QueuedPrompt>,
     direct: VecDeque<QueuedPrompt>,
     previous_slot: Option<RosterSlot>,
@@ -127,6 +178,7 @@ impl Relay {
             paused: false,
             last_active: 0,
             next: None,
+            handoff_next: None,
             steering: VecDeque::new(),
             direct: VecDeque::new(),
             previous_slot: None,
@@ -148,6 +200,7 @@ impl Relay {
         if self.strategy != strategy {
             self.strategy = strategy;
             self.pair_partner = None;
+            self.handoff_next = None;
         }
     }
 
@@ -268,6 +321,7 @@ impl Relay {
             }
         }
         swap_option(&mut self.next, first, second);
+        swap_option(&mut self.handoff_next, first, second);
         swap_option(&mut self.previous_slot, first, second);
         swap_option(&mut self.pair_partner, first, second);
         self.active.swap(first, second);
@@ -434,6 +488,7 @@ impl Relay {
     /// Finalize a dispatched turn and choose the next ring position. Direct
     /// turns never become shared relay context.
     pub fn finish(&mut self, slot: RosterSlot, direct: bool, accepted_stop: bool) {
+        self.handoff_next = None;
         self.next = Some(self.next_active(slot));
         if !direct {
             self.previous_slot = Some(slot);
@@ -441,6 +496,25 @@ impl Relay {
         }
         if accepted_stop && self.direct.is_empty() && self.steering.is_empty() {
             self.stopped = true;
+        }
+    }
+
+    /// A public Roster turn may nominate its next peer. User queues, stop
+    /// eligibility, and the automated turn limit retain their normal priority.
+    pub fn finish_with_handoff(
+        &mut self,
+        slot: RosterSlot,
+        direct: bool,
+        accepted_stop: bool,
+        target: Option<RosterSlot>,
+    ) {
+        self.finish(slot, direct, accepted_stop);
+        if self.strategy == CollaborationStrategy::Roster
+            && !direct
+            && !accepted_stop
+            && let Some(target) = target.filter(|target| *target != slot && self.routable(*target))
+        {
+            self.handoff_next = Some(target);
         }
     }
 
@@ -473,6 +547,12 @@ impl Relay {
     }
 
     fn next_automatic_slot(&mut self, first: RosterSlot) -> RosterSlot {
+        if let Some(target) = self.handoff_next.take()
+            && self.strategy == CollaborationStrategy::Roster
+            && self.routable(target)
+        {
+            return target;
+        }
         match self.strategy {
             CollaborationStrategy::Roster | CollaborationStrategy::Manual => self
                 .next
@@ -511,6 +591,142 @@ impl Relay {
 #[cfg(test)]
 mod tests {
     use super::{CollaborationStrategy, Relay, RelayDecision, STOP_TOKEN, strip_stop_token};
+
+    #[test]
+    fn handoff_parser_requires_an_exact_numeric_suffix() {
+        for (text, expected) in [
+            ("done [CODESWARM:NEXT:3]\n\t", Some(2)),
+            ("[CODESWARM:NEXT:12]", Some(11)),
+            ("[CODESWARM:NEXT:0]", None),
+            ("[CODESWARM:NEXT:-1]", None),
+            ("[CODESWARM:NEXT:]", None),
+            ("[CODESWARM:NEXT:Codex]", None),
+            ("[CODESWARM:NEXT: 3]", None),
+            ("[CODESWARM:NEXT:3] more", None),
+            ("`[CODESWARM:NEXT:3]`", None),
+            ("[CODESWARM:NEXT:999999999999999999999999999]", None),
+        ] {
+            assert_eq!(super::requested_next_slot(text), expected, "{text}");
+        }
+        let token = "[CODESWARM:NEXT:12]";
+        for split in 1..token.len() {
+            let text = format!("✈ ready {}", &token[..split]);
+            assert_eq!(super::control_token_visible_end(&text), "✈ ready ".len());
+        }
+        assert_eq!(
+            super::strip_control_tokens("✈ [CODESWARM:NEXT:3] done [CODESWARM:STOP]"),
+            "✈  done "
+        );
+        assert_eq!(
+            super::strip_control_tokens("[CODESWARM:NEXT:no]"),
+            "[CODESWARM:NEXT:no]"
+        );
+    }
+
+    #[test]
+    fn handoff_preserves_ring_fallback_queues_and_limits() {
+        for target in [None, Some(0), Some(99), Some(2)] {
+            let mut relay = Relay::new(3, 10);
+            relay.begin("task", 0);
+            relay.tombstone(2).unwrap();
+            relay.finish_with_handoff(0, false, false, target);
+            assert!(matches!(
+                relay.begin("", 0),
+                RelayDecision::Dispatch { slot: 1, .. }
+            ));
+        }
+        let mut relay = Relay::new(4, 10);
+        relay.begin("task", 0);
+        relay.finish_with_handoff(0, false, false, Some(3));
+        relay.mark_limited(3).unwrap();
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch { slot: 1, .. }
+        ));
+        relay.finish_with_handoff(1, false, false, Some(2));
+        relay.swap_agents(0, 2).unwrap();
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch {
+                slot: 0,
+                can_stop: true,
+                ..
+            }
+        ));
+        relay.finish_with_handoff(0, false, false, Some(2));
+        relay.enqueue_human("steer", Some(1));
+        assert!(
+            matches!(relay.begin("", 0), RelayDecision::Dispatch { slot: 1, prompt, can_stop: false, .. } if prompt == "steer")
+        );
+        relay.finish_with_handoff(1, false, false, Some(2));
+        relay.enqueue_direct(0, "private").unwrap();
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch {
+                slot: 0,
+                direct: true,
+                ..
+            }
+        ));
+
+        let mut relay = Relay::new(3, 1);
+        relay.begin("task", 0);
+        relay.finish_with_handoff(0, false, false, Some(2));
+        assert_eq!(relay.begin("", 0), RelayDecision::Complete);
+    }
+
+    #[test]
+    fn handoff_resumes_ring_from_recipient_and_requires_all_peers_before_stop() {
+        let mut relay = Relay::new(3, 10);
+        relay.begin("task", 0);
+        relay.finish_with_handoff(0, false, false, Some(2));
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch {
+                slot: 2,
+                can_stop: false,
+                ..
+            }
+        ));
+        relay.finish(2, false, false);
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch {
+                slot: 0,
+                can_stop: false,
+                ..
+            }
+        ));
+        relay.finish(0, false, false);
+        assert!(matches!(
+            relay.begin("", 0),
+            RelayDecision::Dispatch {
+                slot: 1,
+                can_stop: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn handoff_does_not_override_private_pair_manual_or_stop() {
+        for (strategy, direct, stop) in [
+            (CollaborationStrategy::Roster, true, false),
+            (CollaborationStrategy::Pair, false, false),
+            (CollaborationStrategy::Manual, false, false),
+            (CollaborationStrategy::Roster, false, true),
+        ] {
+            let mut relay = Relay::new(3, 10);
+            relay.set_strategy(strategy);
+            relay.begin("task", 0);
+            relay.finish_with_handoff(0, direct, stop, Some(2));
+            assert_eq!(relay.handoff_next, None);
+            assert!(!matches!(
+                relay.begin("", 0),
+                RelayDecision::Dispatch { slot: 2, .. }
+            ));
+        }
+    }
 
     #[test]
     fn relay_moves_around_the_ring_without_self_review() {

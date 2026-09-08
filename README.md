@@ -158,6 +158,16 @@ replayed to peers. The roster introduction is sent once per adapter process;
 replacement agents also receive the original shared task after old journal
 entries have been pruned.
 
+In **Roster** mode, agents can choose the next peer by ending their final
+message with `[CODESWARM:NEXT:3]`, where `3` is the recipient's one-based roster
+number. Each turn's prompt lists the current eligible recipients and their
+markers, so duplicate agent names remain unambiguous. CodeSwarm hides markers
+from the transcript and shared context. A handoff takes effect only when the
+turn completes, after all message, thought, and tool activity. Invalid,
+unavailable, or self-targets use normal roster order. Queued user input takes
+priority, and automated turn limits and review-stop eligibility still apply.
+Handoffs are disabled for private turns, Pair review, Manual, and solo sessions.
+
 The interface keeps streamed output coalesced and transcript rows cached, so a
 5,000-word response remains interactive in constrained terminals.
 

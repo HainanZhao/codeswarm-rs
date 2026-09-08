@@ -682,6 +682,7 @@ impl PromptEditor {
 
     /// Apply one backend-agnostic key. Plain Enter submits; Shift+Enter (or
     /// Ctrl+Enter) inserts a newline. Tab cycles slash-command completions.
+    /// Alt+Left/Right use the editor's native word movement bindings.
     pub fn handle_input(&mut self, input: Input) -> PromptAction {
         if input.key == Key::Enter && !input.ctrl && !input.alt && !input.shift {
             let prompt = self.text();
@@ -717,6 +718,17 @@ impl PromptEditor {
             return PromptAction::Changed;
         }
         let cursor_before = self.cursor();
+        // The textarea binds word movement to Ctrl+arrows and Alt+B/F.
+        // Accept Alt+arrows too, preserving Shift for word selection.
+        let input = if input.alt && !input.ctrl && matches!(input.key, Key::Left | Key::Right) {
+            Input {
+                ctrl: true,
+                alt: false,
+                ..input
+            }
+        } else {
+            input
+        };
         let modified = self.textarea.input(input);
         let cursor_moved = self.cursor() != cursor_before;
         if modified {
@@ -4770,7 +4782,7 @@ fn render_keyboard_help(buffer: &mut Buffer, area: Rect) {
     let lines = [
         " Help · Esc / F1 / ? close · /help toggles",
         " Scroll: wheel or PgUp/PgDn · Ctrl+↑/↓ fine · End follow tail",
-        " Input: Enter send · Shift+Enter newline · Tab complete",
+        " Input: Enter send · Shift+Enter newline · Tab complete · Alt+←/→ word",
         " Turn: Ctrl+Enter direct · Ctrl+C cancel · Ctrl+K cancel queued",
         " Agents: /agent SLOT /reload · Goal: /goal [objective|run|done|clear]",
         " Session: /resume /sessions /status /summary /clear /exit",
@@ -6009,6 +6021,84 @@ mod tests {
     }
 
     #[test]
+    fn prompt_alt_arrows_move_by_word_across_unicode_lines_and_replaced_drafts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        for (draft, moves) in [
+            (
+                "one two",
+                vec![
+                    (KeyCode::Left, (0, 4)),
+                    (KeyCode::Left, (0, 0)),
+                    (KeyCode::Left, (0, 0)),
+                    (KeyCode::Right, (0, 4)),
+                    (KeyCode::Right, (0, 7)),
+                    (KeyCode::Right, (0, 7)),
+                ],
+            ),
+            (
+                "héllo   世界\nnext word",
+                vec![
+                    (KeyCode::Left, (1, 5)),
+                    (KeyCode::Left, (1, 0)),
+                    (KeyCode::Left, (0, 10)),
+                    (KeyCode::Left, (0, 8)),
+                    (KeyCode::Left, (0, 0)),
+                    (KeyCode::Right, (0, 8)),
+                    (KeyCode::Right, (1, 0)),
+                    (KeyCode::Right, (1, 5)),
+                    (KeyCode::Right, (1, 9)),
+                ],
+            ),
+            ("", vec![(KeyCode::Left, (0, 0)), (KeyCode::Right, (0, 0))]),
+        ] {
+            app.prompt = draft.into();
+            app.sync_prompt_editor();
+            for (code, expected) in moves {
+                let before = app.prompt_editor.cursor();
+                let action =
+                    app.handle_prompt_input(Input::from(KeyEvent::new(code, KeyModifiers::ALT)));
+                assert_eq!(
+                    app.prompt_editor.cursor(),
+                    expected,
+                    "draft={draft:?}, key={code:?}"
+                );
+                assert_eq!(
+                    action,
+                    if before == expected {
+                        PromptAction::Ignored
+                    } else {
+                        PromptAction::Changed
+                    }
+                );
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                assert_eq!(app.prompt, draft);
+                assert_eq!(app.prompt_editor.cursor(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_alt_shift_arrow_selects_a_word_for_replacement() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App {
+            prompt: "one two".into(),
+            ..App::default()
+        };
+        app.handle_prompt_input(Input::from(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        )));
+        app.handle_prompt_input(key(Key::Char('X')));
+        assert_eq!(app.prompt, "one X");
+        app.handle_prompt_input(key(Key::Left));
+        assert_eq!(app.prompt_editor.cursor(), (0, 4));
+        app.handle_prompt_input(key(Key::Right));
+        assert_eq!(app.prompt_editor.cursor(), (0, 5));
+    }
+
+    #[test]
     fn chrome_uses_adaptive_surfaces_and_one_teal_accent() {
         assert_eq!(TRANSCRIPT_BG, Color::Reset);
         assert_eq!(STATUS_BG, Color::Reset);
@@ -6337,6 +6427,39 @@ mod tests {
             .expect("draw");
         let rendered = terminal.backend().buffer();
         assert!(rendered.content().iter().any(|cell| cell.symbol() == "w"));
+    }
+
+    #[test]
+    fn user_messages_have_one_gap_after_replaced_output() {
+        let mut app = App::default();
+        let previous = app.transcript.append(BlockKind::Agent, "answer", false);
+        app.transcript.append(BlockKind::Terminal, "hidden", true);
+        app.transcript.append(BlockKind::Human, "You: next", false);
+
+        // Replacements must both add missing spacing and reuse existing blank
+        // rows, including whitespace-only output, across cached widths.
+        for source in ["answer", "answer\n", "answer\n \n", "answer"] {
+            app.transcript
+                .replace(previous, BlockKind::Agent, source, false);
+            for width in [60, 40, 60] {
+                let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                let rows = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .chunks(width as usize)
+                    .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                    .collect::<Vec<_>>();
+                let answer = rows.iter().position(|row| row.contains("answer")).unwrap();
+                let user = rows
+                    .iter()
+                    .position(|row| row.contains("› You: next"))
+                    .unwrap();
+                assert_eq!(user, answer + 2, "source={source:?}, rows={rows:?}");
+                assert!(rows[user - 1].trim().is_empty());
+            }
+        }
     }
 
     #[test]

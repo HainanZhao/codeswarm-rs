@@ -43,6 +43,14 @@
   not override permissions, turn limits, or current user instructions.
 - Each agent's first prompt includes a brief roster introduction identifying
   itself and its active collaborators.
+- In Roster mode, a public agent turn may end its final message with
+  `[CODESWARM:NEXT:N]` to choose one-based roster slot N as the next peer.
+  Each turn's prompt lists current eligible names and markers. Only the final
+  contiguous message segment after all meaningful activity may route a turn;
+  trailing whitespace is allowed. Hide complete markers from streamed text
+  and public context. Invalid, unavailable, or self-targets keep normal ring
+  order. Queued user input, turn limits, and stop eligibility retain priority.
+  Private, Pair review, Manual, and solo turns cannot request handoffs.
 - Replacement adapters also receive the retained original public task, even
   after its journal entry has been pruned. Private prompts never replace it.
 - Untagged human messages submitted while an agent is working are queued back

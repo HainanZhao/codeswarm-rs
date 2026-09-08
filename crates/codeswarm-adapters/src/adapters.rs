@@ -20,7 +20,8 @@ use crate::{
     reduce,
     relay::{
         CollaborationStrategy, DEFAULT_STOP_ACKNOWLEDGMENT, Relay, RelayDecision, STOP_TOKEN,
-        is_usage_limit_response, stop_token_visible_end, strip_stop_token,
+        control_token_visible_end, is_usage_limit_response, requested_next_slot,
+        strip_control_tokens, strip_stop_token,
     },
     resources,
 };
@@ -1576,8 +1577,33 @@ impl RelayHost {
             } else {
                 "\n\n"
             };
+        // Refresh target numbers every turn: roster members may have been
+        // added, replaced, reordered, dropped, or usage-limited since introduction.
+        let handoff_block = if self.relay.strategy() == CollaborationStrategy::Roster && !*direct {
+            let targets = self
+                .relay
+                .routable_slots()
+                .filter(|candidate| candidate != slot)
+                .map(|candidate| {
+                    format!(
+                        "[CODESWARM:NEXT:{}] → {}",
+                        candidate + 1,
+                        self.roster_names
+                            .get(candidate)
+                            .cloned()
+                            .unwrap_or_else(|| self.hosts[candidate].adapter().display_name())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n\nRoster handoff: to choose the next agent instead of normal roster order, end your final message with exactly one of the following markers:\n{targets}\nUse only a listed target, never yourself. The marker must follow all text, reasoning, and tool activity; only trailing whitespace is allowed. CodeSwarm hides it and routes at turn completion. Without a valid marker, normal roster order applies. Unavailable targets are ignored. Queued user input takes priority; turn limits and review-stop rules still apply. Choose either a handoff marker or the stop marker, not both."
+            )
+        } else {
+            "\n\nAgent-directed handoff markers are disabled on this turn; they only route public turns in Roster mode.".to_owned()
+        };
         let prompt = format!(
-            "{introduction}{separator}{prompt}{role_separator}{role_block}\n\n{}",
+            "{introduction}{separator}{prompt}{role_separator}{role_block}\n\n{}{handoff_block}",
             if effective_can_stop {
                 format!(
                     "You are reviewing another agent. If no meaningful correction is needed,\nend your final response with {STOP_TOKEN}, optionally preceded by an emoji.\nOnly a terminal marker after all reasoning and tool activity requests a stop. A marker followed by more output or activity is non-stopping reasoning. Trailing whitespace is allowed.\nCodeSwarm hides the token and evaluates it only when your turn is complete."
@@ -1618,7 +1644,7 @@ impl RelayHost {
             self.last_public_dispatch = Some(*slot);
         }
         let mut response = String::new();
-        // Only the final contiguous message segment can request a stop.
+        // Only the final contiguous message segment can request a stop or handoff.
         // Later reasoning/tool activity invalidates an earlier marker.
         let mut stop_segment_start = 0;
         let mut emitted_text = 0usize;
@@ -1737,7 +1763,7 @@ impl RelayHost {
                     stop_segment_start = response.len();
                 }
                 AgentEvent::TurnComplete { .. } => {
-                    let visible_response = response.replace(STOP_TOKEN, "");
+                    let visible_response = strip_control_tokens(&response);
                     let visible_start = emitted_text.min(visible_response.len());
                     let visible_start = floor_char_boundary(&visible_response, visible_start);
                     if visible_start < visible_response.len()
@@ -1774,8 +1800,8 @@ impl RelayHost {
             }
             if let AgentEvent::Text { .. } = &update.event {
                 // Only a possible split marker needs to wait for another chunk.
-                let visible_response = response.replace(STOP_TOKEN, "");
-                let visible_end = stop_token_visible_end(&visible_response);
+                let visible_response = strip_control_tokens(&response);
+                let visible_end = control_token_visible_end(&visible_response);
                 if emitted_text < visible_end {
                     if let Some(sink) = &self.event_sink {
                         sink(AgentEvent::Text {
@@ -1792,8 +1818,9 @@ impl RelayHost {
         let requested_stop = response[stop_segment_start..]
             .trim_end()
             .ends_with(STOP_TOKEN);
+        let next_slot = requested_next_slot(&response[stop_segment_start..]);
         let (response, _) = strip_stop_token(&response);
-        let response = response.replace(STOP_TOKEN, "");
+        let response = strip_control_tokens(&response);
         let accepted_stop = requested_stop && effective_can_stop;
         let needs_stop_acknowledgment = accepted_stop && response.is_empty();
         let response = if needs_stop_acknowledgment {
@@ -1836,7 +1863,8 @@ impl RelayHost {
                 .record_public(public_context_speaker(&speaker_name), response);
         }
         self.relay.mark_context_seen(*slot);
-        self.relay.finish(*slot, *direct, accepted_stop);
+        self.relay
+            .finish_with_handoff(*slot, *direct, accepted_stop, next_slot);
         self.queue_session_metadata()?;
         Ok(decision)
     }
@@ -6456,6 +6484,118 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                 updates[7].clone(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn roster_handoff_routes_only_terminal_message_markers_and_refreshes_targets() {
+        let text = |value: &str| AgentEvent::Text {
+            slot: 0,
+            text: value.into(),
+        };
+        let thought = || AgentEvent::Thought {
+            slot: 0,
+            text: "still checking".into(),
+        };
+        let tool = || AgentEvent::Tool {
+            slot: 0,
+            update: crate::ToolUpdate {
+                id: "read".into(),
+                title: "Read file".into(),
+                status: ToolStatus::Running,
+                detail: None,
+            },
+        };
+        let cases = vec![
+            (vec![text("result [CODESWARM:NEXT:3]\n ")], 2),
+            (
+                vec![text("result [CODESWARM:"), text("NEXT:"), text("3]")],
+                2,
+            ),
+            (vec![text("result [CODESWARM:NEXT:3]"), text(" more")], 1),
+            (vec![text("result [CODESWARM:NEXT:3]"), thought()], 1),
+            (
+                vec![text("result [CODESWARM:NEXT:3]"), tool(), text(" ")],
+                1,
+            ),
+            (
+                vec![text("result [CODESWARM:NEXT:"), thought(), text("3]")],
+                1,
+            ),
+            (
+                vec![text("result"), thought(), text("[CODESWARM:NEXT:3]")],
+                2,
+            ),
+            (vec![text("result [CODESWARM:NEXT:1]")], 1),
+            (vec![text("result [CODESWARM:NEXT:0]")], 1),
+            (vec![text("result [CODESWARM:NEXT:99]")], 1),
+            (
+                vec![
+                    text("result [CODESWARM:NEXT:3]"),
+                    AgentEvent::UsageUpdated {
+                        slot: 0,
+                        usage: crate::UsageUpdate { used: 1, size: 100 },
+                    },
+                ],
+                2,
+            ),
+        ];
+        for (mut updates, expected) in cases {
+            updates.push(AgentEvent::TurnComplete { slot: 0 });
+            let first = ScriptedAdapter::new(0, AgentCapabilities::default(), updates);
+            let hosts = std::iter::once(AdapterHost::new(Box::new(first), None))
+                .chain((1..3).map(|slot| {
+                    AdapterHost::new(
+                        Box::new(ScriptedAdapter::new(
+                            slot,
+                            AgentCapabilities::default(),
+                            [AgentEvent::TurnComplete { slot }],
+                        )),
+                        None,
+                    )
+                }))
+                .collect();
+            let mut relay = RelayHost::new(hosts, 10).unwrap();
+            relay.set_roster_names(vec!["Worker".into(), "Codex".into(), "Codex".into()]);
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = events.clone();
+            relay.set_event_sink(move |event| captured.lock().unwrap().push(event));
+            relay.start().await.unwrap();
+            relay.run_turn("task", 0).await.unwrap();
+            let prompt = &relay.dispatches()[0].1;
+            assert!(prompt.contains("[CODESWARM:NEXT:2] → Codex"));
+            assert!(prompt.contains("[CODESWARM:NEXT:3] → Codex"));
+            assert!(!prompt.contains("[CODESWARM:NEXT:1]"));
+            // The new names must appear even when introduction has already run.
+            relay.introduced.fill(true);
+            relay.set_roster_names(vec!["Replacement".into(), "Codex".into(), "Codex".into()]);
+            let next = relay.run_turn("", 0).await.unwrap();
+            assert!(
+                matches!(next, RelayDecision::Dispatch { slot, can_stop: false, .. } if slot == expected),
+                "{next:?}"
+            );
+            let prompt = &relay.dispatches()[1].1;
+            assert!(prompt.contains("[CODESWARM:NEXT:1] → Replacement"));
+            assert!(prompt.contains("result"));
+            let public = prompt
+                .split("Public updates:\n")
+                .nth(1)
+                .unwrap()
+                .split("\n\nDo not use")
+                .next()
+                .unwrap();
+            assert!(!public.contains("[CODESWARM:NEXT:"));
+            let visible = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert!(visible.contains("result"));
+            assert!(!visible.contains("[CODESWARM:"), "{visible}");
+        }
     }
 
     #[tokio::test]

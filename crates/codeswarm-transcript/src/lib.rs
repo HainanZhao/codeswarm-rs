@@ -324,6 +324,19 @@ impl Transcript {
                 header_speaker = None;
             }
             self.block_starts.insert(block.id, self.rows.len());
+            if block.kind == BlockKind::Human
+                && self
+                    .rows
+                    .last()
+                    .is_some_and(|row| !row.text.trim().is_empty())
+            {
+                self.rows.push(RenderRow {
+                    block_id: block.id,
+                    kind: BlockKind::Human,
+                    first_in_block: false,
+                    text: String::new(),
+                });
+            }
             // Terminal lifecycle stays available for export without adding
             // noisy create/output/exit records to the conversation.
             if block.kind == BlockKind::Terminal {

@@ -14,20 +14,23 @@ pub(super) enum SavedEvent {
 #[derive(Clone, Debug)]
 pub(super) struct SavedConversation {
     pub id: Option<String>,
+    /// Display names saved with the archive entry. These remain available
+    /// even when provider metadata is missing, partial, or no longer usable.
+    pub roster: Vec<String>,
     pub metadata: SessionMetadata,
     pub events: Vec<SavedEvent>,
     pub warnings: Vec<String>,
 }
 
 pub(super) fn replay_conversation(app: &mut App, conversation: &SavedConversation) {
-    seed_saved_roster(app, &conversation.metadata);
+    seed_saved_roster(app, &conversation.roster, &conversation.metadata);
     for event in &conversation.events {
         match event {
             SavedEvent::Human { text, direct } => app.record_human_message(text, *direct),
             SavedEvent::Agent(event) => replay_display_event(app, event),
         }
     }
-    seed_saved_roster(app, &conversation.metadata);
+    seed_saved_roster(app, &conversation.roster, &conversation.metadata);
     if !conversation.warnings.is_empty() {
         app.status = format!(
             "history loaded with {} unreadable journal record(s)",
@@ -75,14 +78,26 @@ pub(super) fn replay_display_event(app: &mut App, event: &AgentEvent) {
 
 /// Display identity is available even if the provider handle is expired or
 /// absent. Reading local history must not depend on provider resumability.
-pub(super) fn seed_saved_roster(app: &mut App, metadata: &SessionMetadata) {
+pub(super) fn seed_saved_roster(app: &mut App, roster: &[String], metadata: &SessionMetadata) {
+    for (slot, name) in roster.iter().enumerate() {
+        app.set_agent_name(slot, name);
+        app.apply_event(&AgentEvent::Ready {
+            slot,
+            capabilities: Default::default(),
+        });
+    }
     if let Some(agents) = metadata.get("agents").and_then(serde_json::Value::as_array) {
-        for (slot, agent) in agents.iter().enumerate() {
-            let name = agent
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Saved agent");
-            app.set_agent_name(slot, name);
+        for (index, agent) in agents.iter().enumerate() {
+            let slot = agent
+                .get("slot")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|slot| usize::try_from(slot).ok())
+                .unwrap_or(index);
+            if roster.get(slot).is_none()
+                && let Some(name) = agent.get("name").and_then(serde_json::Value::as_str)
+            {
+                app.set_agent_name(slot, name);
+            }
             if let Some(identity) = agent.get("identity").and_then(serde_json::Value::as_str) {
                 app.set_agent_identity(slot, identity);
             }
@@ -206,6 +221,7 @@ pub(super) fn load_conversation(id: &str, cwd: &Path) -> Result<SavedConversatio
     }
     Ok(SavedConversation {
         id: Some(archived.entry.id),
+        roster: archived.entry.roster,
         metadata: archived.metadata,
         warnings: archived.warnings,
         events: archived
@@ -653,7 +669,7 @@ mod tests {
                 .clone(),
         );
         let mut app = App::default();
-        seed_saved_roster(&mut app, &metadata);
+        seed_saved_roster(&mut app, &[], &metadata);
         assert!(resumable_slots(&metadata).is_empty());
         replay_display_event(
             &mut app,
@@ -678,6 +694,47 @@ mod tests {
                 .is_none()
         );
         assert_eq!(app.queued_count(), 0);
+    }
+
+    #[test]
+    fn archived_display_names_survive_resume_when_provider_metadata_is_stale() {
+        let metadata = SessionMetadata::new(
+            serde_json::json!({"agents":[
+                {"slot":0,"name":"Agent 1","identity":"anthropic.com"},
+                {"slot":1,"name":"Agent 2","identity":"openai.com"},
+                {"slot":2,"name":"Agent 3","identity":"antigravity.google.com"}
+            ]})
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let conversation = SavedConversation {
+            id: Some("saved".into()),
+            roster: vec!["Claude".into(), "Codex".into(), "Antigravity".into()],
+            metadata,
+            events: vec![
+                SavedEvent::Agent(AgentEvent::Text {
+                    slot: 0,
+                    text: "first".into(),
+                }),
+                SavedEvent::Agent(AgentEvent::TurnComplete { slot: 0 }),
+                SavedEvent::Agent(AgentEvent::Text {
+                    slot: 2,
+                    text: "third".into(),
+                }),
+            ],
+            warnings: Vec::new(),
+        };
+        let mut app = App::default();
+
+        replay_conversation(&mut app, &conversation);
+
+        assert_eq!(app.agent_name(0), "Claude");
+        assert_eq!(app.agent_name(1), "Codex");
+        assert_eq!(app.agent_name(2), "Antigravity");
+        let transcript = app.export_markdown();
+        assert!(transcript.contains("Claude"), "{transcript}");
+        assert!(transcript.contains("Antigravity"), "{transcript}");
     }
 
     #[test]

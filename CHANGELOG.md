@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-09-08
+
+### Added
+
+- In Roster mode, agents can route their completed public turn to a specific
+  eligible peer with a hidden terminal `[CODESWARM:NEXT:N]` marker.
+- Alt+Left/Right moves the prompt cursor by word, with Shift preserving word
+  selection.
+
+### Fixed
+
+- Resumed sessions retain the archived Claude, Codex, Antigravity, and other
+  agent display names even when provider metadata is missing or stale.
+- Keep one blank row between replaced agent output and the next human message.
+
 ## [0.10.3] - 2026-09-06
 
 ### Fixed

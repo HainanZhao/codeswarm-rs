@@ -638,6 +638,7 @@ fn main() -> std::io::Result<()> {
                     let metadata = saved_chat_resume().map_err(std::io::Error::other)?;
                     Launch::History(Box::new(product::SavedConversation {
                         id: None,
+                        roster: product::metadata_roster(&metadata),
                         metadata,
                         events: Vec::new(),
                         warnings: Vec::new(),
@@ -690,6 +691,7 @@ fn main() -> std::io::Result<()> {
                 drop(validated_launch);
                 launch = Launch::History(Box::new(product::SavedConversation {
                     id: None,
+                    roster: product::metadata_roster(&metadata),
                     metadata: *metadata,
                     events: Vec::new(),
                     warnings: Vec::new(),
@@ -2371,7 +2373,7 @@ fn spawn_agy_command(
     (receiver, controls, worker)
 }
 
-/// Hide CodeSwarm's relay marker when an adapter is run directly. Relay turns
+/// Hide CodeSwarm's relay markers when an adapter is run directly. Relay turns
 /// retain the marker until `RelayHost` decides whether a reviewer may stop;
 /// standalone `--agy` and `--acp` sessions have no such semantics and must
 /// never expose the control token in the transcript. A short UTF-8-safe tail
@@ -2381,30 +2383,19 @@ fn sanitize_direct_event(event: AgentEvent, response_tail: &mut String) -> Vec<A
     match event {
         AgentEvent::Text { slot, text } => {
             response_tail.push_str(&text);
-            let token = codeswarm_adapters::relay::STOP_TOKEN;
-            loop {
-                if let Some(index) = response_tail.find(token) {
-                    let prefix = response_tail[..index].to_owned();
-                    if !prefix.is_empty() {
-                        visible.push(AgentEvent::Text { slot, text: prefix });
-                    }
-                    *response_tail = response_tail[index + token.len()..].replace(token, "");
-                    continue;
-                }
-                let boundary = codeswarm_adapters::relay::stop_token_visible_end(response_tail);
-                if boundary > 0 {
-                    let prefix = response_tail[..boundary].to_owned();
-                    if !prefix.is_empty() {
-                        visible.push(AgentEvent::Text { slot, text: prefix });
-                    }
-                    *response_tail = response_tail[boundary..].to_owned();
-                }
-                break;
+            *response_tail = codeswarm_adapters::relay::strip_control_tokens(response_tail);
+            let boundary = codeswarm_adapters::relay::control_token_visible_end(response_tail);
+            if boundary > 0 {
+                visible.push(AgentEvent::Text {
+                    slot,
+                    text: response_tail[..boundary].to_owned(),
+                });
+                *response_tail = response_tail[boundary..].to_owned();
             }
         }
         AgentEvent::TurnComplete { slot } => {
             let text =
-                std::mem::take(response_tail).replace(codeswarm_adapters::relay::STOP_TOKEN, "");
+                codeswarm_adapters::relay::strip_control_tokens(&std::mem::take(response_tail));
             if !text.is_empty() {
                 visible.push(AgentEvent::Text { slot, text });
             }
@@ -7044,6 +7035,42 @@ mod tests {
             },
         };
         assert_eq!(sanitize_direct_event(tool.clone(), &mut tail), vec![tool]);
+    }
+
+    #[test]
+    fn standalone_handoff_marker_stays_hidden_at_every_stream_boundary() {
+        let token = "[CODESWARM:NEXT:12]";
+        for split in 1..token.len() {
+            let mut tail = String::new();
+            let mut output = sanitize_direct_event(
+                AgentEvent::Text {
+                    slot: 0,
+                    text: format!("✈ ready {}", &token[..split]),
+                },
+                &mut tail,
+            );
+            assert_eq!(tail, token[..split]);
+            output.extend(sanitize_direct_event(
+                AgentEvent::Text {
+                    slot: 0,
+                    text: format!("{} done", &token[split..]),
+                },
+                &mut tail,
+            ));
+            output.extend(sanitize_direct_event(
+                AgentEvent::TurnComplete { slot: 0 },
+                &mut tail,
+            ));
+            let visible = output
+                .into_iter()
+                .filter_map(|event| match event {
+                    AgentEvent::Text { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(visible, "✈ ready  done");
+            assert!(tail.is_empty());
+        }
     }
 
     #[test]
