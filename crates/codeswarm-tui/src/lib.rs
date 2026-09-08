@@ -3594,7 +3594,10 @@ impl App {
                 self.active_agent = self.agent_name(*slot);
                 self.agent_states.insert(*slot, "working".into());
                 self.status = if update.status == ToolStatus::Failed {
-                    format!("tool failed: {}", update.title)
+                    format!(
+                        "tool failed: {}",
+                        update.title.trim().trim_start_matches('🔧').trim_start()
+                    )
                 } else if self.thinking_agents.contains(slot) {
                     "thinking".into()
                 } else {
@@ -4146,7 +4149,9 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
 }
 
 fn tool_call_summary(title: &str, status: ToolStatus) -> String {
-    let title = title.trim();
+    // Provider titles and replayed legacy rows may already contain the icon.
+    // The renderer owns the single clickable gutter icon.
+    let title = title.trim().trim_start_matches('🔧').trim_start();
     let mut parts = Vec::new();
     if !title.is_empty()
         && !title.eq_ignore_ascii_case("tool call")
@@ -4157,7 +4162,7 @@ fn tool_call_summary(title: &str, status: ToolStatus) -> String {
     if status != ToolStatus::Completed {
         parts.push(tool_status_label(status));
     }
-    format!("🔧 {}", parts.join(" · "))
+    parts.join(" · ")
 }
 
 fn tool_window_source(window: &ToolWindow) -> String {
@@ -4171,14 +4176,14 @@ fn tool_window_source(window: &ToolWindow) -> String {
                 .as_deref()
                 .and_then(|detail| detail.lines().rev().find(|line| !line.trim().is_empty()))
             {
-                if row.trim_end() != "🔧" {
+                if !row.trim().is_empty() {
                     row.push_str(" · ");
                 }
                 row.push_str(&detail.split_whitespace().collect::<Vec<_>>().join(" "));
             }
             row
         })
-        .filter(|row| row.trim() != "🔧")
+        .filter(|row| !row.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n");
     format!("{}{}", window.prefix, calls)
@@ -9546,20 +9551,57 @@ mod tests {
     fn tool_summaries_omit_generic_labels_and_counts_but_keep_failures() {
         assert_eq!(
             super::tool_call_summary("Tool call", codeswarm_adapters::ToolStatus::Completed),
-            "🔧 "
+            ""
         );
         assert_eq!(
             super::tool_call_summary("Read file", codeswarm_adapters::ToolStatus::Completed),
-            "🔧 Read file"
+            "Read file"
         );
         assert_eq!(
             super::tool_call_summary("Tool call", codeswarm_adapters::ToolStatus::Failed),
-            "🔧 failed"
+            "failed"
         );
         assert_eq!(
             super::tool_call_summary("Read file", codeswarm_adapters::ToolStatus::Running),
-            "🔧 Read file · running"
+            "Read file · running"
         );
+        assert_eq!(
+            super::tool_call_summary("🔧 error", codeswarm_adapters::ToolStatus::Failed),
+            "error · failed"
+        );
+    }
+
+    #[test]
+    fn expanded_tool_error_has_one_gutter_icon() {
+        let mut app = App::default();
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
+            slot: 0,
+            update: codeswarm_adapters::ToolUpdate {
+                id: "error-tool".into(),
+                title: "🔧 error".into(),
+                status: codeswarm_adapters::ToolStatus::Failed,
+                detail: Some("provider error".into()),
+            },
+        });
+        assert_eq!(app.toggle_focused_detail(), Some(false));
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let wrench_count = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == "🔧")
+            .count();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(60)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(wrench_count, 1, "rendered={rendered:?}");
+        assert!(!rendered.iter().any(|row| row.contains("🔧  🔧")));
     }
 
     #[test]

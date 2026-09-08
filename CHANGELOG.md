@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Surface Codex reasoning summaries by enabling its JSON reasoning output, and
+  fall back to consolidated Claude thinking blocks when streaming deltas are
+  absent.
+- Keep a single clickable tool icon in the transcript gutter and suppress
+  empty Codex command output instead of rendering a literal `""`.
+
 ## [0.10.7] - 2026-09-08
 
 ### Fixed

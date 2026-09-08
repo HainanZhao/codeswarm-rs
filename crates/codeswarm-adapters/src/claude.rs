@@ -31,6 +31,7 @@ use super::{
 struct ParserState {
     tools: BTreeMap<String, ToolUpdate>,
     finished_tools: BTreeSet<String>,
+    streamed_thoughts: BTreeMap<u64, String>,
 }
 
 fn content_text(value: &Value) -> Option<String> {
@@ -155,8 +156,13 @@ fn parse_stream_event(
         return None;
     }
     let event = value.get("event")?;
+    let event_type = event.get("type").and_then(Value::as_str)?;
+    if event_type == "message_start" {
+        state.streamed_thoughts.clear();
+        return None;
+    }
     let index = event.get("index").and_then(Value::as_u64);
-    match event.get("type").and_then(Value::as_str)? {
+    match event_type {
         "content_block_delta" => {
             let delta = event.get("delta")?;
             match delta.get("type").and_then(Value::as_str)? {
@@ -168,14 +174,21 @@ fn parse_stream_event(
                         slot,
                         text: text.to_owned(),
                     }),
-                "thinking_delta" => delta
-                    .get("thinking")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                    .map(|text| AgentEvent::Thought {
+                "thinking_delta" => {
+                    let text = delta
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())?;
+                    state
+                        .streamed_thoughts
+                        .entry(index?)
+                        .or_default()
+                        .push_str(text);
+                    Some(AgentEvent::Thought {
                         slot,
                         text: text.to_owned(),
-                    }),
+                    })
+                }
                 _ => None,
             }
         }
@@ -223,6 +236,48 @@ fn parse_stream_event(
         }
         _ => None,
     }
+}
+
+fn parse_consolidated_thoughts(
+    slot: RosterSlot,
+    value: &Value,
+    state: &mut ParserState,
+) -> Vec<AgentEvent> {
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(content) = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let events = content
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            if block.get("type").and_then(Value::as_str) != Some("thinking") {
+                return None;
+            }
+            let text = block
+                .get("thinking")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())?;
+            let streamed = state
+                .streamed_thoughts
+                .get(&(index as u64))
+                .map(String::as_str)
+                .unwrap_or_default();
+            let remainder = text.strip_prefix(streamed).unwrap_or(text);
+            (!remainder.is_empty()).then(|| AgentEvent::Thought {
+                slot,
+                text: remainder.to_owned(),
+            })
+        })
+        .collect();
+    state.streamed_thoughts.clear();
+    events
 }
 
 fn parse_tool_results(slot: RosterSlot, value: &Value, state: &mut ParserState) -> Vec<AgentEvent> {
@@ -542,6 +597,11 @@ impl AgentAdapter for ClaudeAdapter {
                         break;
                     }
                 }
+                for event in parse_consolidated_thoughts(slot, &value, &mut state) {
+                    if sender.send(Ok(event)).await.is_err() {
+                        break;
+                    }
+                }
                 for event in parse_tool_uses(slot, &value, &mut state) {
                     if sender.send(Ok(event)).await.is_err() {
                         break;
@@ -702,8 +762,8 @@ impl AgentAdapter for ClaudeAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaudeAdapter, ParserState, parse_stream_event, parse_tool_progress, parse_tool_results,
-        parse_tool_uses,
+        ClaudeAdapter, ParserState, parse_consolidated_thoughts, parse_stream_event,
+        parse_tool_progress, parse_tool_results, parse_tool_uses,
     };
     use crate::{AgentAdapter, AgentEvent, ToolStatus};
     use serde_json::json;
@@ -716,7 +776,7 @@ mod tests {
             Some(AgentEvent::Text { slot: 2, text }) if text == "hello"
         ));
         assert!(matches!(
-            parse_stream_event(2, &json!({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"check"}}}), &mut state),
+            parse_stream_event(2, &json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"check"}}}), &mut state),
             Some(AgentEvent::Thought { text, .. }) if text == "check"
         ));
         assert!(matches!(
@@ -927,6 +987,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn consolidated_thoughts_fill_missing_deltas_without_duplication() {
+        let mut state = ParserState::default();
+        assert!(
+            parse_stream_event(
+                0,
+                &json!({"type":"stream_event","event":{"type":"message_start","message":{}}}),
+                &mut state,
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            parse_stream_event(
+                0,
+                &json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"first "}}}),
+                &mut state,
+            ),
+            Some(AgentEvent::Thought { text, .. }) if text == "first "
+        ));
+        let remainder = parse_consolidated_thoughts(
+            0,
+            &json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "thinking", "thinking": "first second"}]}
+            }),
+            &mut state,
+        );
+        assert!(matches!(
+            remainder.as_slice(),
+            [AgentEvent::Thought { text, .. }] if text == "second"
+        ));
+
+        let fallback = parse_consolidated_thoughts(
+            0,
+            &json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "thinking", "thinking": "gateway-only thought"}]}
+            }),
+            &mut state,
+        );
+        assert!(matches!(
+            fallback.as_slice(),
+            [AgentEvent::Thought { text, .. }] if text == "gateway-only thought"
+        ));
+    }
+
     #[tokio::test]
     async fn advertises_only_noninteractive_modes_and_accepts_full_model_ids() {
         let mut adapter = ClaudeAdapter::new(0, std::env::current_dir().unwrap(), "claude");
@@ -970,7 +1076,7 @@ mod tests {
         std::fs::write(
             &script_path,
             format!(
-                "printf '%s\\n' \"$*\" >> '{}'\nsed -n 'p' >> '{}'\nprintf '\\n' >> '{}'\nprintf '%s\\n' '{{\"type\":\"system\",\"session_id\":\"session-native\"}}' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"hello\",\"session_id\":\"session-native\"}}'\n",
+                "printf '%s\\n' \"$*\" >> '{}'\nsed -n 'p' >> '{}'\nprintf '\\n' >> '{}'\nprintf '%s\\n' '{{\"type\":\"system\",\"session_id\":\"session-native\"}}' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"thinking\",\"thinking\":\"checked context\"}}]}}}}' '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"hello\",\"session_id\":\"session-native\"}}'\n",
                 args_path.display(),
                 stdin_path.display(),
                 stdin_path.display()
@@ -996,6 +1102,10 @@ mod tests {
             Some(Ok(AgentEvent::Ready { .. }))
         ));
         adapter.send_prompt("-first prompt".into()).await.unwrap();
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Thought { text, .. })) if text == "checked context"
+        ));
         assert!(
             matches!(adapter.next_event().await, Some(Ok(AgentEvent::Text { text, .. })) if text == "hello")
         );
@@ -1005,6 +1115,10 @@ mod tests {
         ));
         assert_eq!(adapter.session_id(), Some("session-native".into()));
         adapter.send_prompt("second prompt".into()).await.unwrap();
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Thought { .. }))
+        ));
         assert!(matches!(
             adapter.next_event().await,
             Some(Ok(AgentEvent::Text { .. }))

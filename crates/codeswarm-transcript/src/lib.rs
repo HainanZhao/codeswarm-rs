@@ -507,8 +507,10 @@ fn collapsed_activity_preview(
 /// Full retained history remains available through Ctrl+O.
 fn rolling_tool_preview(source: &str, width: usize) -> String {
     let latest = source
-        .rsplit_once("\n🔧")
-        .map_or(source, |(_, latest)| latest);
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(source);
     let content = latest
         .trim_start_matches('🔧')
         .split_whitespace()
@@ -1040,8 +1042,7 @@ mod tests {
         let rows = transcript.viewport(48, 0, 10, 0);
         assert_eq!(rows[0].text, "Codex: [12:05]");
         assert_eq!(rows.len(), 2);
-        assert!(rows[1].text.starts_with("…"));
-        assert!(rows[1].text.ends_with("third output line"));
+        assert_eq!(rows[1].text, "third output line");
         assert!(rows[1..].iter().all(|row| row.kind == BlockKind::Tool));
     }
 

@@ -46,7 +46,7 @@ struct ParserState {
 
 fn text_value(value: Option<&Value>) -> Option<String> {
     value.and_then(|value| match value {
-        Value::String(text) if !text.is_empty() => Some(text.to_owned()),
+        Value::String(text) => (!text.is_empty()).then(|| text.to_owned()),
         Value::Null => None,
         Value::Object(object) => object
             .get("message")
@@ -466,7 +466,16 @@ impl AgentAdapter for CodexAdapter {
         if !fresh {
             command.arg("resume");
         }
-        command.arg("--json");
+        command
+            .arg("--json")
+            // `exec --json` reports reasoning token usage but omits reasoning
+            // items under Codex's default `none` summary policy. These
+            // invocation-local overrides make the provider's own reasoning
+            // summaries available to CodeSwarm's Thought event parser.
+            .arg("-c")
+            .arg("show_raw_agent_reasoning=true")
+            .arg("-c")
+            .arg("model_reasoning_summary=\"detailed\"");
         if let Some(model) = &self.model {
             command.arg("--model").arg(model);
         }
@@ -737,7 +746,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_value(1, &json!({"type":"item.started","item":{"id":"c1","type":"command_execution","command":"cargo test","status":"in_progress"}}), &mut state),
-            Some(AgentEvent::Tool { update, .. }) if update.status == ToolStatus::Running && update.title == "cargo test"
+            Some(AgentEvent::Tool { update, .. }) if update.status == ToolStatus::Running && update.title == "cargo test" && update.detail.is_none()
         ));
         assert!(matches!(
             parse_value(1, &json!({"type":"item.completed","item":{"id":"c1","type":"command_execution","status":"completed","aggregated_output":"ok"}}), &mut state),
@@ -874,6 +883,11 @@ printf '%s\n' '{{"type":"thread.started","thread_id":"thread-model"}}' '{{"type"
         ));
         let args = std::fs::read_to_string(&args_path).expect("captured arguments");
         assert!(args.contains("--model gpt-test"), "{args}");
+        assert!(args.contains("show_raw_agent_reasoning=true"), "{args}");
+        assert!(
+            args.contains("model_reasoning_summary=\"detailed\""),
+            "{args}"
+        );
         assert!(args.ends_with(" -\n"), "{args}");
         assert!(!args.contains("task with"), "{args}");
         assert!(
