@@ -3675,6 +3675,9 @@ impl App {
                 self.status = "batch complete".into();
             }
             AgentEvent::UsageLimitReached { slot, detail } => {
+                let had_visible_response = self
+                    .streaming_blocks
+                    .contains_key(&(*slot, crate::transcript::BlockKind::Agent));
                 self.thinking_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
@@ -3697,6 +3700,16 @@ impl App {
                     self.next_agent = self.next_roster_slot_after(*slot);
                 }
                 let name = self.agent_name(*slot);
+                if !had_visible_response {
+                    self.transcript.append(
+                        crate::transcript::BlockKind::Agent,
+                        format!(
+                            "{}Could not respond — {detail}",
+                            agent_message_prefix(&name)
+                        ),
+                        false,
+                    );
+                }
                 self.status = format!(
                     "{name} out of credits — skipped for this batch and retried next prompt · unselect in /settings if it persists ({detail})"
                 );
@@ -3706,6 +3719,9 @@ impl App {
                 started,
                 detail,
             } => {
+                let had_visible_response = self
+                    .streaming_blocks
+                    .contains_key(&(*slot, crate::transcript::BlockKind::Agent));
                 self.thinking_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
@@ -3724,6 +3740,16 @@ impl App {
                     self.permission = None;
                 }
                 self.active_agent = self.agent_name(*slot);
+                if !had_visible_response {
+                    self.transcript.append(
+                        crate::transcript::BlockKind::Agent,
+                        format!(
+                            "{}Could not respond — {detail}",
+                            agent_message_prefix(&self.active_agent)
+                        ),
+                        false,
+                    );
+                }
                 self.agent_states
                     .insert(*slot, if *started { "error" } else { "unavailable" }.into());
                 if self.next_agent == Some(*slot) {
@@ -6758,6 +6784,42 @@ mod tests {
             app.status.contains("retried next prompt"),
             "{:?}",
             app.status
+        );
+        assert!(
+            app.transcript
+                .markdown()
+                .contains("Could not respond — You've hit your usage limit."),
+            "{}",
+            app.transcript.markdown()
+        );
+    }
+
+    #[test]
+    fn failed_turn_without_output_is_printed_in_the_conversation() {
+        let mut app = App::default();
+        app.set_agent_name(1, "Qwen");
+        app.apply_event(&codeswarm_adapters::AgentEvent::TurnStarted { slot: 1 });
+        app.apply_event(&codeswarm_adapters::AgentEvent::Failed {
+            slot: 1,
+            started: true,
+            detail: "ACP turn stopped because the output token limit was reached".into(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("terminal");
+        terminal
+            .draw(|frame| super::render(frame, &mut app))
+            .expect("draw");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Qwen"), "rendered={rendered:?}");
+        assert!(
+            rendered.contains("output token limit was reached"),
+            "rendered={rendered:?}"
         );
     }
 

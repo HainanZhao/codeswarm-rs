@@ -3584,6 +3584,27 @@ impl AgentAdapter for AcpAdapter {
                     return Some(Err(AdapterError::Protocol(error.to_string())));
                 }
                 self.prompt_request_id = None;
+                if let Some(reason) = value
+                    .get("result")
+                    .and_then(|result| result.get("stopReason"))
+                    .and_then(Value::as_str)
+                    .filter(|reason| !matches!(*reason, "end_turn" | "cancelled"))
+                {
+                    let detail = match reason {
+                        "max_tokens" => {
+                            "ACP turn stopped because the output token limit was reached".into()
+                        }
+                        "max_turn_requests" => {
+                            "ACP turn stopped because the tool-turn limit was reached".into()
+                        }
+                        other => format!("ACP turn stopped before responding: {other}"),
+                    };
+                    return Some(Ok(AgentEvent::Failed {
+                        slot: self.slot,
+                        started: true,
+                        detail,
+                    }));
+                }
                 return Some(Ok(AgentEvent::TurnComplete { slot: self.slot }));
             }
         }
@@ -5346,6 +5367,27 @@ printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"timeou
         assert!(matches!(
             adapter.next_event().await,
             Some(Ok(AgentEvent::TurnComplete { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn acp_output_token_limit_is_reported_as_a_failed_turn() {
+        let script = r#"read _; echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{}}}'; read _; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session-1"}}'; read _; echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"max_tokens"}}'"#;
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut adapter = AcpAdapter::new(1, cwd, "sh", vec!["-c".into(), script.into()]);
+        adapter.start().await.expect("initialize");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Ready { .. }))
+        ));
+        adapter.send_prompt("hello".into()).await.expect("prompt");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Failed {
+                slot: 1,
+                started: true,
+                detail,
+            })) if detail.contains("output token limit")
         ));
     }
 
