@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.9] - 2026-09-09
+
+### Fixed
+
+- Surface ACP output-token exhaustion as a failed turn instead of silently
+  completing, and keep no-output failures and usage-limit errors visible in
+  the agent's conversation transcript.
+
 ## [0.10.8] - 2026-09-09
 
 ### Fixed
