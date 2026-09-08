@@ -117,13 +117,21 @@ fn tool_title(item: &Value, kind: &str) -> String {
 }
 
 fn tool_status(item: &Value, event_type: &str) -> ToolStatus {
+    if item
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .is_some_and(|exit_code| exit_code != 0)
+    {
+        return ToolStatus::Failed;
+    }
     match item
         .get("status")
         .and_then(Value::as_str)
         .or(Some(event_type))
     {
-        Some("completed") | Some("item.completed") => ToolStatus::Completed,
-        Some("failed") | Some("declined") | Some("cancelled") => ToolStatus::Failed,
+        Some("completed") | Some("success") | Some("item.completed") => ToolStatus::Completed,
+        Some("failed") | Some("error") | Some("errored") | Some("declined") | Some("cancelled")
+        | Some("item.failed") => ToolStatus::Failed,
         Some("in_progress") | Some("running") | Some("item.started") | Some("item.updated") => {
             ToolStatus::Running
         }
@@ -178,7 +186,7 @@ fn parse_value(slot: RosterSlot, value: &Value, state: &mut ParserState) -> Opti
         .unwrap_or_default();
     if matches!(
         event_type,
-        "item.started" | "item.updated" | "item.completed"
+        "item.started" | "item.updated" | "item.completed" | "item.failed"
     ) {
         let item = value.get("item")?;
         let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
@@ -735,6 +743,14 @@ mod tests {
         assert!(matches!(
             parse_value(1, &json!({"type":"item.completed","item":{"id":"c1","type":"command_execution","status":"completed","aggregated_output":"ok"}}), &mut state),
             Some(AgentEvent::Tool { update, .. }) if update.status == ToolStatus::Completed && update.detail.as_deref() == Some("ok")
+        ));
+        assert!(matches!(
+            parse_value(1, &json!({"type":"item.completed","item":{"id":"c2","type":"command_execution","exit_code":1,"aggregated_output":"command failed"}}), &mut state),
+            Some(AgentEvent::Tool { update, .. }) if update.status == ToolStatus::Failed && update.detail.as_deref() == Some("command failed")
+        ));
+        assert!(matches!(
+            parse_value(1, &json!({"type":"item.failed","item":{"id":"c3","type":"command_execution","status":"error","error":"spawn failed"}}), &mut state),
+            Some(AgentEvent::Tool { update, .. }) if update.status == ToolStatus::Failed && update.detail.as_deref() == Some("spawn failed")
         ));
         assert!(parse_value(1, &json!({"type":"turn.completed"}), &mut state).is_none());
         assert!(

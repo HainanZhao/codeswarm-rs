@@ -3184,6 +3184,15 @@ async fn run_relay_turn_with_controls(
             result = &mut turn => break result,
             command = controls.recv(), if !stopping => match command {
                 Some(AdapterControl::Cancel) => cancellation.request(),
+                Some(AdapterControl::Reload(slot)) => {
+                    // A silent-turn reload arrives while the turn future is
+                    // still waiting on the adapter. Request cancellation here
+                    // as well as deferring the actual restart, so `/reload`
+                    // cannot depend on a separate Cancel message being
+                    // observed first.
+                    cancellation.request();
+                    deferred.push(AdapterControl::Reload(slot));
+                }
                 Some(AdapterControl::Permission { slot, request_id, answer }) => {
                     if let Err(error) = permission_sender.send(RelayPermissionAnswer {
                         slot,
@@ -5604,6 +5613,37 @@ done
                 .1
                 .contains("Active shared goal: new objective")
         );
+    }
+
+    #[tokio::test]
+    async fn reload_control_cancels_a_silent_native_turn_before_restarting() {
+        let adapter =
+            super::ClaudeAdapter::new(0, std::env::current_dir().unwrap(), "sh -c 'sleep 10'");
+        let mut relay = RelayHost::new(vec![AdapterHost::new(Box::new(adapter), None)], 4).unwrap();
+        relay.start().await.unwrap();
+        let (sender, mut controls) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _receiver) = std::sync::mpsc::channel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        sender.send(AdapterControl::Reload(0)).unwrap();
+        let (_stopping, deferred, decision) = {
+            let turn = super::run_relay_turn_with_controls(
+                &mut relay,
+                &mut controls,
+                &events,
+                "stuck".into(),
+                0,
+            );
+            tokio::time::timeout(Duration::from_secs(5), turn)
+                .await
+                .expect("reload control should cancel the turn")
+        };
+        assert!(decision.is_none());
+        assert!(matches!(deferred.as_slice(), [AdapterControl::Reload(0)]));
+        tokio::time::timeout(Duration::from_secs(5), relay.reload(0))
+            .await
+            .expect("reload should not hang")
+            .expect("reload should restart the adapter");
+        relay.stop().await.unwrap();
     }
 
     #[test]

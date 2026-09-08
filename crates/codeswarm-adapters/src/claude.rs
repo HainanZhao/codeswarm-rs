@@ -724,4 +724,21 @@ mod tests {
         let _ = std::fs::remove_file(stdin_path);
         let _ = std::fs::remove_file(script_path);
     }
+
+    #[tokio::test]
+    async fn native_claude_reload_reaps_a_silent_turn() {
+        let mut adapter =
+            ClaudeAdapter::new(0, std::env::current_dir().unwrap(), "sh -c 'sleep 10'");
+        adapter.start().await.unwrap();
+        for _ in 0..3 {
+            assert!(adapter.next_event().await.is_some());
+        }
+        adapter.send_prompt("stuck".into()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), adapter.reload())
+            .await
+            .expect("reload should not hang")
+            .expect("reload should succeed");
+        assert!(adapter.child.is_none());
+        adapter.stop().await.unwrap();
+    }
 }
