@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.7] - 2026-09-08
+
+### Fixed
+
+- Align native Claude tool handling with the upstream ACP lifecycle, including
+  consolidated tool metadata, specialized server/MCP/code-execution results,
+  structured errors, and ID-safe progress heartbeats.
+- Make `/reload` cancel and reap a silent active agent before restarting it,
+  without interrupting a different healthy roster peer.
+- Preserve Codex tool failures reported through nonzero exit codes, error
+  statuses, interrupted states, and failed item events.
+
 ## [0.10.6] - 2026-09-08
 
 ### Added
