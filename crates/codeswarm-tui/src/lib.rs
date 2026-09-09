@@ -4181,6 +4181,11 @@ fn tool_call_summary(title: &str, status: ToolStatus) -> String {
     // Provider titles and replayed legacy rows may already contain the icon.
     // The renderer owns the single clickable gutter icon.
     let title = title.trim().trim_start_matches('🔧').trim_start();
+    let title = if title.eq_ignore_ascii_case("run command") {
+        "bash"
+    } else {
+        title
+    };
     let mut parts = Vec::new();
     if !title.is_empty()
         && !title.eq_ignore_ascii_case("tool call")
@@ -9699,6 +9704,25 @@ mod tests {
     }
 
     #[test]
+    fn generic_run_command_tool_renders_as_bash() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Codex");
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
+            slot: 0,
+            update: codeswarm_adapters::ToolUpdate {
+                id: "shell".into(),
+                title: "Run command".into(),
+                status: codeswarm_adapters::ToolStatus::Running,
+                detail: None,
+            },
+        });
+
+        let rendered = draw_to_string(&mut app, 80, 12);
+        assert!(rendered.contains("bash · running"), "{rendered:?}");
+        assert!(!rendered.contains("Run command"), "{rendered:?}");
+    }
+
+    #[test]
     fn tool_summaries_omit_generic_labels_and_counts_but_keep_failures() {
         assert_eq!(
             super::tool_call_summary("Tool call", codeswarm_adapters::ToolStatus::Completed),
@@ -9715,6 +9739,14 @@ mod tests {
         assert_eq!(
             super::tool_call_summary("Read file", codeswarm_adapters::ToolStatus::Running),
             "Read file · running"
+        );
+        assert_eq!(
+            super::tool_call_summary("Run command", codeswarm_adapters::ToolStatus::Running),
+            "bash · running"
+        );
+        assert_eq!(
+            super::tool_call_summary("Run tests", codeswarm_adapters::ToolStatus::Running),
+            "Run tests · running"
         );
         assert_eq!(
             super::tool_call_summary("🔧 error", codeswarm_adapters::ToolStatus::Failed),
