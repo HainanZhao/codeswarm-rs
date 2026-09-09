@@ -520,6 +520,23 @@ fn dispatch_queued_prompt(
     controls.is_some_and(|controls| controls.send(control).is_ok())
 }
 
+fn dispatch_next_queued_prompt(
+    app: &mut App,
+    controls: Option<&tokio::sync::mpsc::UnboundedSender<AdapterControl>>,
+    journal: &mut Option<product::ConversationJournal>,
+) -> bool {
+    let Some(queued) = app.next_queued_prompt().cloned() else {
+        return false;
+    };
+    if !dispatch_queued_prompt(controls, &queued) {
+        return false;
+    }
+    app.remove_queued_prompt(queued.id);
+    record_dispatched_prompt(app, journal, &queued.prompt, queued.direct);
+    app.status = "queued prompt dispatched".into();
+    true
+}
+
 fn dispatch_permission_action(
     controls: Option<&tokio::sync::mpsc::UnboundedSender<AdapterControl>>,
     action: PermissionAction,
@@ -2548,13 +2565,19 @@ async fn cancel_standalone_turn(
     let _ = sender.send(Err(result));
 }
 
-fn finish_pending_cancellation(app: &mut App, error_text: &str) -> bool {
+fn finish_pending_cancellation(
+    app: &mut App,
+    error_text: &str,
+    controls: Option<&tokio::sync::mpsc::UnboundedSender<AdapterControl>>,
+    journal: &mut Option<product::ConversationJournal>,
+) -> (bool, bool) {
     let cancelled =
         app.cancellation_pending() || error_text.to_ascii_lowercase().contains("cancelled");
     if cancelled {
         app.finish_turn_cancellation();
     }
-    cancelled
+    let dispatched = cancelled && dispatch_next_queued_prompt(app, controls, journal);
+    (cancelled, dispatched)
 }
 
 fn runtime_metadata_writer(
@@ -4161,18 +4184,9 @@ fn run_terminal(
                             notify_turn_complete(&app.active_agent);
                         }
                         if matches!(&event, AgentEvent::TurnComplete { .. })
-                            && let Some(queued) = app.next_queued_prompt().cloned()
-                            && dispatch_queued_prompt(controls.as_ref(), &queued)
+                            && dispatch_next_queued_prompt(app, controls.as_ref(), &mut journal)
                         {
-                            app.remove_queued_prompt(queued.id);
-                            record_dispatched_prompt(
-                                app,
-                                &mut journal,
-                                &queued.prompt,
-                                queued.direct,
-                            );
                             turn_active = true;
-                            app.status = "queued prompt dispatched".into();
                         }
                     }
                     Err(error) => {
@@ -4185,7 +4199,15 @@ fn run_terminal(
                         pending_permission = None;
                         app.clear_terminal_alerts();
                         mode_sync_in_flight = None;
-                        let cancelled = finish_pending_cancellation(app, &error_text);
+                        let (cancelled, queued_dispatched) = finish_pending_cancellation(
+                            app,
+                            &error_text,
+                            controls.as_ref(),
+                            &mut journal,
+                        );
+                        if queued_dispatched {
+                            turn_active = true;
+                        }
                         if !cancelled && app.failed_agent().is_none() {
                             let active_agent = app.active_agent.clone();
                             app.set_header(active_agent, format!("error: {error_text}"));
@@ -7248,12 +7270,45 @@ done
         app.request_turn_cancellation();
         assert!(app.cancellation_pending());
 
-        assert!(finish_pending_cancellation(
+        let (cancelled, dispatched) = finish_pending_cancellation(
             &mut app,
-            "adapter cancellation timed out"
-        ));
+            "adapter cancellation timed out",
+            None,
+            &mut None,
+        );
+        assert!(cancelled);
+        assert!(!dispatched);
         assert!(!app.cancellation_pending());
         assert_eq!(app.status, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_dispatches_the_next_queued_prompt() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Codex");
+        app.set_agent_name(1, "Qwen");
+        app.apply_event(&AgentEvent::TurnStarted { slot: 0 });
+        app.queue_prompt("continue after cancellation", Some(1), false)
+            .expect("queue prompt");
+        app.request_turn_cancellation();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let (cancelled, dispatched) =
+            finish_pending_cancellation(&mut app, "relay turn cancelled", Some(&sender), &mut None);
+
+        assert!(cancelled);
+        assert!(dispatched);
+        assert_eq!(app.queued_count(), 0);
+        assert_eq!(app.status, "queued prompt dispatched");
+        assert!(
+            app.export_markdown()
+                .contains("continue after cancellation")
+        );
+        assert!(matches!(
+            receiver.recv().await,
+            Some(AdapterControl::Queue { slot: 1, prompt })
+                if prompt == "continue after cancellation"
+        ));
     }
 
     #[tokio::test]
