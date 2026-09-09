@@ -1678,7 +1678,7 @@ impl RelayHost {
             "{introduction}{separator}{prompt}{role_separator}{role_block}\n\n{}{handoff_block}",
             if effective_can_stop {
                 format!(
-                    "You are reviewing another agent. If no meaningful correction is needed,\nend your final response with {STOP_TOKEN}, optionally preceded by an emoji.\nOnly a terminal marker after all reasoning and tool activity requests a stop. A marker followed by more output or activity is non-stopping reasoning. Trailing whitespace is allowed.\nCodeSwarm hides the token and evaluates it only when your turn is complete."
+                    "You are reviewing another agent. {STOP_TOKEN} is a global batch stop: it stops all other agents and ends the entire automated relay, not just your turn. Use it with extreme care.\nUse it only when the shared task is fully complete, no meaningful correction is needed, and no other agent should continue working. If there is any uncertainty, do not use it; state what remains and let the relay continue.\nWhen—and only when—those conditions are met, end your final response with {STOP_TOKEN}, optionally preceded by an emoji.\nOnly a terminal marker after all reasoning and tool activity requests a stop. A marker followed by more output or activity is non-stopping reasoning. Trailing whitespace is allowed.\nCodeSwarm hides the token and evaluates it only when your turn is complete."
                 )
             } else {
                 format!(
@@ -6331,6 +6331,17 @@ done
         assert!(relay.dispatches()[0].1.contains("1. Claude — you"));
         assert!(relay.dispatches()[0].1.contains("2. Codex"));
         assert!(relay.dispatches()[1].1.contains(STOP_TOKEN));
+        assert!(
+            relay.dispatches()[1]
+                .1
+                .contains("stops all other agents and ends the entire automated relay")
+        );
+        assert!(relay.dispatches()[1].1.contains("Use it with extreme care"));
+        assert!(
+            relay.dispatches()[1]
+                .1
+                .contains("If there is any uncertainty, do not use it")
+        );
         assert!(relay.dispatches()[0].1.contains("Do not use"));
         let lifecycle = events.lock().expect("events");
         let positions = lifecycle

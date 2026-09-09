@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Warn reviewers that `[CODESWARM:STOP]` ends the entire automated relay batch
+  for every agent, and require extreme care before emitting it.
+
 ## [0.10.9] - 2026-09-09
 
 ### Fixed
