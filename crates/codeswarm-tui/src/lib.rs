@@ -4424,7 +4424,7 @@ fn footer_agent_label(app: &App, slot: usize, active_count: usize) -> String {
         "working" => "●",
         "starting" => "◌",
         "error" => "!",
-        "limited" => "℃",
+        "limited" => "!",
         _ if app.collaboration == "Manual routing" && selected => "⌖",
         _ => "○",
     };
@@ -7539,6 +7539,27 @@ mod tests {
         assert!(!footer.contains("connection lost"));
         assert!(rendered.contains("Auto"));
         assert!(app.status.contains("/reload"));
+    }
+
+    #[test]
+    fn usage_limit_uses_the_error_marker_in_the_footer() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::default();
+        app.set_agent_name(0, "Codex");
+        app.apply_event(&codeswarm_adapters::AgentEvent::UsageLimitReached {
+            slot: 0,
+            detail: "You've hit your usage limit.".into(),
+        });
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw limited footer");
+        let footer = (0..80)
+            .map(|x| terminal.backend().buffer()[(x, 23)].symbol())
+            .collect::<String>();
+        assert!(footer.contains("! Codex"), "footer={footer:?}");
+        assert!(!footer.contains('℃'), "footer={footer:?}");
     }
 
     #[test]

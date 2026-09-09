@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Replace the accidental Celsius symbol beside usage-limited agents in the
+  footer with the standard error marker.
+
 ## [0.10.10] - 2026-09-09
 
 ### Fixed
