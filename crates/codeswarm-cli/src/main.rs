@@ -562,6 +562,17 @@ fn dispatch_permission_action(
     controls.is_some_and(|controls| controls.send(command).is_ok())
 }
 
+fn dispatch_auto_permission_action(
+    app: &mut App,
+    controls: Option<&tokio::sync::mpsc::UnboundedSender<AdapterControl>>,
+) -> bool {
+    if app.mode_policy() != Some("full-access") {
+        return false;
+    }
+    let action = app.auto_permission_action();
+    dispatch_permission_action(controls, action)
+}
+
 fn collaboration_strategy(label: &str) -> CollaborationStrategy {
     match label {
         "Manual routing" => CollaborationStrategy::Manual,
@@ -3260,16 +3271,18 @@ async fn run_relay_sequence_with_controls(
     first_slot: usize,
 ) -> (bool, Vec<AdapterControl>) {
     let mut task = task;
-    let mut elapsed_by_slot = std::collections::BTreeMap::<usize, u64>::new();
+    let mut elapsed_by_slot = std::collections::BTreeMap::<usize, Duration>::new();
     loop {
-        let turn_started = Instant::now();
+        // One continuous wall-clock interval covers the complete agent turn:
+        // prompt dispatch, thinking, tools, permissions, and final response.
+        let agent_started = Instant::now();
         let (stopping, deferred, decision) =
             run_relay_turn_with_controls(relay, controls, sender, task, first_slot).await;
         if stopping {
             return (true, deferred);
         }
         if let Some(RelayDecision::Dispatch { slot, .. }) = &decision {
-            *elapsed_by_slot.entry(*slot).or_default() += turn_started.elapsed().as_secs();
+            *elapsed_by_slot.entry(*slot).or_default() += agent_started.elapsed();
         }
         let mut blocking = Vec::new();
         for command in deferred {
@@ -3316,16 +3329,16 @@ async fn run_relay_sequence_with_controls(
 
 fn send_batch_complete(
     sender: &Sender<AdapterResult<AgentEvent>>,
-    elapsed_by_slot: &std::collections::BTreeMap<usize, u64>,
+    elapsed_by_slot: &std::collections::BTreeMap<usize, Duration>,
 ) {
     if elapsed_by_slot.is_empty() {
         return;
     }
     let elapsed = elapsed_by_slot
         .iter()
-        .map(|(slot, seconds)| codeswarm_adapters::BatchElapsed {
+        .map(|(slot, elapsed)| codeswarm_adapters::BatchElapsed {
             slot: *slot,
-            seconds: *seconds,
+            seconds: elapsed.as_secs(),
         })
         .collect();
     let _ = sender.send(Ok(AgentEvent::BatchComplete { elapsed }));
@@ -4079,8 +4092,20 @@ fn run_terminal(
                             | AgentEvent::UsageUpdated { .. } => {}
                         }
                         if let AgentEvent::Permission { slot, request } = &event {
-                            pending_permission = Some((*slot, request.id.clone()));
-                            app.terminal_alert(true);
+                            let auto = app.mode_policy() == Some("full-access");
+                            if auto && dispatch_auto_permission_action(app, controls.as_ref()) {
+                                app.clear_terminal_alerts();
+                                pending_permission = None;
+                            } else {
+                                // Building the auto answer consumes the prompt. If the
+                                // adapter channel is gone, restore it so the failure does
+                                // not leave the turn invisibly blocked.
+                                if auto {
+                                    app.apply_event(&event);
+                                }
+                                pending_permission = Some((*slot, request.id.clone()));
+                                app.terminal_alert(true);
+                            }
                         }
                         if matches!(
                             &event,
@@ -5312,16 +5337,17 @@ mod tests {
         AdapterControl, AgentSpec, ConfigInputDecoder, Launch, MAX_EVENTS_PER_FRAME, TextSelection,
         apply_mouse_scroll, apply_navigation_scroll, apply_notification_preferences,
         bare_launch_from_settings, cancel_standalone_turn, consume_one_shot_route,
-        control_for_queued, copy_text_to_terminal_clipboard, dispatch_permission_action,
-        dispatch_queued_prompt, enqueue_fresh_roster_prompt, finish_pending_cancellation,
-        interaction_height, load_prompt_history_from, load_session_metadata_candidates,
-        mouse_scroll_delta, next_event_batch, normalize_arguments, normalize_selected_slot,
-        parse_launch, prepare_launch_arguments, program_available, project_dir_argument,
-        project_prompt_history_path, reconcile_config_roster,
-        rejection_interrupts_roster_reconcile, restore_relay_context, resume_launch_from_metadata,
-        run_relay_sequence_with_controls, sanitize_direct_event, save_roster_slots_at,
-        session_metadata_path_for, should_apply_configured_models, standalone_session_metadata,
-        terminal_capture_enabled_for, update_saved_conversation_roster, validate_project_directory,
+        control_for_queued, copy_text_to_terminal_clipboard, dispatch_auto_permission_action,
+        dispatch_permission_action, dispatch_queued_prompt, enqueue_fresh_roster_prompt,
+        finish_pending_cancellation, interaction_height, load_prompt_history_from,
+        load_session_metadata_candidates, mouse_scroll_delta, next_event_batch,
+        normalize_arguments, normalize_selected_slot, parse_launch, prepare_launch_arguments,
+        program_available, project_dir_argument, project_prompt_history_path,
+        reconcile_config_roster, rejection_interrupts_roster_reconcile, restore_relay_context,
+        resume_launch_from_metadata, run_relay_sequence_with_controls, sanitize_direct_event,
+        save_roster_slots_at, send_batch_complete, session_metadata_path_for,
+        should_apply_configured_models, standalone_session_metadata, terminal_capture_enabled_for,
+        update_saved_conversation_roster, validate_project_directory,
     };
     use crate::product;
     use async_trait::async_trait;
@@ -7334,6 +7360,53 @@ done
         ));
     }
 
+    #[tokio::test]
+    async fn auto_pilot_dispatches_the_structured_allow_option() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::default();
+        app.apply_event(&AgentEvent::Permission {
+            slot: 2,
+            request: codeswarm_adapters::PermissionRequest {
+                id: "request-auto".into(),
+                title: "Write file".into(),
+                options: vec!["拒绝".into(), "允许".into()],
+                option_ids: vec!["opaque-rejection".into(), "opaque-approval".into()],
+                option_kinds: vec!["reject_once".into(), "allow_once".into()],
+            },
+        });
+
+        assert!(dispatch_auto_permission_action(&mut app, Some(&sender)));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(AdapterControl::Permission {
+                slot: 2,
+                request_id,
+                answer: PermissionAnswer::Selected { option_id },
+            }) if request_id == "request-auto" && option_id == "opaque-approval"
+        ));
+    }
+
+    #[test]
+    fn manual_mode_does_not_auto_dispatch_permissions() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::default();
+        app.set_mode("Manual");
+        app.apply_event(&AgentEvent::Permission {
+            slot: 0,
+            request: codeswarm_adapters::PermissionRequest {
+                id: "request-manual".into(),
+                title: "Write file".into(),
+                options: vec!["Allow".into(), "Reject".into()],
+                option_ids: vec!["allow".into(), "reject".into()],
+                option_kinds: vec!["allow_once".into(), "reject_once".into()],
+            },
+        });
+
+        assert!(!dispatch_auto_permission_action(&mut app, Some(&sender)));
+        assert!(app.permission.is_some());
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[test]
     fn queued_untagged_input_remains_an_active_agent_follow_up() {
         let prompt = QueuedPrompt {
@@ -7439,6 +7512,24 @@ done
             events.try_recv(),
             Ok(Ok(AgentEvent::BatchComplete { elapsed }))
                 if elapsed.iter().map(|timing| timing.slot).collect::<Vec<_>>() == vec![0, 1]
+        ));
+    }
+
+    #[test]
+    fn batch_timing_truncates_only_after_complete_agent_time_is_accumulated() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut elapsed = std::collections::BTreeMap::new();
+        elapsed.insert(
+            0,
+            Duration::from_millis(1_900) + Duration::from_millis(1_900),
+        );
+
+        send_batch_complete(&sender, &elapsed);
+
+        assert!(matches!(
+            receiver.recv(),
+            Ok(Ok(AgentEvent::BatchComplete { elapsed }))
+                if elapsed.len() == 1 && elapsed[0].slot == 0 && elapsed[0].seconds == 3
         ));
     }
 

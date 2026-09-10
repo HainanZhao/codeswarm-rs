@@ -393,6 +393,7 @@ pub struct PermissionPrompt {
     pub title: String,
     pub options: Vec<String>,
     pub option_ids: Vec<String>,
+    pub option_kinds: Vec<String>,
     selected: usize,
 }
 
@@ -906,6 +907,7 @@ impl PermissionPrompt {
         title: impl Into<String>,
         options: Vec<String>,
         option_ids: Vec<String>,
+        option_kinds: Vec<String>,
     ) -> Self {
         Self {
             slot,
@@ -913,6 +915,7 @@ impl PermissionPrompt {
             title: title.into(),
             options,
             option_ids,
+            option_kinds,
             selected: 0,
         }
     }
@@ -3621,6 +3624,7 @@ impl App {
                     request.title.clone(),
                     request.options.clone(),
                     request.option_ids.clone(),
+                    request.option_kinds.clone(),
                 ));
             }
             AgentEvent::Terminal { slot, event } => {
@@ -4005,6 +4009,73 @@ impl App {
                 action
             }
         }
+    }
+
+    /// Select the provider's allow-like option for unattended Auto pilot turns.
+    /// Providers normally put this option first, but matching its identity keeps
+    /// the decision safe when a provider reorders its permission choices.
+    pub fn auto_permission_action(&mut self) -> PermissionAction {
+        let Some(request) = self.permission.as_mut() else {
+            return PermissionAction::Ignored;
+        };
+        let allowed_by_kind = ["allow_once", "allow_always"].iter().find_map(|kind| {
+            request
+                .option_kinds
+                .iter()
+                .position(|candidate| candidate.eq_ignore_ascii_case(kind))
+        });
+        let allowed = allowed_by_kind
+            .or_else(|| {
+                request
+                    .options
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, option)| {
+                        let option_id = request
+                            .option_ids
+                            .get(index)
+                            .map(String::as_str)
+                            .unwrap_or_default();
+                        [option_id, option.as_str()]
+                            .iter()
+                            .any(|value| {
+                                let value = value.to_ascii_lowercase();
+                                value.starts_with("allow")
+                                    || value.starts_with("approve")
+                                    || value.starts_with("accept")
+                                    || value.starts_with("grant")
+                                    || value.starts_with("permit")
+                                    || value.starts_with("proceed")
+                                    || value.starts_with("continue")
+                                    || value.starts_with("yes")
+                            })
+                            .then_some(index)
+                    })
+            })
+            .or_else(|| {
+                request
+                    .options
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, option)| {
+                        let option_id = request
+                            .option_ids
+                            .get(index)
+                            .map(String::as_str)
+                            .unwrap_or_default();
+                        let is_reject = [option_id, option.as_str()].iter().any(|value| {
+                            let value = value.to_ascii_lowercase();
+                            value.starts_with("reject")
+                                || value.starts_with("deny")
+                                || value.starts_with("cancel")
+                                || value.starts_with("no")
+                        });
+                        (!is_reject).then_some(index)
+                    })
+            })
+            .unwrap_or(0);
+        request.selected = allowed;
+        self.handle_permission_key(PermissionKey::Confirm)
     }
 }
 
@@ -6440,6 +6511,7 @@ mod tests {
                 title: "Allow this operation?".into(),
                 options: vec!["Allow".into(), "Deny".into(), "Always".into()],
                 option_ids: Vec::new(),
+                option_kinds: Vec::new(),
             },
         });
         app.toggle_keyboard_help();
@@ -6472,6 +6544,7 @@ mod tests {
                 title: "Allow operation?".into(),
                 options: vec!["Allow".into(), "Deny".into()],
                 option_ids: Vec::new(),
+                option_kinds: Vec::new(),
             },
         });
         app.toggle_keyboard_help();
@@ -7307,6 +7380,7 @@ mod tests {
                 title: "Run command".into(),
                 options: vec!["Allow".into()],
                 option_ids: vec!["allow".into()],
+                option_kinds: Vec::new(),
             },
         });
         let now = std::time::Instant::now();
@@ -9935,6 +10009,7 @@ mod tests {
                 title: "Write to the workspace".into(),
                 options: vec!["Allow once".into(), "Always allow".into(), "Deny".into()],
                 option_ids: vec!["allow-once".into(), "always".into(), "deny".into()],
+                option_kinds: Vec::new(),
             },
         });
 
@@ -9961,6 +10036,33 @@ mod tests {
     }
 
     #[test]
+    fn auto_permission_action_selects_allow_even_when_not_first() {
+        let mut app = App::default();
+        app.apply_event(&codeswarm_adapters::AgentEvent::Permission {
+            slot: 0,
+            request: codeswarm_adapters::PermissionRequest {
+                id: "permission-auto".into(),
+                title: "Write to the workspace".into(),
+                options: vec!["拒绝".into(), "允许".into()],
+                option_ids: vec!["reject".into(), "opaque-approval".into()],
+                option_kinds: vec!["reject_once".into(), "allow_once".into()],
+            },
+        });
+
+        assert_eq!(
+            app.auto_permission_action(),
+            PermissionAction::Answer {
+                slot: 0,
+                request_id: "permission-auto".into(),
+                option_index: 1,
+                option: "允许".into(),
+                option_id: "opaque-approval".into(),
+            }
+        );
+        assert!(app.permission.is_none());
+    }
+
+    #[test]
     fn replacement_permission_resets_focus_and_cancel_clears_it() {
         let mut app = App::default();
         app.apply_event(&codeswarm_adapters::AgentEvent::Permission {
@@ -9970,6 +10072,7 @@ mod tests {
                 title: "First".into(),
                 options: vec!["one".into(), "two".into()],
                 option_ids: Vec::new(),
+                option_kinds: Vec::new(),
             },
         });
         assert_eq!(
@@ -9983,6 +10086,7 @@ mod tests {
                 title: "Replacement".into(),
                 options: vec!["only choice".into()],
                 option_ids: Vec::new(),
+                option_kinds: Vec::new(),
             },
         });
         assert_eq!(
@@ -10013,6 +10117,7 @@ mod tests {
                 title: "Run this command?".into(),
                 options: vec!["Allow".into(), "Deny".into()],
                 option_ids: Vec::new(),
+                option_kinds: Vec::new(),
             },
         });
         terminal
@@ -10040,6 +10145,7 @@ mod tests {
                 title: "No choices".into(),
                 options: Vec::new(),
                 option_ids: Vec::new(),
+                option_kinds: Vec::new(),
             },
         });
         assert_eq!(
@@ -10559,6 +10665,7 @@ mod tests {
             title: "Run command?".into(),
             options: vec!["Allow once".into(), "Deny".into()],
             option_ids: vec!["allow".into(), "deny".into()],
+            option_kinds: vec!["allow_once".into(), "reject_once".into()],
             selected: 1,
         });
         app.queue_prompt("follow up", Some(0), false);

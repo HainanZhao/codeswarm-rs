@@ -3975,10 +3975,10 @@ fn parse_permission_event(
         .and_then(Value::as_str)
         .unwrap_or("Agent requests permission")
         .to_owned();
-    let (options, option_ids): (Vec<String>, Vec<String>) = options
+    let (options, option_ids, option_kinds): (Vec<String>, Vec<String>, Vec<String>) = options
         .and_then(Value::as_array)
         .map(|options| {
-            options
+            let parsed = options
                 .iter()
                 .filter_map(|option| {
                     let label = option
@@ -3992,9 +3992,23 @@ fn parse_permission_event(
                         .and_then(Value::as_str)
                         .map(str::to_owned)
                         .unwrap_or_else(|| label.clone());
-                    Some((label, option_id))
+                    let kind = option
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    Some((label, option_id, kind))
                 })
-                .unzip()
+                .collect::<Vec<_>>();
+            let mut labels = Vec::with_capacity(parsed.len());
+            let mut ids = Vec::with_capacity(parsed.len());
+            let mut kinds = Vec::with_capacity(parsed.len());
+            for (label, id, kind) in parsed {
+                labels.push(label);
+                ids.push(id);
+                kinds.push(kind);
+            }
+            (labels, ids, kinds)
         })
         .unwrap_or_default();
     if options.is_empty() {
@@ -4007,6 +4021,7 @@ fn parse_permission_event(
             title,
             options,
             option_ids,
+            option_kinds,
         },
     })
 }
@@ -4563,6 +4578,7 @@ mod tests {
                             title: "Allow?".into(),
                             options: vec!["Allow".into()],
                             option_ids: vec!["allow".into()],
+                            option_kinds: Vec::new(),
                         },
                     }))
                 }
@@ -5189,7 +5205,7 @@ mod tests {
     fn parses_acp_permission_requests() {
         let event = parse_acp_notification(
             0,
-            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"request_permission","toolCall":{"toolCallId":"t1","title":"Write file"},"options":[{"name":"Allow once","optionId":"allow-once"},{"name":"Reject","optionId":"reject"}]}}}"#,
+            r#"{"method":"session/update","params":{"update":{"sessionUpdate":"request_permission","toolCall":{"toolCallId":"t1","title":"Write file"},"options":[{"name":"Yes","optionId":"opaque-approval","kind":"allow_once"},{"name":"No","optionId":"reject","kind":"reject_once"}]}}}"#,
         )
         .expect("valid permission")
         .expect("permission event");
@@ -5198,8 +5214,9 @@ mod tests {
             AgentEvent::Permission { request, .. }
                 if request.id == "t1"
                     && request.title == "Write file"
-                    && request.options == ["Allow once", "Reject"]
-                    && request.option_ids == ["allow-once", "reject"]
+                    && request.options == ["Yes", "No"]
+                    && request.option_ids == ["opaque-approval", "reject"]
+                    && request.option_kinds == ["allow_once", "reject_once"]
         ));
     }
 
@@ -5218,6 +5235,7 @@ mod tests {
                     && request.title == "Write file"
                     && request.options == ["allow-once", "reject"]
                     && request.option_ids == ["allow-once", "reject"]
+                    && request.option_kinds == ["", ""]
         ));
     }
 

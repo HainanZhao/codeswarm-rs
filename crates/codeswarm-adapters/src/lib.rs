@@ -91,6 +91,11 @@ pub struct PermissionRequest {
     /// fall back to the visible option label for legacy/native adapters.
     #[serde(default)]
     pub option_ids: Vec<String>,
+    /// ACP permission kinds aligned by index with `options`, such as
+    /// `allow_once` or `reject_always`. Native and legacy adapters may omit
+    /// these and rely on the option identity/label fallback in the client.
+    #[serde(default)]
+    pub option_kinds: Vec<String>,
 }
 
 /// The normalized answer to an adapter permission request. Native adapters
