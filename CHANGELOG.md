@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.13] - 2026-09-10
+
+### Fixed
+
+- Report an OpenCode ACP turn that echoes the prompt and ends with no agent
+  output (for example an unauthorized or out-of-quota model) as a failed turn
+  instead of showing the prompt back to the user.
+- Accept OpenCode's `models`/`availableModels` session payload so its model
+  catalog feeds model selection.
+
+### Changed
+
+- The `/settings` roster shows only the selected agents and displays each
+  agent's saved model before its adapter advertises a catalog.
+
 ## [0.10.12] - 2026-09-09
 
 ### Changed
