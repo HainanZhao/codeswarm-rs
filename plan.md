@@ -34,11 +34,13 @@ compatibility executable or interpreter launcher.
 
 ```text
 Cargo.toml
+src/
+  lib.rs                # application package root (modules below are private)
+  transcript.rs         # immutable blocks, wrapping cache, viewport index
+  tui/                  # Ratatui/Crossterm full-screen UI
+  bin/benchmark.rs      # deterministic cached-scroll benchmark
 crates/
-  codeswarm-core/       # events, reducer, relay, persistence interfaces
   codeswarm-adapters/   # AgentAdapter trait, ACP and native implementations
-  codeswarm-transcript/ # immutable blocks, wrapping cache, viewport index
-  codeswarm-tui/        # Ratatui/Crossterm full-screen UI
   codeswarm-cli/        # `codeswarm` command, config and migration wiring
 crate-local tests/      # behavior, adapter-contract, transcript, renderer tests
 ```
@@ -50,9 +52,9 @@ oracle.
 
 Completed on branch \`rewrite/rust-ratatui-architecture\`:
 
-- [x] Created the Rust Cargo workspace and the \`codeswarm-core\`,
-  \`codeswarm-adapters\`, \`codeswarm-transcript\`, \`codeswarm-tui\`, and
-  \`codeswarm\` packages.
+- [x] Created the Rust Cargo workspace: the \`codeswarm\` application package
+  with its private \`transcript\` and \`tui\` modules, and the
+  \`codeswarm-adapters\` crate.
 - [x] Added deterministic 5,000-word and 100-turn transcript fixtures, a
   benchmark binary, and a cached viewport transcript renderer.
 - [x] Added a 5,000-word cached-scroll regression budget (<100ms), bounded
@@ -254,7 +256,7 @@ regression, and produces a baseline for the existing client where practical.
 **Purpose:** Extract behavior from UI lifecycle and make replay deterministic.
 
 - [ ] Define `AgentCommand`, `AgentEvent`, `AgentCapabilities`, `SessionState`,
-  `RelayState`, and `TranscriptEvent` in `codeswarm-core`. Events must cover
+  `RelayState`, and `TranscriptEvent` in `codeswarm-adapters`. Events must cover
   response text, thought text, tools, terminal lifecycle, permission requests,
   mode updates, failures, completion, and adapter replacement.
 - [ ] Implement a pure reducer from `(SessionState, AgentEvent)` to next state

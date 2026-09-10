@@ -1,6 +1,6 @@
 //! Viewport-oriented transcript data with stable logical blocks.
 //!
-//! This crate deliberately has no terminal or async dependencies. After the
+//! This module deliberately has no terminal or async dependencies. After the
 //! width cache is warm, rendering a scroll position is a lookup over cached
 //! rows; it does not reparse the full transcript, talk to an adapter, or wait
 //! for persistence.

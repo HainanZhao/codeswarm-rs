@@ -17,7 +17,7 @@
   user selection becomes the new desired roster-wide policy; `Mixed` is not a
   user-facing mode.
 - An unlimited-size roster of ACP agents relay turns sequentially in a ring
-  (`crates/codeswarm-core/src/relay.rs`, `Relay`), never concurrently — a relay
+  (`crates/codeswarm-adapters/src/relay.rs`, `Relay`), never concurrently — a relay
   has a causal dependency on the previous response. Solo sessions (roster size
   1) never construct a relay; `Conversation._relay_active` gates every relay
   code path so the common single-agent case is untouched.

@@ -56,7 +56,7 @@ Data contract (agent may refine ergonomics, retain semantics):
 
 ### B — browser and diagnostics UI (OpenCode)
 
-Own `crates/codeswarm-tui/src/lib.rs` (and optional presentation modules).
+Own `src/tui/mod.rs` (and optional presentation modules).
 Add local `/sessions`, `/status`, `/summary` actions to parser/help/completion.
 Provide native Ratatui session browser and read-only diagnostics/summary panes,
 keyboard navigation, escape, selection, and TestBackend regressions. These are

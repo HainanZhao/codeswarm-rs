@@ -716,7 +716,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("codeswarm-core-{unique}.jsonl"));
+        let path = std::env::temp_dir().join(format!("codeswarm-adapters-{unique}.jsonl"));
         let log = super::EventLog::open(&path);
         let events = [
             AgentEvent::Text {
@@ -747,7 +747,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("codeswarm-core-checkpoint-{unique}.jsonl"));
+        let path =
+            std::env::temp_dir().join(format!("codeswarm-adapters-checkpoint-{unique}.jsonl"));
         let log = super::EventLog::open(&path);
         log.append(&AgentEvent::Text {
             slot: 0,
@@ -767,7 +768,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("codeswarm-core-durable-{unique}.jsonl"));
+        let path = std::env::temp_dir().join(format!("codeswarm-adapters-durable-{unique}.jsonl"));
         let log = super::EventLog::open(&path);
         log.append_durable(&AgentEvent::Text {
             slot: 1,
@@ -790,7 +791,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("codeswarm-core-buffered-{unique}.jsonl"));
+        let path = std::env::temp_dir().join(format!("codeswarm-adapters-buffered-{unique}.jsonl"));
         let log = super::EventLog::open(&path);
         let buffered = log.buffered().expect("background writer");
         for text in ["one", "two", "three"] {

@@ -6702,7 +6702,7 @@ mod tests {
     #[test]
     fn async_path_picker_ranks_and_inserts_a_workspace_file() {
         let root = std::env::temp_dir().join(format!(
-            "codeswarm-tui-picker-{}-{}",
+            "tui-picker-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -6749,7 +6749,7 @@ mod tests {
 
     #[test]
     fn path_picker_accents_the_fuzzy_match_offsets() {
-        let matches = codeswarm_tui_path_match_fixture();
+        let matches = tui_path_match_fixture();
         let spans = super::path_match_spans(&matches.path, &matches.offsets, false);
         assert!(spans.iter().any(|span| {
             span.content == "main"
@@ -6910,7 +6910,7 @@ mod tests {
         assert_eq!(app.active_agent, "ACP");
     }
 
-    fn codeswarm_tui_path_match_fixture() -> super::PathMatch {
+    fn tui_path_match_fixture() -> super::PathMatch {
         super::rank_matches(
             "@main",
             &[super::PathCandidate {
@@ -6926,7 +6926,7 @@ mod tests {
     #[test]
     fn quoted_path_picker_keeps_spaces_inside_the_current_token() {
         let root = std::env::temp_dir().join(format!(
-            "codeswarm-tui-quoted-picker-{}-{}",
+            "tui-quoted-picker-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -8520,7 +8520,7 @@ mod tests {
     #[test]
     fn workspace_path_picker_indexes_off_thread_and_inserts_selected_path() {
         let root = std::env::temp_dir().join(format!(
-            "codeswarm-tui-path-picker-{}-{}",
+            "tui-path-picker-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
