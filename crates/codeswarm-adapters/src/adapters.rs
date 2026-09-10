@@ -2504,6 +2504,7 @@ pub struct AcpAdapter {
     session_id: Option<String>,
     next_request_id: u64,
     prompt_request_id: Option<u64>,
+    prompt_had_output: bool,
     queued_events: VecDeque<AdapterResult<AgentEvent>>,
     tool_updates: BTreeMap<String, ToolUpdate>,
     stderr_task: Option<tokio::task::JoinHandle<String>>,
@@ -2532,6 +2533,7 @@ impl AcpAdapter {
             session_id: None,
             next_request_id: 1,
             prompt_request_id: None,
+            prompt_had_output: false,
             queued_events: VecDeque::new(),
             tool_updates: BTreeMap::new(),
             stderr_task: None,
@@ -3375,6 +3377,7 @@ impl AgentAdapter for AcpAdapter {
             return Err(error);
         }
         self.prompt_request_id = Some(request_id);
+        self.prompt_had_output = false;
         Ok(())
     }
 
@@ -3556,7 +3559,14 @@ impl AgentAdapter for AcpAdapter {
                 Err(error) => return Some(Err(error)),
             }
             match self.handle_client_request(&value).await {
-                Ok(true) => continue,
+                Ok(true) => {
+                    // Any agent-initiated client request (fs, terminal) proves
+                    // the model is alive, even before it streams text.
+                    if self.prompt_request_id.is_some() {
+                        self.prompt_had_output = true;
+                    }
+                    continue;
+                }
                 Ok(false) => {}
                 Err(error) => return Some(Err(error)),
             }
@@ -3569,6 +3579,18 @@ impl AgentAdapter for AcpAdapter {
                         self.model_config_id = Some(config_id.clone());
                         self.models = models.clone();
                         self.capabilities.supports_models = !models.is_empty();
+                    }
+                    if self.prompt_request_id.is_some()
+                        && matches!(
+                            event,
+                            AgentEvent::Text { .. }
+                                | AgentEvent::Thought { .. }
+                                | AgentEvent::Tool { .. }
+                                | AgentEvent::Permission { .. }
+                                | AgentEvent::Terminal { .. }
+                        )
+                    {
+                        self.prompt_had_output = true;
                     }
                     return Some(Ok(event));
                 }
@@ -3584,11 +3606,12 @@ impl AgentAdapter for AcpAdapter {
                     return Some(Err(AdapterError::Protocol(error.to_string())));
                 }
                 self.prompt_request_id = None;
-                if let Some(reason) = value
+                let stop_reason = value
                     .get("result")
                     .and_then(|result| result.get("stopReason"))
-                    .and_then(Value::as_str)
-                    .filter(|reason| !matches!(*reason, "end_turn" | "cancelled"))
+                    .and_then(Value::as_str);
+                if let Some(reason) =
+                    stop_reason.filter(|reason| !matches!(*reason, "end_turn" | "cancelled"))
                 {
                     let detail = match reason {
                         "max_tokens" => {
@@ -3603,6 +3626,17 @@ impl AgentAdapter for AcpAdapter {
                         slot: self.slot,
                         started: true,
                         detail,
+                    }));
+                }
+                // OpenCode ends the turn with only a `user_message_chunk` echo
+                // and zero usage when the configured model cannot run (bad
+                // API key, quota, unknown model). Surface that as a failure
+                // instead of a silent empty turn.
+                if !self.prompt_had_output && !matches!(stop_reason, Some("cancelled")) {
+                    return Some(Ok(AgentEvent::Failed {
+                        slot: self.slot,
+                        started: true,
+                        detail: "ACP turn ended with no agent output; the configured model may be unauthorized or out of quota — pick another model with /model or verify with `opencode run`".into(),
                     }));
                 }
                 return Some(Ok(AgentEvent::TurnComplete { slot: self.slot }));
@@ -3819,6 +3853,34 @@ fn normalize_acp_tool(
 }
 
 fn parse_model_config(value: &Value) -> Option<(String, Vec<Mode>, Option<String>)> {
+    // Newer agents (OpenCode 1.4+) also advertise `models` with
+    // `currentModelId`/`availableModels`; prefer the legacy `configOptions`
+    // select when present so `session/set_config_option` keeps working.
+    if let Some(object) = value.get("models").and_then(Value::as_object)
+        && value.get("configOptions").is_none()
+    {
+        let available = object.get("availableModels")?.as_array()?;
+        let modes = available
+            .iter()
+            .filter_map(|option| {
+                let id = option.get("modelId")?.as_str()?.to_owned();
+                let label = option
+                    .get("name")
+                    .or_else(|| option.get("label"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&id)
+                    .to_owned();
+                Some(Mode { id, label })
+            })
+            .collect::<Vec<_>>();
+        return (!modes.is_empty()).then(|| {
+            let current = object
+                .get("currentModelId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            ("model".to_owned(), modes, current)
+        });
+    }
     let config = value
         .get("configOptions")?
         .as_array()?
@@ -5368,6 +5430,56 @@ printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"timeou
             adapter.next_event().await,
             Some(Ok(AgentEvent::TurnComplete { .. }))
         ));
+    }
+
+    #[tokio::test]
+    async fn acp_empty_end_turn_is_a_failed_turn_not_an_echo() {
+        // OpenCode echoes the prompt as `user_message_chunk` and ends with
+        // zero usage when the model cannot run. That must fail loudly.
+        let script = r#"read _; echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{}}}'; read _; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session-1"}}'; read _; echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"say hello"}}}}'; echo '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'"#;
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut adapter = AcpAdapter::new(1, cwd, "sh", vec!["-c".into(), script.into()]);
+        adapter.start().await.expect("initialize");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Ready { .. }))
+        ));
+        adapter
+            .send_prompt("say hello".into())
+            .await
+            .expect("prompt");
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::UserText { .. }))
+        ));
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Failed {
+                slot: 1,
+                started: true,
+                detail,
+            })) if detail.contains("no agent output")
+        ));
+    }
+
+    #[test]
+    fn parses_opencode_models_shape_without_config_options() {
+        let session = serde_json::json!({
+            "sessionId": "s",
+            "models": {
+                "currentModelId": "opencode-go/m",
+                "availableModels": [
+                    {"modelId": "opencode-go/m", "name": "M"},
+                    {"modelId": "other/m2", "name": "M2"},
+                ],
+            },
+            "modes": {"currentModeId": "build", "availableModes": []},
+        });
+        let (config_id, models, current) =
+            super::parse_model_config(&session).expect("models shape");
+        assert_eq!(config_id, "model");
+        assert_eq!(models.len(), 2);
+        assert_eq!(current.as_deref(), Some("opencode-go/m"));
     }
 
     #[tokio::test]
