@@ -1394,13 +1394,22 @@ impl App {
         self.config_agents = agents;
         self.config_roster_dirty = false;
         let max = CONFIG_SETTING_COUNT
-            .saturating_add(self.config_agents.len())
+            .saturating_add(self.config_roster_count())
             .saturating_sub(1);
         self.config_selected = self.config_selected.min(max);
     }
 
     pub fn config_agents(&self) -> &[StoreAgent] {
         &self.config_agents
+    }
+
+    /// Number of selected roster rows. The configuration panel only shows
+    /// these; unselected catalog templates stay hidden until they are added.
+    pub fn config_roster_count(&self) -> usize {
+        self.config_agents
+            .iter()
+            .take_while(|agent| agent.selected)
+            .count()
     }
 
     pub fn config_roster_dirty(&self) -> bool {
@@ -1680,7 +1689,7 @@ impl App {
             }
             ConfigKey::Down => {
                 let max = CONFIG_SETTING_COUNT
-                    .saturating_add(self.config_agents.len())
+                    .saturating_add(self.config_roster_count())
                     .saturating_sub(1);
                 self.config_selected = self.config_selected.saturating_add(1).min(max);
                 ConfigAction::Changed
@@ -1803,9 +1812,10 @@ impl App {
                 if let Some(agent) = self.config_agents.get(index).cloned() {
                     if agent.selected {
                         self.config_agents.remove(index);
-                        self.config_selected = self
-                            .config_selected
-                            .min(CONFIG_SETTING_COUNT + self.config_agents.len().saturating_sub(1));
+                        let max = CONFIG_SETTING_COUNT
+                            .saturating_add(self.config_roster_count())
+                            .saturating_sub(1);
+                        self.config_selected = self.config_selected.min(max);
                     } else {
                         let mut slot = agent.clone();
                         slot.selected = true;
@@ -3456,19 +3466,12 @@ impl App {
                     *current = Some(current_model.clone());
                 }
             }
-            AgentEvent::UserText { slot, text } => {
+            AgentEvent::UserText { slot, .. } => {
+                // `user_message_chunk` is the agent echoing our own prompt,
+                // not new conversation content. Track working state without
+                // appending a transcript block; resumed history still arrives
+                // as `History` events.
                 self.mark_agent_turn_started(*slot);
-                let key = (*slot, crate::transcript::BlockKind::Human);
-                let block = self.streaming_blocks.get(&key).copied().unwrap_or_else(|| {
-                    let id = self.transcript.append(
-                        crate::transcript::BlockKind::Human,
-                        format!("{}: ", self.agent_name(*slot)),
-                        false,
-                    );
-                    self.streaming_blocks.insert(key, id);
-                    id
-                });
-                self.transcript.extend(block, text);
                 self.active_agent = self.agent_name(*slot);
                 self.agent_states.insert(*slot, "working".into());
             }
@@ -4920,7 +4923,7 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
         ("Theme", app.theme.label(), true),
         ("Roster", "Space toggle · Alt/Shift+↑/↓ or [ ] order", false),
     ];
-    let total_rows = rows.len().saturating_add(app.config_agents.len());
+    let total_rows = rows.len().saturating_add(app.config_roster_count());
     let mut lines = Vec::with_capacity(total_rows + 3);
     lines.push(Line::styled(
         "Configuration",
@@ -4969,27 +4972,41 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
                     }),
                 ),
             ];
-            if agent.selected
-                && let Some(source_slot) = app.model_source_slot_for_config_row(roster_index)
-                && let Some((_config_id, models, current)) = app.agent_models.get(&source_slot)
-            {
+            if agent.selected {
                 let target_slot = app.live_slot_for_config_row(roster_index);
-                let selected_model = agent
+                let chosen = agent
                     .model
                     .as_ref()
-                    .or_else(|| target_slot.and_then(|slot| app.pending_model_changes.get(&slot)))
-                    .or(current.as_ref());
-                if let Some(model) =
-                    selected_model.and_then(|id| models.iter().find(|model| &model.id == id))
-                {
+                    .or_else(|| target_slot.and_then(|slot| app.pending_model_changes.get(&slot)));
+                let live = app
+                    .model_source_slot_for_config_row(roster_index)
+                    .and_then(|source_slot| app.agent_models.get(&source_slot));
+                if let Some((_config_id, models, current)) = live {
+                    let selected_model = chosen.or(current.as_ref());
+                    if let Some(model) =
+                        selected_model.and_then(|id| models.iter().find(|model| &model.id == id))
+                    {
+                        spans.push(Span::styled(
+                            format!(" · {} ←/→", model.label),
+                            Style::default().fg(ACCENT),
+                        ));
+                    } else if let Some(model) = selected_model {
+                        spans.push(Span::styled(
+                            format!(" · {model} ←/→"),
+                            Style::default().fg(ACCENT),
+                        ));
+                    } else {
+                        spans.push(Span::styled(
+                            " · Inherited ←/→",
+                            Style::default().fg(ACCENT),
+                        ));
+                    }
+                } else if let Some(model) = chosen {
+                    // No adapter has advertised a catalog yet. Show the saved
+                    // selection so selected agents are inspectable pre-launch.
                     spans.push(Span::styled(
-                        format!(" · {} ←/→", model.label),
-                        Style::default().fg(ACCENT),
-                    ));
-                } else if selected_model.is_none() {
-                    spans.push(Span::styled(
-                        " · Inherited ←/→",
-                        Style::default().fg(ACCENT),
+                        format!(" · {model} (saved)"),
+                        Style::default().fg(Color::Gray),
                     ));
                 }
             }
@@ -6878,7 +6895,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_user_message_chunks_share_one_transcript_block() {
+    fn live_user_message_echo_stays_out_of_the_transcript() {
         let mut app = App::default();
         app.set_agent_name(0, "ACP");
         app.apply_event(&codeswarm_adapters::AgentEvent::UserText {
@@ -6889,11 +6906,8 @@ mod tests {
             slot: 0,
             text: "second".into(),
         });
-        assert_eq!(app.transcript.len(), 1);
-        assert_eq!(
-            app.transcript.viewport(80, 0, 4, 0)[0].text,
-            "ACP: first second"
-        );
+        assert_eq!(app.transcript.len(), 0);
+        assert_eq!(app.active_agent, "ACP");
     }
 
     fn codeswarm_tui_path_match_fixture() -> super::PathMatch {
@@ -8130,7 +8144,7 @@ mod tests {
     }
 
     #[test]
-    fn config_roster_rows_toggle_and_reorder_without_losing_selection() {
+    fn config_roster_shows_only_selected_agents_and_keeps_them_operable() {
         let mut app = App::default();
         app.set_config_agents(vec![
             StoreAgent {
@@ -8148,23 +8162,26 @@ mod tests {
                 adapter: "native".into(),
                 command: "two".into(),
                 available: true,
+                selected: true,
+                model: None,
+            },
+            StoreAgent {
+                identity: "three.example".into(),
+                name: "Three".into(),
+                adapter: "native".into(),
+                command: "three".into(),
+                available: true,
                 selected: false,
                 model: None,
             },
         ]);
         app.handle_local_command("/settings");
-        for _ in 0..15 {
+        for _ in 0..20 {
             app.handle_config_key(ConfigKey::Down);
         }
-        assert_eq!(
-            app.handle_config_key(ConfigKey::ToggleSlot),
-            ConfigAction::Changed
-        );
-        assert_eq!(
-            app.config_roster_identities(),
-            ["one.example", "two.example"]
-        );
-        assert!(app.config_roster_dirty());
+        // Navigation clamps to the two selected rows; the hidden template
+        // never receives a roster row.
+        assert_eq!(app.config_selected, CONFIG_SETTING_COUNT + 1);
         assert_eq!(
             app.handle_config_key(ConfigKey::MoveUp),
             ConfigAction::Changed
@@ -8173,8 +8190,58 @@ mod tests {
             app.config_roster_identities(),
             ["two.example", "one.example"]
         );
+        assert!(app.config_roster_dirty());
+        // Toggling removes the focused selected slot.
+        assert_eq!(
+            app.handle_config_key(ConfigKey::ToggleSlot),
+            ConfigAction::Changed
+        );
+        assert_eq!(app.config_roster_identities(), ["one.example"]);
         assert_eq!(app.handle_config_key(ConfigKey::Save), ConfigAction::Save);
         assert!(!app.config_visible());
+    }
+
+    #[test]
+    fn selected_agent_shows_its_saved_model_before_the_adapter_starts() {
+        let mut app = App::default();
+        app.set_config_agents(vec![
+            StoreAgent {
+                identity: "opencode.ai".into(),
+                name: "OpenCode".into(),
+                adapter: "ACP".into(),
+                command: "opencode acp".into(),
+                available: true,
+                selected: true,
+                model: Some("opencode-go/muse-spark".into()),
+            },
+            StoreAgent {
+                identity: "hidden.example".into(),
+                name: "Hidden".into(),
+                adapter: "native".into(),
+                command: "hidden".into(),
+                available: true,
+                selected: false,
+                model: None,
+            },
+        ]);
+        app.open_config();
+        app.config_selected = CONFIG_SETTING_COUNT;
+        let mut terminal = Terminal::new(TestBackend::new(96, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw saved model");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("opencode-go/muse-spark (saved)"),
+            "rendered={rendered:?}"
+        );
+        assert!(!rendered.contains("Hidden"), "rendered={rendered:?}");
     }
 
     #[test]
