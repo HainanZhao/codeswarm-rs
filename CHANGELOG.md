@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.14] - 2026-09-10
+
+### Fixed
+
+- Automatically answer ACP permission requests with an allow option in Auto
+  pilot while preserving interactive prompts in Manual and Plan modes.
+- Measure each agent's complete turn, including thinking, tools, permissions,
+  and response generation, without truncating fractional time between turns.
+
 ## [0.10.13] - 2026-09-10
 
 ### Fixed
