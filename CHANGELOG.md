@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.15] - 2026-09-12
+
+### Added
+
+- Add `/loop [Nm] REQUEST` to repeat a request sequentially, immediately after
+  completion or at a start-to-start interval in minutes. Overruns restart on
+  completion, and roster jobs wait for the full peer-review batch.
+- Add `/loop` status and `/loop stop`; cancellation, manual requests, session
+  changes, and agent failures stop repetition. Loops stay local to the session.
+
 ## [0.10.14] - 2026-09-10
 
 ### Fixed

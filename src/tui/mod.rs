@@ -105,6 +105,7 @@ pub enum PermissionAction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalCommand {
+    Loop(String),
     Goal(codeswarm_adapters::goal::GoalCommand),
     Handled,
     Exit,
@@ -127,6 +128,11 @@ pub struct CommandSpec {
 
 /// One canonical vocabulary for parsing, completion, and command help.
 pub const LOCAL_COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "/loop",
+        description: "Repeat a request after completion or every N minutes",
+        usage: "/loop [Nm] REQUEST | /loop stop",
+    },
     CommandSpec {
         name: "/goal",
         description: "Set, view, or manage the shared goal",
@@ -1240,6 +1246,7 @@ impl App {
         if let Some(spec) = spec
             && spec.name != "/agent"
             && spec.name != "/goal"
+            && spec.name != "/loop"
             && !argument.is_empty()
         {
             self.status = format!("usage: {}", spec.usage);
@@ -1247,6 +1254,7 @@ impl App {
         }
         let canonical = spec.map_or(command.as_str(), |spec| spec.name);
         let result = match canonical {
+            "/loop" => LocalCommand::Loop(argument.into()),
             "/goal" => match codeswarm_adapters::goal::GoalCommand::parse(argument) {
                 Ok(codeswarm_adapters::goal::GoalCommand::Show) => {
                     self.status = self.goal.as_ref().map_or_else(
@@ -4920,7 +4928,7 @@ fn render_keyboard_help(buffer: &mut Buffer, area: Rect) {
         " Turn: Ctrl+Enter direct · Ctrl+C cancel · Ctrl+K cancel queued",
         " Agents: /agent SLOT /reload · Goal: /goal [objective|run|done|clear]",
         " Session: /resume /sessions /status /summary /clear /exit",
-        " Tools: /settings /export",
+        " Tools: /settings /export · Repeat: /loop [Nm] REQUEST /loop stop",
     ];
     Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>())
         .style(Style::default().fg(Color::Gray).bg(PANEL_BG))
@@ -7882,6 +7890,34 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Session: /resume"));
+    }
+
+    #[test]
+    fn loop_command_is_local_and_listed_in_help() {
+        let mut app = App::default();
+        for argument in ["", "5m check builds", "stop", "0m invalid"] {
+            assert_eq!(
+                app.handle_local_command(&format!("/loop {argument}")),
+                Some(LocalCommand::Loop(argument.into()))
+            );
+        }
+        assert!(app.transcript.is_empty());
+        app.handle_local_command("/help");
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("/loop [Nm] REQUEST"));
+        assert!(
+            super::LOCAL_COMMANDS
+                .iter()
+                .any(|spec| spec.name == "/loop")
+        );
     }
 
     #[test]

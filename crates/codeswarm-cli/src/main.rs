@@ -1,3 +1,4 @@
+mod looping;
 mod product;
 
 use std::{
@@ -906,7 +907,7 @@ Options:
   -h, --help                      Show this help
   -v, --version                   Show the version
 
-Prompt commands include /help, /settings, /goal, /cancel, /reload, /agent,
+Prompt commands include /help, /settings, /goal, /loop, /cancel, /reload, /agent,
 /export, /clear, and /exit."#
     );
 }
@@ -2234,6 +2235,7 @@ fn save_ui_preferences_at(path: &Path, app: &App) -> std::io::Result<()> {
 
 #[derive(Default)]
 struct SessionSetup {
+    relay_batches: bool,
     history: Option<product::SavedConversation>,
     initial_prompt: Option<(String, bool)>,
 }
@@ -2300,6 +2302,7 @@ fn run_saved_history(
         None,
         saved,
         SessionSetup {
+            relay_batches: false,
             history: Some(conversation),
             initial_prompt: None,
         },
@@ -2367,6 +2370,7 @@ fn run_agy_command(
         None,
         saved_resume,
         SessionSetup {
+            relay_batches: false,
             history: None,
             initial_prompt: initial_prompt.map(|prompt| (prompt, false)),
         },
@@ -2410,6 +2414,7 @@ fn run_acp_program(
         None,
         saved_resume,
         SessionSetup {
+            relay_batches: false,
             history: None,
             initial_prompt: initial_prompt.map(|prompt| (prompt, false)),
         },
@@ -2482,6 +2487,7 @@ fn run_roster(
         Some(first_slot),
         saved_resume,
         SessionSetup {
+            relay_batches: true,
             history: restored,
             initial_prompt: initial_prompt.map(|prompt| (prompt, initial_direct)),
         },
@@ -3903,6 +3909,9 @@ fn run_terminal(
     saved_resume: Result<SessionMetadata, String>,
     setup: SessionSetup,
 ) -> std::io::Result<SessionOutcome> {
+    let relay_batches = setup.relay_batches;
+    let mut batch_active = setup.initial_prompt.is_some();
+    let mut loop_job: Option<looping::Job> = None;
     let mut saved_conversation = setup.history;
     load_ui_preferences(app);
     load_config_agents(app);
@@ -4012,6 +4021,7 @@ fn run_terminal(
                         {
                             app.status = format!("unable to archive update: {error}");
                         }
+                        looping::observe(&mut loop_job, &mut batch_active, &event, relay_batches);
                         match &event {
                             AgentEvent::History { .. }
                             | AgentEvent::GoalUpdated { .. }
@@ -4216,6 +4226,8 @@ fn run_terminal(
                     }
                     Err(error) => {
                         let error_text = error.to_string();
+                        loop_job = None;
+                        batch_active = false;
                         if let Some(log) = &event_log {
                             let _ = log.flush();
                         }
@@ -4240,6 +4252,39 @@ fn run_terminal(
                     }
                 }
             }
+        }
+        let now = Instant::now();
+        if loop_job.as_ref().is_some_and(|job| {
+            job.ready(
+                now,
+                turn_active
+                    || batch_active
+                    || pending_permission.is_some()
+                    || app.queued_count() > 0
+                    || app.config_visible()
+                    || app.product_panel_visible(),
+            )
+        }) {
+            let job = loop_job.as_ref().expect("ready loop");
+            if !app.active_roster_slots().contains(&job.target) {
+                loop_job = None;
+                app.status = "loop stopped: selected recipient is unavailable".into();
+            } else if controls.as_ref().is_some_and(|controls| {
+                controls
+                    .send(normal_prompt_control(Some(job.target), job.prompt.clone()))
+                    .is_ok()
+            }) {
+                let prompt = job.prompt.clone();
+                record_dispatched_prompt(app, &mut journal, &prompt, false);
+                loop_job.as_mut().expect("dispatched loop").dispatched(now);
+                turn_active = true;
+                batch_active = true;
+                app.status = "loop request dispatched".into();
+            } else {
+                loop_job = None;
+                app.status = "loop stopped: agent connection closed; request not sent".into();
+            }
+            redraw.invalidate();
         }
         if let Some(error) = journal.as_ref().and_then(|journal| journal.poll_error()) {
             app.status = format!("unable to save session: {error}");
@@ -4446,6 +4491,8 @@ fn run_terminal(
                         if config_action != ConfigAction::Save {
                             continue;
                         }
+                        loop_job = None;
+                        batch_active = false;
                         if app.config_roster_dirty() {
                             let roster = app.config_roster_slots();
                             if controls.is_none() {
@@ -4729,6 +4776,7 @@ fn run_terminal(
                             continue;
                         }
                         if let Some(controls) = &controls {
+                            loop_job = None;
                             let prompt = app.prompt.clone();
                             let slot = app.next_agent_slot().expect("guarded recipient");
                             if turn_active {
@@ -4766,7 +4814,47 @@ fn run_terminal(
                                 app.status = "local shell commands are not supported".into();
                             } else if let Some(local) = app.handle_local_command(&prompt) {
                                 match local {
+                                    LocalCommand::Loop(argument) => {
+                                        match looping::Command::parse(&argument) {
+                                            Ok(looping::Command::Show) => {
+                                                app.status = loop_job.as_ref().map_or_else(
+                                                    || {
+                                                        format!(
+                                                            "No loop running. Usage: {}",
+                                                            looping::USAGE
+                                                        )
+                                                    },
+                                                    looping::Job::status,
+                                                );
+                                            }
+                                            Ok(looping::Command::Stop) => {
+                                                loop_job = None;
+                                                app.status =
+                                                    "loop stopped; active work may finish".into();
+                                            }
+                                            Ok(looping::Command::Start { interval, prompt }) => {
+                                                if controls.as_ref().is_none_or(|c| c.is_closed()) {
+                                                    app.status = "send a normal prompt to connect an agent before starting a loop".into();
+                                                } else if let Some(target) = app.next_agent_slot() {
+                                                    let job = looping::Job::new(
+                                                        prompt,
+                                                        target,
+                                                        interval,
+                                                        Instant::now(),
+                                                    );
+                                                    app.status = job.status();
+                                                    loop_job = Some(job);
+                                                    consume_one_shot_route(app, &mut selected_slot);
+                                                } else {
+                                                    app.status = "select an available agent before starting a loop".into();
+                                                }
+                                            }
+                                            Err(error) => app.status = error,
+                                        }
+                                    }
                                     LocalCommand::Goal(command) => {
+                                        loop_job = None;
+                                        batch_active = false;
                                         if let Some(controls) = &controls {
                                             if controls
                                                 .send(AdapterControl::Goal(
@@ -4911,6 +4999,8 @@ fn run_terminal(
                                         return Ok(SessionOutcome::Exit);
                                     }
                                     LocalCommand::Cancel => {
+                                        let stopped_loop = loop_job.take().is_some();
+                                        batch_active = false;
                                         if turn_active {
                                             app.request_turn_cancellation();
                                             if let Some(controls) = &controls {
@@ -4918,7 +5008,12 @@ fn run_terminal(
                                             }
                                             app.status = "cancelling".into();
                                         } else {
-                                            app.status = "nothing to cancel".into();
+                                            app.status = if stopped_loop {
+                                                "loop stopped"
+                                            } else {
+                                                "nothing to cancel"
+                                            }
+                                            .into();
                                         }
                                     }
                                     LocalCommand::Resume => {
@@ -4979,6 +5074,8 @@ fn run_terminal(
                                         }
                                     }
                                     LocalCommand::Reload => {
+                                        loop_job = None;
+                                        batch_active = false;
                                         if let Some(controls) = &controls {
                                             request_agent_reload(app, controls, Instant::now());
                                         } else {
@@ -5026,6 +5123,7 @@ fn run_terminal(
                                 }
                                 app.status = "selected agent has no resumable provider handle; history remains available".into();
                             } else if let Some(controls) = &controls {
+                                loop_job = None;
                                 let target = app.next_agent_slot();
                                 if turn_active {
                                     if app.queue_prompt(prompt.clone(), target, false).is_some() {
@@ -5057,6 +5155,8 @@ fn run_terminal(
                         }
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        loop_job = None;
+                        batch_active = false;
                         if !turn_active {
                             if let Some(journal) = &journal {
                                 journal.flush().map_err(std::io::Error::other)?;
@@ -7531,6 +7631,74 @@ done
             Ok(Ok(AgentEvent::BatchComplete { elapsed }))
                 if elapsed.len() == 1 && elapsed[0].slot == 0 && elapsed[0].seconds == 3
         ));
+    }
+
+    #[tokio::test]
+    async fn loop_repeats_same_request_only_after_full_relay_batch() {
+        let hosts = (0..2)
+            .map(|slot| {
+                AdapterHost::new(
+                    Box::new(ScriptedAdapter::new(
+                        slot,
+                        AgentCapabilities::default(),
+                        [
+                            AgentEvent::Text {
+                                slot,
+                                text: "first run".into(),
+                            },
+                            AgentEvent::TurnComplete { slot },
+                            AgentEvent::Text {
+                                slot,
+                                text: "second run".into(),
+                            },
+                            AgentEvent::TurnComplete { slot },
+                        ],
+                    )),
+                    None,
+                )
+            })
+            .collect();
+        let mut relay = RelayHost::new(hosts, 2).unwrap();
+        relay.start().await.unwrap();
+        let (sender, events) = std::sync::mpsc::channel();
+        let (_control_sender, mut controls) = tokio::sync::mpsc::unbounded_channel();
+        let now = Instant::now();
+        let mut job = super::looping::Job::new("check builds".into(), 1, Duration::ZERO, now);
+        for _ in 0..2 {
+            assert!(job.ready(now, false));
+            let command = super::normal_prompt_control(Some(job.target), job.prompt.clone());
+            let AdapterControl::Queue { slot, prompt } = command else {
+                panic!("explicit recipient required")
+            };
+            assert_eq!(slot, 1);
+            assert_eq!(prompt, "check builds");
+            assert!(relay.relay_mut().enqueue_human(prompt, Some(slot)));
+            job.dispatched(now);
+            job.observe(&AgentEvent::TurnComplete { slot }, true);
+            assert!(!job.ready(now, false));
+            let (stopping, deferred) = run_relay_sequence_with_controls(
+                &mut relay,
+                &mut controls,
+                &sender,
+                String::new(),
+                slot,
+            )
+            .await;
+            assert!(!stopping);
+            assert!(deferred.is_empty());
+            for event in events.try_iter() {
+                job.observe(&event.unwrap(), true);
+            }
+            assert!(job.ready(now, false));
+        }
+        assert_eq!(
+            relay
+                .dispatches()
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>(),
+            [1, 0, 1, 0]
+        );
     }
 
     #[tokio::test]

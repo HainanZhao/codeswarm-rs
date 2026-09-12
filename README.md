@@ -196,6 +196,23 @@ Goals persist in session metadata and are restored by `codeswarm resume`;
 ordinary launches start with no goal. Restoring a goal does not run it until
 you send a prompt or use `/goal run`.
 
+## Repeating requests
+
+`/loop 5m Check the build status` runs immediately, then repeats the same
+request every five minutes measured from the previous run's start. Bare minute
+counts (`/loop 5 ...`) also work. Runs never overlap: if a job takes longer than
+the interval, the next starts as soon as it finishes, without catch-up runs.
+`/loop Check the build status` repeats immediately after each completed job.
+For a roster, a job includes the entire peer-review batch.
+
+`/loop` shows the active loop. `/loop stop` stops future runs and lets current
+work finish; `/cancel` stops repetition and cancels current work. A new loop
+replaces the previous schedule and waits for active work to finish. Each loop
+keeps its original selected recipient. A new manual request, goal change,
+settings save, reload, roster change, or agent failure stops repetition. Loops
+are local to the live session and are not restored from history; connect an
+agent with a normal prompt before starting a loop in an offline archive.
+
 ## Development
 
 Cargo is the canonical build and test tool:
