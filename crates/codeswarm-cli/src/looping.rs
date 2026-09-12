@@ -2,13 +2,16 @@ use std::time::{Duration, Instant};
 
 use codeswarm_adapters::AgentEvent;
 
-pub const USAGE: &str = "/loop [Nm] REQUEST | /loop stop";
+pub const USAGE: &str = "/loop [Nm] REQUEST [| REQUEST...] | /loop stop";
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Show,
     Stop,
-    Start { interval: Duration, prompt: String },
+    Start {
+        interval: Duration,
+        prompts: Vec<String>,
+    },
 }
 
 impl Command {
@@ -21,7 +24,7 @@ impl Command {
         }
         let (first, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
         let numeric = first.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+');
-        let (interval, prompt) = if numeric {
+        let (interval, raw) = if numeric {
             let minutes = first.strip_suffix('m').unwrap_or(first);
             let minutes = minutes.parse::<u64>().ok().filter(|n| *n > 0);
             let seconds = minutes.and_then(|n| n.checked_mul(60));
@@ -37,36 +40,50 @@ impl Command {
         } else {
             (Duration::ZERO, input)
         };
-        if prompt.is_empty() || prompt.len() > 16_000 || prompt.starts_with('/') {
+        if raw.is_empty() || raw.len() > 16_000 || raw.starts_with('/') {
             return Err(format!(
                 "provide a request (up to 16000 bytes); usage: {USAGE}"
             ));
         }
-        Ok(Self::Start {
-            interval,
-            prompt: prompt.into(),
-        })
+        let prompts: Vec<String> = raw
+            .split('|')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if prompts.is_empty() || prompts.iter().any(|part| part.starts_with('/')) {
+            return Err(format!(
+                "provide a request (up to 16000 bytes); usage: {USAGE}"
+            ));
+        }
+        Ok(Self::Start { interval, prompts })
     }
 }
 
 #[derive(Debug)]
 pub struct Job {
-    pub prompt: String,
+    pub prompts: Vec<String>,
     pub target: usize,
     pub interval: Duration,
     due: Instant,
     running: bool,
+    next: usize,
 }
 
 impl Job {
-    pub fn new(prompt: String, target: usize, interval: Duration, now: Instant) -> Self {
+    pub fn new(prompts: Vec<String>, target: usize, interval: Duration, now: Instant) -> Self {
         Self {
-            prompt,
+            prompts,
             target,
             interval,
             due: now,
             running: false,
+            next: 0,
         }
+    }
+
+    pub fn current(&self) -> &str {
+        &self.prompts[self.next % self.prompts.len()]
     }
 
     pub fn ready(&self, now: Instant, busy: bool) -> bool {
@@ -76,6 +93,7 @@ impl Job {
     pub fn dispatched(&mut self, now: Instant) {
         self.running = true;
         self.due = now.checked_add(self.interval).expect("validated interval");
+        self.next = (self.next + 1) % self.prompts.len();
     }
 
     pub fn observe(&mut self, event: &AgentEvent, relay: bool) {
@@ -92,10 +110,19 @@ impl Job {
         } else {
             format!("every {}m", self.interval.as_secs() / 60)
         };
+        let requests = self.prompts.join(" | ");
+        let rotation = if self.prompts.len() > 1 {
+            format!(
+                " · part {}/{}",
+                self.next % self.prompts.len() + 1,
+                self.prompts.len()
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "loop {cadence} · agent {} · {} · /loop stop",
+            "loop {cadence} · agent {}{rotation} · {requests} · /loop stop",
             self.target + 1,
-            self.prompt
         )
     }
 }
@@ -126,7 +153,7 @@ mod tests {
     #[test]
     fn failure_and_replacement_stop_loop_but_catalog_updates_do_not() {
         let now = Instant::now();
-        let mut job = Some(Job::new("check".into(), 0, Duration::ZERO, now));
+        let mut job = Some(Job::new(vec!["check".into()], 0, Duration::ZERO, now));
         let mut busy = false;
         observe(
             &mut job,
@@ -162,7 +189,7 @@ mod tests {
         );
         assert!(job.is_none());
         assert!(!busy);
-        job = Some(Job::new("replacement".into(), 0, Duration::ZERO, now));
+        job = Some(Job::new(vec!["replacement".into()], 0, Duration::ZERO, now));
         observe(
             &mut job,
             &mut busy,
@@ -185,21 +212,35 @@ mod tests {
             Command::parse("check builds").unwrap(),
             Command::Start {
                 interval: Duration::ZERO,
-                prompt: "check builds".into()
+                prompts: vec!["check builds".into()]
             }
         );
         assert_eq!(
             Command::parse("5m check\n builds").unwrap(),
             Command::Start {
                 interval: Duration::from_secs(300),
-                prompt: "check\n builds".into()
+                prompts: vec!["check\n builds".into()]
             }
         );
         assert_eq!(
             Command::parse("5 check").unwrap(),
             Command::Start {
                 interval: Duration::from_secs(300),
-                prompt: "check".into()
+                prompts: vec!["check".into()]
+            }
+        );
+        assert_eq!(
+            Command::parse("first | second | third").unwrap(),
+            Command::Start {
+                interval: Duration::ZERO,
+                prompts: vec!["first".into(), "second".into(), "third".into()]
+            }
+        );
+        assert_eq!(
+            Command::parse("5m first |  second  || third |").unwrap(),
+            Command::Start {
+                interval: Duration::from_secs(300),
+                prompts: vec!["first".into(), "second".into(), "third".into()]
             }
         );
         for input in [
@@ -210,6 +251,10 @@ mod tests {
             "5m",
             "18446744073709551615m check",
             "/cancel",
+            "|",
+            "||",
+            "check | /cancel",
+            "5m |",
         ] {
             assert!(Command::parse(input).is_err(), "{input}");
         }
@@ -218,7 +263,7 @@ mod tests {
     #[test]
     fn waits_for_whole_batch_and_uses_start_to_start_interval() {
         let now = Instant::now();
-        let mut job = Job::new("check".into(), 2, Duration::from_secs(300), now);
+        let mut job = Job::new(vec!["check".into()], 2, Duration::from_secs(300), now);
         assert!(job.ready(now, false));
         job.dispatched(now);
         job.observe(&AgentEvent::TurnComplete { slot: 2 }, true);
@@ -237,13 +282,33 @@ mod tests {
     #[test]
     fn no_interval_repeats_on_completion_and_replacement_resets_schedule() {
         let now = Instant::now();
-        let mut job = Job::new("first".into(), 0, Duration::ZERO, now);
+        let mut job = Job::new(vec!["first".into()], 0, Duration::ZERO, now);
         job.dispatched(now);
         assert!(!job.ready(now, false));
         job.observe(&AgentEvent::TurnComplete { slot: 0 }, false);
         assert!(job.ready(now, false));
-        job = Job::new("replacement".into(), 3, Duration::from_secs(60), now);
+        job = Job::new(vec!["replacement".into()], 3, Duration::from_secs(60), now);
         assert!(job.ready(now, false));
         assert_eq!(job.target, 3);
+    }
+
+    #[test]
+    fn cycles_through_pipe_separated_requests() {
+        let now = Instant::now();
+        let mut job = Job::new(
+            vec!["first".into(), "second".into(), "third".into()],
+            0,
+            Duration::ZERO,
+            now,
+        );
+        assert_eq!(job.current(), "first");
+        job.dispatched(now);
+        assert_eq!(job.current(), "second");
+        job.dispatched(now);
+        assert_eq!(job.current(), "third");
+        job.dispatched(now);
+        assert_eq!(job.current(), "first");
+        assert!(job.status().contains("part 1/3"));
+        assert!(job.status().contains("first | second | third"));
     }
 }

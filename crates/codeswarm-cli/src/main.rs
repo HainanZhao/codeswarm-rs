@@ -4271,10 +4271,13 @@ fn run_terminal(
                 app.status = "loop stopped: selected recipient is unavailable".into();
             } else if controls.as_ref().is_some_and(|controls| {
                 controls
-                    .send(normal_prompt_control(Some(job.target), job.prompt.clone()))
+                    .send(normal_prompt_control(
+                        Some(job.target),
+                        job.current().to_owned(),
+                    ))
                     .is_ok()
             }) {
-                let prompt = job.prompt.clone();
+                let prompt = job.current().to_owned();
                 record_dispatched_prompt(app, &mut journal, &prompt, false);
                 loop_job.as_mut().expect("dispatched loop").dispatched(now);
                 turn_active = true;
@@ -4832,12 +4835,12 @@ fn run_terminal(
                                                 app.status =
                                                     "loop stopped; active work may finish".into();
                                             }
-                                            Ok(looping::Command::Start { interval, prompt }) => {
+                                            Ok(looping::Command::Start { interval, prompts }) => {
                                                 if controls.as_ref().is_none_or(|c| c.is_closed()) {
                                                     app.status = "send a normal prompt to connect an agent before starting a loop".into();
                                                 } else if let Some(target) = app.next_agent_slot() {
                                                     let job = looping::Job::new(
-                                                        prompt,
+                                                        prompts,
                                                         target,
                                                         interval,
                                                         Instant::now(),
@@ -7663,10 +7666,10 @@ done
         let (sender, events) = std::sync::mpsc::channel();
         let (_control_sender, mut controls) = tokio::sync::mpsc::unbounded_channel();
         let now = Instant::now();
-        let mut job = super::looping::Job::new("check builds".into(), 1, Duration::ZERO, now);
+        let mut job = super::looping::Job::new(vec!["check builds".into()], 1, Duration::ZERO, now);
         for _ in 0..2 {
             assert!(job.ready(now, false));
-            let command = super::normal_prompt_control(Some(job.target), job.prompt.clone());
+            let command = super::normal_prompt_control(Some(job.target), job.current().to_owned());
             let AdapterControl::Queue { slot, prompt } = command else {
                 panic!("explicit recipient required")
             };

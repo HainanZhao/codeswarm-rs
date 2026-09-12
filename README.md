@@ -200,7 +200,10 @@ you send a prompt or use `/goal run`.
 
 `/loop 5m Check the build status` runs immediately, then repeats the same
 request every five minutes measured from the previous run's start. Bare minute
-counts (`/loop 5 ...`) also work. Runs never overlap: if a job takes longer than
+counts (`/loop 5 ...`) also work. Separate alternatives with `|` to rotate
+through them one per run, cycling forever (for example
+`/loop Check builds | Review logs | Summarize status`); empty parts are
+skipped. Runs never overlap: if a job takes longer than
 the interval, the next starts as soon as it finishes, without catch-up runs.
 `/loop Check the build status` repeats immediately after each completed job.
 For a roster, a job includes the entire peer-review batch.

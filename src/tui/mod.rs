@@ -131,7 +131,7 @@ pub const LOCAL_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/loop",
         description: "Repeat a request after completion or every N minutes",
-        usage: "/loop [Nm] REQUEST | /loop stop",
+        usage: "/loop [Nm] REQUEST [| REQUEST...] | /loop stop",
     },
     CommandSpec {
         name: "/goal",
@@ -4928,7 +4928,7 @@ fn render_keyboard_help(buffer: &mut Buffer, area: Rect) {
         " Turn: Ctrl+Enter direct · Ctrl+C cancel · Ctrl+K cancel queued",
         " Agents: /agent SLOT /reload · Goal: /goal [objective|run|done|clear]",
         " Session: /resume /sessions /status /summary /clear /exit",
-        " Tools: /settings /export · Repeat: /loop [Nm] REQUEST /loop stop",
+        " Tools: /settings /export · Repeat: /loop [Nm] REQUEST [| ...] /loop stop",
     ];
     Paragraph::new(lines.into_iter().map(Line::raw).collect::<Vec<_>>())
         .style(Style::default().fg(Color::Gray).bg(PANEL_BG))

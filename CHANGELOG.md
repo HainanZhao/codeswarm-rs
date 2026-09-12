@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.16] - 2026-09-12
+
+### Added
+
+- Add `/loop REQUEST [| REQUEST...]` rotation: pipe-separated requests dispatch
+  one per run and cycle forever; empty parts are skipped.
+
 ## [0.10.15] - 2026-09-12
 
 ### Added
