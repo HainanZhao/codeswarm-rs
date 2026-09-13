@@ -20,8 +20,8 @@ use crate::{
     reduce,
     relay::{
         CollaborationStrategy, DEFAULT_STOP_ACKNOWLEDGMENT, Relay, RelayDecision, STOP_TOKEN,
-        control_token_visible_end, is_usage_limit_response, requested_next_slot,
-        strip_control_tokens, strip_stop_token,
+        control_token_visible_end, is_context_window_error, is_usage_limit_response,
+        requested_next_slot, strip_control_tokens, strip_stop_token,
     },
     resources,
 };
@@ -409,6 +409,12 @@ pub trait AgentAdapter: Send {
         Err(AdapterError::Unsupported("set_model"))
     }
     async fn reload(&mut self) -> AdapterResult<()>;
+    /// Drop provider-side conversation history and start a fresh session.
+    /// Used to recover from input-context exhaustion, where resuming the
+    /// same overloaded session would fail again. Defaults to `reload`.
+    async fn reset_context(&mut self) -> AdapterResult<()> {
+        self.reload().await
+    }
     async fn stop(&mut self) -> AdapterResult<()>;
     async fn next_event(&mut self) -> Option<AdapterResult<AgentEvent>>;
 }
@@ -564,6 +570,10 @@ impl AgentAdapter for SlotMappedAdapter {
         self.inner.reload().await
     }
 
+    async fn reset_context(&mut self) -> AdapterResult<()> {
+        self.inner.reset_context().await
+    }
+
     async fn stop(&mut self) -> AdapterResult<()> {
         self.inner.stop().await
     }
@@ -642,6 +652,18 @@ impl AdapterHost {
         if let Some(agent) = self.state.slots.get_mut(slot) {
             agent.active = true;
             agent.capabilities = self.adapter.capabilities();
+        }
+        self.last_error = None;
+        Ok(())
+    }
+
+    pub async fn reset_context(&mut self) -> AdapterResult<()> {
+        self.adapter.reset_context().await?;
+        let slot = self.adapter.slot();
+        if let Some(agent) = self.state.slots.get_mut(slot) {
+            agent.active = true;
+            agent.capabilities = self.adapter.capabilities();
+            agent.usage = None;
         }
         self.last_error = None;
         Ok(())
@@ -741,6 +763,11 @@ pub struct RelayHost {
     hosts: Vec<AdapterHost>,
     relay: Relay,
     introduced: Vec<bool>,
+    usages: Vec<Option<UsageUpdate>>,
+    /// Slots already compacted in the current batch. A fresh provider session
+    /// reports usage from the replayed context, so without this guard a large
+    /// replayed journal would trigger a compaction on every turn.
+    auto_compacted: Vec<bool>,
     roster_names: Vec<String>,
     roster_identities: Vec<String>,
     roster_launch_specs: Vec<(String, String)>,
@@ -766,6 +793,12 @@ pub struct RelayCancellation {
 }
 
 const NO_ACTIVE_TURN: usize = usize::MAX;
+
+/// Proactively start a fresh provider session once the reported context
+/// window crosses this usage percent. The bounded public journal (shared
+/// task plus recent public updates) is replayed as compacted context, so
+/// work continues instead of running into the provider's hard limit.
+const CONTEXT_COMPACT_THRESHOLD_PERCENT: u64 = 80;
 
 struct ActiveTurnGuard(Arc<AtomicUsize>);
 
@@ -946,6 +979,8 @@ impl RelayHost {
         Ok(Self {
             relay: Relay::new(hosts.len(), max_rounds),
             introduced: vec![false; hosts.len()],
+            usages: vec![None; hosts.len()],
+            auto_compacted: vec![false; hosts.len()],
             roster_names: hosts
                 .iter()
                 .map(|host| host.adapter().display_name())
@@ -1352,6 +1387,43 @@ impl RelayHost {
         Ok(())
     }
 
+    /// Drop provider-side history and start a fresh session after input
+    /// context exhaustion. Unlike `reload`, this never resumes the poisoned
+    /// session handle, so the next prompt starts from a clean window while
+    /// CodeSwarm's shared task and public journal are re-sent as context.
+    pub async fn reset_context(&mut self, slot: RosterSlot) -> AdapterResult<()> {
+        let desired_policy = self.desired_policy.clone();
+        let event_sink = self.event_sink.clone();
+        let host = self
+            .hosts
+            .get_mut(slot)
+            .ok_or_else(|| AdapterError::Transport("reset target is missing".into()))?;
+        host.reset_context().await?;
+        refresh_adapter_startup(host, &event_sink).await?;
+        apply_policy_to_host(host, &desired_policy).await?;
+        if let Some(introduced) = self.introduced.get_mut(slot) {
+            *introduced = false;
+        }
+        if let Some(usage) = self.usages.get_mut(slot) {
+            *usage = None;
+        }
+        self.relay
+            .reactivate(slot)
+            .map_err(|error| AdapterError::Transport(error.into()))?;
+        let _ = self.queue_session_metadata();
+        if let Some(sink) = &self.event_sink {
+            sink(AgentEvent::RosterUpdated {
+                update: RosterUpdate::Reloaded { slot },
+            });
+            sink(AgentEvent::Text {
+                slot,
+                text: "Started a fresh provider session to reclaim context. Recent shared task and public updates will be re-sent as context.".into(),
+            });
+        }
+        let _ = self.relay.clear_limited(slot);
+        Ok(())
+    }
+
     /// Stop and tombstone an agent while preserving its stable roster slot.
     pub async fn drop_agent(&mut self, slot: RosterSlot) -> AdapterResult<()> {
         self.relay
@@ -1406,6 +1478,8 @@ impl RelayHost {
         self.hosts.push(host);
         self.relay.add_agent();
         self.introduced.push(false);
+        self.usages.push(None);
+        self.auto_compacted.push(false);
         let name = name.into();
         let identity = identity.into();
         self.roster_names.push(name.clone());
@@ -1451,6 +1525,8 @@ impl RelayHost {
             self.roster_launch_specs.swap(first, second);
         }
         self.introduced.swap(first, second);
+        self.usages.swap(first, second);
+        self.auto_compacted.swap(first, second);
         if self.pair_implementer == Some(first) {
             self.pair_implementer = Some(second);
         } else if self.pair_implementer == Some(second) {
@@ -1542,6 +1618,11 @@ impl RelayHost {
         self.active_turn_slot.store(*slot, Ordering::Release);
         let _active_turn = ActiveTurnGuard(Arc::clone(&self.active_turn_slot));
         let event_sink = self.event_sink.clone();
+        // A non-empty public prompt starts a fresh batch; each slot gets one
+        // proactive compaction per batch.
+        if !*direct && !prompt.trim().is_empty() {
+            self.auto_compacted.fill(false);
+        }
         // Recover a broken ACP transport before collecting context or building
         // the prompt. Reload rewinds the slot's context watermark and clears
         // its introduction flag, so those values must be read afterward.
@@ -1561,6 +1642,26 @@ impl RelayHost {
                 return Ok(decision);
             }
             return Err(error);
+        }
+        // Proactively compact before the provider's hard limit is hit: drop
+        // provider-side history with a fresh session and replay the bounded
+        // public journal as compacted context. Performed at most once per
+        // slot per batch; the reactive reset remains as the safety net.
+        let window_full = self
+            .usages
+            .get(*slot)
+            .and_then(|usage| usage.as_ref())
+            .is_some_and(|usage| {
+                usage.size > 0
+                    && usage.used.saturating_mul(100) / usage.size
+                        >= CONTEXT_COMPACT_THRESHOLD_PERCENT
+            });
+        if window_full
+            && !self.auto_compacted.get(*slot).copied().unwrap_or(false)
+            && self.reset_context(*slot).await.is_ok()
+            && let Some(flag) = self.auto_compacted.get_mut(*slot)
+        {
+            *flag = true;
         }
         let speaker_name = self
             .roster_names
@@ -1693,8 +1794,16 @@ impl RelayHost {
             .ok_or_else(|| AdapterError::Transport("relay selected missing adapter".into()))?;
         let prompt = crate::goal::prompt(self.goal.as_ref(), &prompt);
         if let Err(error) = host.send_prompt(prompt.clone()).await {
-            let limited =
-                report_relay_failure(&mut self.relay, &event_sink, *slot, true, error.to_string());
+            let detail = error.to_string();
+            let exhausted =
+                is_context_exhaustion(&detail, self.usages.get(*slot).and_then(|u| u.as_ref()));
+            if exhausted && self.reset_context(*slot).await.is_ok() {
+                // The human prompt was already journaled, so returning the
+                // dispatch lets the outer relay loop retry the same slot with
+                // a fresh provider session on its next iteration.
+                return Ok(decision);
+            }
+            let limited = report_relay_failure(&mut self.relay, &event_sink, *slot, true, detail);
             if limited {
                 self.relay.finish(*slot, *direct, false);
             }
@@ -1738,12 +1847,37 @@ impl RelayHost {
                 update = host.next_update() => match update {
                     Some(Ok(update)) => update,
                     Some(Err(error)) => {
+                        let detail = error.to_string();
+                        let exhausted = is_context_exhaustion(
+                            &detail,
+                            self.usages.get(*slot).and_then(|u| u.as_ref()),
+                        );
+                        if exhausted && self.reset_context(*slot).await.is_ok() {
+                            return Ok(decision);
+                        }
+                        if exhausted {
+                            let limited = report_relay_failure(
+                                &mut self.relay,
+                                &event_sink,
+                                *slot,
+                                true,
+                                detail,
+                            );
+                            if limited {
+                                self.relay.finish(*slot, *direct, false);
+                            }
+                            let _ = self.queue_session_metadata();
+                            if limited {
+                                return Ok(decision);
+                            }
+                            return Err(error);
+                        }
                         let limited = report_relay_failure(
                             &mut self.relay,
                             &event_sink,
                             *slot,
                             true,
-                            error.to_string(),
+                            detail,
                         );
                         if limited {
                             self.relay.finish(*slot, *direct, false);
@@ -1756,12 +1890,20 @@ impl RelayHost {
                     }
                     None => {
                         let error = AdapterError::Transport("adapter ended during turn".into());
+                        let detail = error.to_string();
+                        let exhausted = is_context_exhaustion(
+                            &detail,
+                            self.usages.get(*slot).and_then(|u| u.as_ref()),
+                        );
+                        if exhausted && self.reset_context(*slot).await.is_ok() {
+                            return Ok(decision);
+                        }
                         let limited = report_relay_failure(
                             &mut self.relay,
                             &event_sink,
                             *slot,
                             true,
-                            error.to_string(),
+                            detail,
                         );
                         if limited {
                             self.relay.finish(*slot, *direct, false);
@@ -1809,6 +1951,11 @@ impl RelayHost {
                     continue;
                 },
             };
+            if let AgentEvent::UsageUpdated { usage, .. } = &update.event
+                && let Some(slot_usage) = self.usages.get_mut(*slot)
+            {
+                *slot_usage = Some(usage.clone());
+            }
             match &update.event {
                 AgentEvent::Text { text, .. } => response.push_str(text),
                 AgentEvent::Thought { text, .. } | AgentEvent::UserText { text, .. }
@@ -1839,6 +1986,30 @@ impl RelayHost {
                 AgentEvent::Failed {
                     started, detail, ..
                 } => {
+                    let exhausted = is_context_exhaustion(
+                        detail,
+                        self.usages.get(*slot).and_then(|u| u.as_ref()),
+                    );
+                    if exhausted && self.reset_context(*slot).await.is_ok() {
+                        return Ok(decision);
+                    }
+                    if exhausted {
+                        let limited = report_relay_failure(
+                            &mut self.relay,
+                            &event_sink,
+                            *slot,
+                            *started,
+                            detail.clone(),
+                        );
+                        if limited {
+                            self.relay.finish(*slot, *direct, false);
+                        }
+                        let _ = self.queue_session_metadata();
+                        if limited {
+                            return Ok(decision);
+                        }
+                        return Err(AdapterError::Transport(detail.clone()));
+                    }
                     let limited = report_relay_failure(
                         &mut self.relay,
                         &event_sink,
@@ -1900,6 +2071,12 @@ impl RelayHost {
         if let Some(sink) = &self.event_sink {
             sink(completion_event);
         }
+        // Input-context exhaustion starts a fresh provider session instead
+        // of recording the provider's error text as conversation history.
+        // The outer relay loop retries the same slot on its next iteration.
+        if is_context_window_error(&response) && self.reset_context(*slot).await.is_ok() {
+            return Ok(decision);
+        }
         // A provider plan that ran out mid-turn routes future turns around
         // the agent instead of back into the exhausted quota.
         if is_usage_limit_response(&response) {
@@ -1927,6 +2104,31 @@ impl RelayHost {
         self.queue_session_metadata()?;
         Ok(decision)
     }
+}
+
+/// Whether `detail` looks like input-context exhaustion rather than an
+/// ordinary transport failure. A bare crash string is only treated as
+/// exhaustion when the last `usage_update` shows a nearly-full window, so a
+/// flaky child process is never mistaken for a full context.
+fn is_context_exhaustion(detail: &str, usage: Option<&UsageUpdate>) -> bool {
+    if is_context_window_error(detail) {
+        return true;
+    }
+    let Some(usage) = usage else {
+        return false;
+    };
+    if usage.size == 0 {
+        return false;
+    }
+    if usage.used.saturating_mul(100) / usage.size < 85 {
+        return false;
+    }
+    let haystack = detail.to_lowercase();
+    haystack.contains("adapter ended during turn")
+        || haystack.contains("stream closed")
+        || haystack.contains("eof")
+        || haystack.contains("broken pipe")
+        || haystack.contains("transport")
 }
 
 fn report_relay_failure(
@@ -2386,6 +2588,16 @@ impl AgentAdapter for AgyAdapter {
 
     async fn reload(&mut self) -> AdapterResult<()> {
         self.stop().await?;
+        self.start().await
+    }
+
+    async fn reset_context(&mut self) -> AdapterResult<()> {
+        self.session_id = None;
+        if let Ok(mut announced) = self.announced_session.lock() {
+            *announced = None;
+        }
+        self.stop().await?;
+        self.session_id = None;
         self.start().await
     }
 
@@ -3512,6 +3724,16 @@ impl AgentAdapter for AcpAdapter {
             self.session_id = session_id;
         }
         result
+    }
+
+    async fn reset_context(&mut self) -> AdapterResult<()> {
+        // Context exhaustion poisons the provider-side session: resuming the
+        // same ID would fail again. Drop the handle so `start` creates a
+        // fresh `session/new` conversation.
+        self.session_id = None;
+        self.stop().await?;
+        self.session_id = None;
+        self.start().await
     }
 
     async fn stop(&mut self) -> AdapterResult<()> {
@@ -7847,5 +8069,105 @@ done
         );
         assert!(public.contains("implemented the fix"));
         assert!(!public.contains("Agent 0"));
+    }
+
+    #[tokio::test]
+    async fn relay_streaming_preserves_newlines_across_chunks() {
+        use std::sync::{Arc, Mutex};
+        let streamed = Arc::new(Mutex::new(String::new()));
+        let captured = Arc::clone(&streamed);
+        // Simulate an ACP agent (for example opencode) streaming one answer
+        // in several chunks with embedded newlines, brackets, and markdown.
+        let host = AdapterHost::new(
+            Box::new(ScriptedAdapter::new(
+                0,
+                AgentCapabilities::default(),
+                [
+                    AgentEvent::Text {
+                        slot: 0,
+                        text: "line one\nline two with [brackets] and `code`\n".into(),
+                    },
+                    AgentEvent::Text {
+                        slot: 0,
+                        text: "- item a\n- item b\n\n```rust\nlet x = 1;\n```".into(),
+                    },
+                    AgentEvent::TurnComplete { slot: 0 },
+                ],
+            )),
+            None,
+        );
+        let mut relay = super::RelayHost::new(vec![host], 4).expect("relay");
+        relay.set_event_sink(move |event| {
+            if let AgentEvent::Text { text, .. } = event {
+                captured.lock().expect("stream").push_str(&text);
+            }
+        });
+        relay.start().await.expect("start");
+        relay.run_turn("task", 0).await.expect("turn");
+        let expected = "line one\nline two with [brackets] and `code`\n- item a\n- item b\n\n```rust\nlet x = 1;\n```";
+        assert_eq!(streamed.lock().expect("stream").as_str(), expected);
+    }
+
+    #[tokio::test]
+    async fn relay_proactively_compacts_before_context_is_exhausted() {
+        use std::sync::{Arc, Mutex};
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        let host = AdapterHost::new(
+            Box::new(ScriptedAdapter::new(
+                0,
+                AgentCapabilities::default(),
+                [
+                    AgentEvent::UsageUpdated {
+                        slot: 0,
+                        usage: crate::UsageUpdate {
+                            used: 90,
+                            size: 100,
+                        },
+                    },
+                    AgentEvent::Text {
+                        slot: 0,
+                        text: "first".into(),
+                    },
+                    AgentEvent::TurnComplete { slot: 0 },
+                    AgentEvent::Text {
+                        slot: 0,
+                        text: "second".into(),
+                    },
+                    AgentEvent::TurnComplete { slot: 0 },
+                ],
+            )),
+            None,
+        );
+        let mut relay = super::RelayHost::new(vec![host], 4).expect("relay");
+        relay.set_event_sink(move |event| captured.lock().expect("events").push(event));
+        relay.start().await.expect("start");
+        relay.run_turn("task", 0).await.expect("first turn");
+        relay.run_turn("", 0).await.expect("second turn");
+        assert_eq!(relay.dispatches().len(), 2);
+        // The 90% window reported during the first turn triggers a fresh
+        // session before the second prompt, so the introduction (with the
+        // shared task) is re-sent alongside the compacted public journal.
+        assert!(relay.dispatches()[1].1.contains("You are"));
+        let events = events.lock().expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::RosterUpdated {
+                        update: super::RosterUpdate::Reloaded { slot: 0 },
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Text { text, .. } if text.contains("fresh provider session")
+            )),
+            "compaction notice is surfaced"
+        );
     }
 }

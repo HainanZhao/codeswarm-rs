@@ -72,6 +72,48 @@ pub fn stop_token_visible_end(text: &str) -> usize {
     text.len() - pending
 }
 
+/// Recognize provider input-context exhaustion (for example an ACP
+/// `session/prompt` rejected because the model context window is full).
+/// Kept narrow so ordinary conversation and output-token notices are never
+/// misclassified: a match requires context/prompt/input vocabulary.
+pub fn is_context_window_error(text: &str) -> bool {
+    let haystack = text.to_lowercase();
+    if haystack.contains("context_length_exceeded")
+        || haystack.contains("contextwindow")
+        || haystack.contains("context-window")
+    {
+        return true;
+    }
+    if haystack.contains("context window")
+        || haystack.contains("context length")
+        || haystack.contains("context size")
+        || haystack.contains("context limit")
+        || haystack.contains("maximum context")
+        || haystack.contains("context budget")
+        || haystack.contains("context overflow")
+    {
+        return true;
+    }
+    if haystack.contains("prompt too long")
+        || haystack.contains("prompt too large")
+        || haystack.contains("input too long")
+        || haystack.contains("input too large")
+        || haystack.contains("message too large")
+        || haystack.contains("too many tokens")
+    {
+        return true;
+    }
+    let context = haystack.contains("context");
+    let exhausted = haystack.contains("exceed")
+        || haystack.contains("overflow")
+        || haystack.contains("too large")
+        || haystack.contains("too long")
+        || haystack.contains("exhausted")
+        || haystack.contains("exhaustion")
+        || haystack.contains("full");
+    context && exhausted
+}
+
 /// Recognize a provider usage-limit reply (for example an exhausted Codex
 /// plan). Kept deliberately narrow so ordinary conversation mentioning
 /// "limits" is never misclassified.
@@ -1063,6 +1105,30 @@ mod tests {
             "I updated the usage-limit documentation and billing upgrade flow."
         ));
         assert!(!super::is_usage_limit_response("Ready to review the diff."));
+    }
+
+    #[test]
+    fn context_window_detection_matches_provider_copy() {
+        assert!(super::is_context_window_error(
+            "API Error: This model's maximum context length is 200000 tokens"
+        ));
+        assert!(super::is_context_window_error(
+            "session/prompt failed: context window exceeded"
+        ));
+        assert!(super::is_context_window_error("context_length_exceeded"));
+        assert!(super::is_context_window_error(
+            "Prompt is too long: context overflow"
+        ));
+        assert!(super::is_context_window_error(
+            "Input too large for context"
+        ));
+        assert!(!super::is_context_window_error(
+            "ACP turn stopped because the output token limit was reached"
+        ));
+        assert!(!super::is_context_window_error(
+            "The rate limit on the build job slowed things down."
+        ));
+        assert!(!super::is_context_window_error("Ready to review the diff."));
     }
 
     #[test]

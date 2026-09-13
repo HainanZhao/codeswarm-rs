@@ -473,11 +473,21 @@ fn collapsed_thought_preview(block: &TranscriptBlock, width: usize) -> String {
         Some((speaker, &body[..=end], &body[end + 2..]))
     });
     let source = attribution.map_or(block.source.as_str(), |(_, _, content)| content);
-    // Paragraph separators must not evict readable lines or force an empty
-    // second row. Preserve the original source for expanded history.
-    let content = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    let lines = wrap(&content, width.max(1));
-    let preview = lines[lines.len().saturating_sub(3)..].join("\n");
+    // Preserve the author's line breaks so streamed reasoning keeps its
+    // shape, but drop blank paragraph separators: an empty row must never
+    // evict a readable line from the three-row rolling preview or force text
+    // to start on the second row. Expanded history keeps the original source.
+    let mut rows = Vec::new();
+    for line in source.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.extend(wrap(line, width.max(1)));
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    let preview = rows[rows.len().saturating_sub(3)..].join("\n");
     attribution.map_or(preview.clone(), |(speaker, timestamp, _)| {
         format!("{speaker}: {timestamp} {preview}")
     })
@@ -781,9 +791,10 @@ mod tests {
             true,
         );
         let rows = transcript.viewport(40, 0, 10, 0);
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert!(rows[0].text.starts_with("cargo build"));
-        assert!(rows[1].text.ends_with("finished"));
+        assert!(rows[1].text.contains("warning"));
+        assert!(rows[2].text.ends_with("finished"));
         assert!(rows.iter().all(|row| !row.text.contains("Ctrl+O")));
     }
 

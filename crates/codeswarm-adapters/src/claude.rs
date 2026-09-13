@@ -759,6 +759,16 @@ impl AgentAdapter for ClaudeAdapter {
         self.start().await
     }
 
+    async fn reset_context(&mut self) -> AdapterResult<()> {
+        self.session_id = None;
+        if let Ok(mut announced) = self.announced_session.lock() {
+            *announced = None;
+        }
+        self.stop().await?;
+        self.session_id = None;
+        self.start().await
+    }
+
     async fn stop(&mut self) -> AdapterResult<()> {
         let _ = self.cancel().await?;
         Ok(())

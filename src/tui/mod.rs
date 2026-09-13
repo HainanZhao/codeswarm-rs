@@ -9347,6 +9347,40 @@ mod tests {
     }
 
     #[test]
+    fn streamed_agent_text_preserves_newlines_across_chunks() {
+        let mut app = App::default();
+        for chunk in [
+            "line one\nline two with [brackets] and `code`\n",
+            "- item a\n- item b\n\n```rust\nlet x = 1;\n```",
+        ] {
+            app.apply_event(&codeswarm_adapters::AgentEvent::Text {
+                slot: 0,
+                text: chunk.into(),
+            });
+        }
+        assert_eq!(app.transcript.len(), 1);
+        let rows = app.transcript.viewport(80, 0, 20, 0);
+        let body = rows
+            .iter()
+            .skip(1)
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            body,
+            [
+                "line one",
+                "line two with [brackets] and `code`",
+                "- item a",
+                "- item b",
+                "",
+                "```rust",
+                "let x = 1;",
+                "```",
+            ]
+        );
+    }
+
+    #[test]
     fn transcript_renders_chat_headers_instead_of_log_prefixes() {
         let backend = TestBackend::new(80, 16);
         let mut terminal = Terminal::new(backend).expect("test terminal");
