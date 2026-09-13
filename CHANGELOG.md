@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.17] - 2026-09-13
+
+### Fixed
+
+- Recover from provider input-context exhaustion (for example opencode/ACP
+  `session/prompt` rejected on a full window) by starting a fresh provider
+  session and retrying the turn instead of stalling.
+- Proactively compact before the hard limit: once reported window usage
+  reaches 80%, start a fresh session and replay the shared task plus the
+  bounded public journal as compacted context, at most once per slot per
+  batch.
+- Preserve line breaks in collapsed thought previews (only blank separators
+  are dropped), so streamed reasoning no longer renders as a single wall of
+  text.
+
 ## [0.10.16] - 2026-09-12
 
 ### Added
