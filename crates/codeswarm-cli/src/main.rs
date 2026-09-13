@@ -79,7 +79,36 @@ fn apply_mouse_scroll(app: &mut App, kind: MouseEventKind, width: usize, height:
     let Some(delta) = mouse_scroll_delta(kind) else {
         return false;
     };
-    app.scroll_by(delta, width, height);
+    if app.store_editing_directory() {
+        return true;
+    }
+    for _ in 0..delta.unsigned_abs() {
+        if app.store_visible() {
+            app.handle_store_key(if delta < 0 {
+                StoreKey::Up
+            } else {
+                StoreKey::Down
+            });
+        } else if app.config_visible() {
+            app.handle_config_key(if delta < 0 {
+                ConfigKey::Up
+            } else {
+                ConfigKey::Down
+            });
+        } else if app.product_panel_visible() {
+            app.handle_product_panel_key(Input {
+                key: if delta < 0 { TuiKey::Up } else { TuiKey::Down },
+                ctrl: false,
+                alt: false,
+                shift: false,
+            });
+        } else if app.path_picker_visible() {
+            app.handle_path_picker_key(if delta < 0 { TuiKey::Up } else { TuiKey::Down });
+        } else {
+            app.scroll_by(delta, width, height);
+            return true;
+        }
+    }
     true
 }
 
@@ -1629,8 +1658,13 @@ fn run_store(
         if !event::poll(Duration::from_millis(50))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Mouse(mouse) if mouse_scroll_delta(mouse.kind).is_some() => {
+                apply_mouse_scroll(&mut app, mouse.kind, 0, 0);
+                continue;
+            }
+            _ => continue,
         };
         if key.kind != KeyEventKind::Press {
             continue;
@@ -1902,7 +1936,11 @@ fn load_config_agents(app: &mut App) {
     let settings = settings_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_default();
-    let saved_slots = parse_saved_slots(&settings);
+    load_config_agents_from_settings(app, &settings);
+}
+
+fn load_config_agents_from_settings(app: &mut App, settings: &str) {
+    let saved_slots = parse_saved_slots(settings);
     let saved = saved_slots
         .iter()
         .map(|slot| slot.agent.clone())
@@ -1912,7 +1950,7 @@ fn load_config_agents(app: &mut App) {
         .into_iter()
         .filter_map(|slot| app.agent_identity(slot).map(str::to_owned))
         .collect::<Vec<_>>();
-    let mut catalog = codeswarm_adapters::agents::active_catalog(catalog_from_settings(&settings));
+    let mut catalog = codeswarm_adapters::agents::active_catalog(catalog_from_settings(settings));
     catalog.sort_by_key(|agent| {
         saved
             .iter()
@@ -4344,21 +4382,6 @@ fn run_terminal(
                 app.set_terminal_focused(false);
                 continue;
             }
-            Event::Mouse(mouse)
-                if app.product_panel_visible() && mouse_scroll_delta(mouse.kind).is_some() =>
-            {
-                text_selection.clear();
-                let delta = mouse_scroll_delta(mouse.kind).unwrap_or(0);
-                for _ in 0..delta.unsigned_abs() {
-                    app.handle_product_panel_key(Input {
-                        key: if delta < 0 { TuiKey::Up } else { TuiKey::Down },
-                        ctrl: false,
-                        alt: false,
-                        shift: false,
-                    });
-                }
-                continue;
-            }
             Event::Mouse(mouse) if mouse_scroll_delta(mouse.kind).is_some() => {
                 text_selection.clear();
                 let (kind, next) = coalesce_wheel_input(mouse.kind, || {
@@ -5468,6 +5491,65 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn solo_settings_exposes_saved_acp_agents_after_catalog_replacement() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Solo ACP");
+        app.set_agent_identity(0, "solo.example");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(96, 24)).expect("terminal");
+
+        for peer in ["First saved ACP", "Replacement ACP"] {
+            let settings = serde_json::json!({
+                "launcher": {"roster": ["solo.example"]},
+                "agents": [
+                    {"identity": "solo.example", "name": "Solo ACP", "short_name": "solo",
+                     "adapter": "acp", "command": "codeswarm-test-missing-solo"},
+                    {"identity": "peer.example", "name": peer, "short_name": "peer",
+                     "adapter": "acp", "command": "codeswarm-test-missing-peer"},
+                    {"identity": "invalid.example", "name": "Invalid ACP", "command": ""}
+                ]
+            });
+            super::load_config_agents_from_settings(&mut app, &settings.to_string());
+            assert_eq!(app.config_roster_identities(), ["solo.example"]);
+            app.open_config();
+            // Navigate through the real panel, including entries below its viewport.
+            let mut visible = String::new();
+            for _ in 0..app.config_agents().len() + 20 {
+                terminal
+                    .draw(|frame| codeswarm::tui::render(frame, &mut app))
+                    .expect("draw settings");
+                visible.extend(
+                    terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol()),
+                );
+                app.handle_config_key(ConfigKey::Down);
+            }
+            assert!(visible.contains("Solo ACP"));
+            assert!(visible.contains(peer), "saved ACP peer must be visible");
+            assert!(
+                visible.contains("missing"),
+                "missing commands stay inspectable"
+            );
+            assert!(!visible.contains("Invalid ACP"));
+            if peer == "Replacement ACP" {
+                assert!(!visible.contains("First saved ACP"));
+            }
+            // The final catalog row is the saved peer, and Space must reach it.
+            app.handle_config_key(ConfigKey::ToggleSlot);
+            assert_eq!(
+                app.config_roster_identities(),
+                ["solo.example", "peer.example"]
+            );
+            app.handle_config_key(ConfigKey::Cancel);
+            assert_eq!(app.config_roster_identities(), ["solo.example"]);
+        }
+    }
+
+    #[test]
     fn pending_messages_only_enter_chat_after_dispatch() {
         for direct in [false, true] {
             let mut app = App::default();
@@ -6039,6 +6121,58 @@ done
         assert_eq!(mouse_scroll_delta(MouseEventKind::ScrollUp), Some(-3));
         assert_eq!(mouse_scroll_delta(MouseEventKind::ScrollDown), Some(3));
         assert_eq!(mouse_scroll_delta(MouseEventKind::Moved), None);
+    }
+
+    #[test]
+    fn mouse_wheel_navigates_settings_and_store_without_scrolling_chat() {
+        let mut app = App::default();
+        let agents = (0..12)
+            .map(|index| StoreAgent {
+                identity: format!("agent-{index}"),
+                name: format!("Agent {index}"),
+                adapter: "ACP".into(),
+                command: "missing-test-agent".into(),
+                available: false,
+                selected: false,
+                model: None,
+            })
+            .collect::<Vec<_>>();
+        app.set_config_agents(agents.clone());
+        app.open_config();
+        app.scroll_y = 7;
+        for _ in 0..20 {
+            assert!(apply_mouse_scroll(
+                &mut app,
+                MouseEventKind::ScrollDown,
+                80,
+                10
+            ));
+        }
+        app.handle_config_key(ConfigKey::ToggleSlot);
+        assert_eq!(app.config_roster_identities(), ["agent-11"]);
+        assert_eq!(app.scroll_y, 7);
+        app.handle_config_key(ConfigKey::Cancel);
+
+        app.show_store(agents);
+        apply_mouse_scroll(&mut app, MouseEventKind::ScrollDown, 80, 10);
+        app.handle_store_key(super::StoreKey::Toggle);
+        assert_eq!(app.store_agents()[0].identity, "agent-3");
+        assert!(app.store_agents()[0].selected);
+        assert_eq!(app.scroll_y, 7);
+        // Directory input owns focus; a wheel event must not change its roster.
+        app.begin_store_directory_edit();
+        apply_mouse_scroll(&mut app, MouseEventKind::ScrollDown, 80, 10);
+        app.cancel_store_directory_edit();
+        app.handle_store_key(super::StoreKey::Toggle);
+        assert!(app.store_agents().iter().all(|agent| !agent.selected));
+        app.show_store(Vec::new());
+        assert!(apply_mouse_scroll(
+            &mut app,
+            MouseEventKind::ScrollUp,
+            80,
+            10
+        ));
+        assert_eq!(app.scroll_y, 7);
     }
 
     #[test]

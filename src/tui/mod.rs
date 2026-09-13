@@ -1414,13 +1414,10 @@ impl App {
         &self.config_agents
     }
 
-    /// Number of selected roster rows. The configuration panel only shows
-    /// these; unselected catalog templates stay hidden until they are added.
+    /// Number of roster editor rows, including catalog templates that can
+    /// be selected to add an agent to the session.
     pub fn config_roster_count(&self) -> usize {
-        self.config_agents
-            .iter()
-            .take_while(|agent| agent.selected)
-            .count()
+        self.config_agents.len()
     }
 
     pub fn config_roster_dirty(&self) -> bool {
@@ -3108,6 +3105,9 @@ impl App {
     /// Resolve a footer click using the same compact geometry as the renderer.
     /// Agent markers and names are forgiving targets, matching the Python UI.
     pub fn footer_action(&self, column: u16, width: u16) -> FooterAction {
+        if self.config_visible || self.store_visible || self.product_panel_visible() {
+            return FooterAction::Ignored;
+        }
         let metrics = footer_metrics(self, width);
         if metrics.inner_width == 0 || column == 0 || column > metrics.inner_width {
             return FooterAction::Ignored;
@@ -4095,7 +4095,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_content(frame: &mut Frame, app: &mut App) {
-    app.sync_prompt_editor();
+    if !app.store_editing_directory {
+        app.sync_prompt_editor();
+    }
     app.poll_path_index();
     app.refresh_status_banner(Instant::now());
     let area = frame.area();
@@ -4108,7 +4110,15 @@ fn render_content(frame: &mut Frame, app: &mut App) {
         return;
     }
     if app.config_visible {
-        render_config(frame, app, area);
+        let panel = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+        render_config(frame, app, panel);
+        if area.height > 0 {
+            render_status_banner(
+                frame.buffer_mut(),
+                Rect::new(area.x, area.bottom() - 1, area.width, 1),
+                app,
+            );
+        }
         return;
     }
     if app.sessions_visible || app.report_visible.is_some() {
@@ -4567,7 +4577,17 @@ fn render_path_picker(buffer: &mut Buffer, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 || !app.path_picker_visible() {
         return;
     }
-    let visible = app.path_matches().iter().take(5);
+    let capacity = usize::from(area.height.saturating_sub(3)).min(5);
+    let start = app
+        .path_selection()
+        .saturating_sub(capacity.saturating_sub(1))
+        .min(app.path_matches().len().saturating_sub(capacity));
+    let visible = app
+        .path_matches()
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(capacity);
     let mut lines = Vec::with_capacity(7);
     lines.push(Line::styled(
         format!(
@@ -4577,7 +4597,7 @@ fn render_path_picker(buffer: &mut Buffer, area: Rect, app: &App) {
         ),
         Style::default().fg(Color::Gray),
     ));
-    for (index, candidate) in visible.enumerate() {
+    for (index, candidate) in visible {
         let selected = index == app.path_selection();
         let marker = if selected { "▶" } else { " " };
         let suffix = if candidate.directory { "/" } else { "" };
@@ -5132,12 +5152,19 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled(compact_label(value, value_width), value_style),
         ]));
     }
-    lines.push(Line::raw(""));
-    let actions = if compact {
-        " Ctrl+S Save · Esc Discard"
+    let navigation = if app.config_selected >= CONFIG_SETTING_COUNT {
+        if compact {
+            " Space slot · [/] order"
+        } else {
+            " ↑/↓ Navigate · Space Slot · ←/→ Model · [/] Order"
+        }
+    } else if compact {
+        " ↑/↓ Move · Enter Change"
     } else {
-        " Ctrl+S Save · Esc Discard · Space Toggle · Enter Change · ↑/↓ Navigate · ←/→ Model · Alt/Shift+↑/↓ or [ ] Order"
+        " ↑/↓ Navigate · Space Toggle · Enter Change"
     };
+    lines.push(Line::styled(navigation, Style::default().fg(Color::Gray)));
+    let actions = " Ctrl+S Save · Esc Discard";
     lines.push(Line::styled(
         format!("{actions}  ({}/{})", app.config_selected + 1, total_rows),
         Style::default().fg(Color::Gray),
@@ -5294,9 +5321,9 @@ fn render_store_directory(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, modal);
     let inner = Rect::new(
         modal.x.saturating_add(1),
-        modal.y.saturating_add(1),
+        modal.y.saturating_add(2),
         modal.width.saturating_sub(2),
-        modal.height.saturating_sub(2),
+        modal.height.saturating_sub(3),
     );
     Paragraph::new(Line::styled(
         " Enter apply · Esc cancel",
@@ -7005,6 +7032,65 @@ mod tests {
     }
 
     #[test]
+    fn path_picker_scrolls_selected_results_into_view_after_resize_and_replacement() {
+        let mut app = App {
+            path_query: "@result".into(),
+            path_matches: (0..12)
+                .map(|index| super::PathMatch {
+                    path: format!("result_{index:02}.rs"),
+                    ..tui_path_match_fixture()
+                })
+                .collect(),
+            ..App::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(64, 8)).expect("terminal");
+        for height in [8, 5, 8] {
+            terminal.backend_mut().resize(64, height);
+            terminal.autoresize().expect("resize");
+            for direction in [Key::Down, Key::Up] {
+                for _ in 0..15 {
+                    app.handle_path_picker_key(direction);
+                    terminal
+                        .draw(|frame| {
+                            let area = frame.area();
+                            super::render_path_picker(frame.buffer_mut(), area, &app);
+                        })
+                        .expect("draw picker");
+                    let rendered = terminal
+                        .backend()
+                        .buffer()
+                        .content()
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    let selected = &app.path_matches[app.path_selection].path;
+                    assert!(
+                        rendered.contains(&format!("▶ {selected}")),
+                        "rendered={rendered:?}"
+                    );
+                }
+            }
+        }
+        app.path_matches = vec![tui_path_match_fixture()];
+        app.path_selection = 0;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::render_path_picker(frame.buffer_mut(), area, &app);
+            })
+            .expect("draw replacement");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("▶ src/main.rs"));
+        assert!(!rendered.contains("result_"));
+    }
+
+    #[test]
     fn quoted_path_picker_keeps_spaces_inside_the_current_token() {
         let root = std::env::temp_dir().join(format!(
             "tui-quoted-picker-{}-{}",
@@ -8254,7 +8340,7 @@ mod tests {
     }
 
     #[test]
-    fn config_roster_shows_only_selected_agents_and_keeps_them_operable() {
+    fn config_roster_shows_catalog_agents_and_keeps_them_operable() {
         let mut app = App::default();
         app.set_config_agents(vec![
             StoreAgent {
@@ -8278,9 +8364,9 @@ mod tests {
             StoreAgent {
                 identity: "three.example".into(),
                 name: "Three".into(),
-                adapter: "native".into(),
+                adapter: "ACP".into(),
                 command: "three".into(),
-                available: true,
+                available: false,
                 selected: false,
                 model: None,
             },
@@ -8289,9 +8375,43 @@ mod tests {
         for _ in 0..20 {
             app.handle_config_key(ConfigKey::Down);
         }
-        // Navigation clamps to the two selected rows; the hidden template
-        // never receives a roster row.
-        assert_eq!(app.config_selected, CONFIG_SETTING_COUNT + 1);
+        // Catalog templates are reachable even when they are not selected.
+        assert_eq!(app.config_selected, CONFIG_SETTING_COUNT + 2);
+        let mut terminal = Terminal::new(TestBackend::new(96, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw catalog");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for name in ["One", "Two", "Three"] {
+            assert!(rendered.contains(name), "rendered={rendered:?}");
+        }
+        for hint in ["←/→ Model", "[/] Order", "Ctrl+S Save", "Esc Discard"] {
+            assert!(rendered.contains(hint), "rendered={rendered:?}");
+        }
+        assert_eq!(
+            app.handle_config_key(ConfigKey::MoveUp),
+            ConfigAction::Ignored
+        );
+        assert_eq!(
+            app.handle_config_key(ConfigKey::NextValue),
+            ConfigAction::Ignored
+        );
+        app.handle_config_key(ConfigKey::ToggleSlot);
+        assert_eq!(
+            app.config_roster_identities(),
+            ["one.example", "two.example", "three.example"]
+        );
+        // Adding a slot preserves its template for another independent slot.
+        assert_eq!(app.config_roster_count(), 4);
+        app.handle_config_key(ConfigKey::ToggleSlot);
+        assert_eq!(app.config_roster_count(), 3);
+        app.handle_config_key(ConfigKey::Up);
         assert_eq!(
             app.handle_config_key(ConfigKey::MoveUp),
             ConfigAction::Changed
@@ -8309,6 +8429,56 @@ mod tests {
         assert_eq!(app.config_roster_identities(), ["one.example"]);
         assert_eq!(app.handle_config_key(ConfigKey::Save), ConfigAction::Save);
         assert!(!app.config_visible());
+
+        // A replaced or empty catalog clamps a stale selection safely.
+        app.set_config_agents(Vec::new());
+        app.open_config();
+        for _ in 0..20 {
+            app.handle_config_key(ConfigKey::Down);
+        }
+        assert_eq!(app.config_selected, CONFIG_SETTING_COUNT - 1);
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw empty catalog");
+    }
+
+    #[test]
+    fn settings_errors_remain_visible_in_the_status_ribbon() {
+        let mut app = App::default();
+        app.open_config();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        for message in [
+            "agent did not advertise model selection",
+            "unable to save preferences: disk full",
+        ] {
+            app.status = message.into();
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .expect("draw settings feedback");
+            let ribbon = (0..80)
+                .map(|x| terminal.backend().buffer()[(x, 23)].symbol())
+                .collect::<String>();
+            assert!(ribbon.contains(message), "ribbon={ribbon:?}");
+            assert!(app.config_visible());
+        }
+    }
+
+    #[test]
+    fn panels_block_clicks_on_hidden_conversation_footer_controls() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Solo ACP");
+        assert!((0..80).any(|column| app.footer_action(column, 80) != FooterAction::Ignored));
+        app.open_config();
+        assert!((0..80).all(|column| app.footer_action(column, 80) == FooterAction::Ignored));
+        app.handle_config_key(ConfigKey::Cancel);
+        assert!((0..80).any(|column| app.footer_action(column, 80) != FooterAction::Ignored));
+        app.show_store(Vec::new());
+        assert!((0..80).all(|column| app.footer_action(column, 80) == FooterAction::Ignored));
+        app.handle_store_key(StoreKey::Cancel);
+        app.open_sessions(Vec::new());
+        assert!((0..80).all(|column| app.footer_action(column, 80) == FooterAction::Ignored));
+        app.close_sessions();
+        assert!((0..80).any(|column| app.footer_action(column, 80) != FooterAction::Ignored));
     }
 
     #[test]
@@ -8351,7 +8521,7 @@ mod tests {
             rendered.contains("opencode-go/muse-spark (saved)"),
             "rendered={rendered:?}"
         );
-        assert!(!rendered.contains("Hidden"), "rendered={rendered:?}");
+        assert!(rendered.contains("Hidden"), "rendered={rendered:?}");
     }
 
     #[test]
@@ -9171,6 +9341,24 @@ mod tests {
         app.handle_store_directory_input(key(Key::Char('/')));
         for character in "tmp".chars() {
             app.handle_store_directory_input(key(Key::Char(character)));
+        }
+        for (width, height) in [(80, 24), (32, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .expect("draw directory editor");
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                rendered.contains("Enter apply · Esc cancel"),
+                "rendered={rendered:?}"
+            );
+            assert!(rendered.contains("/tmp"), "rendered={rendered:?}");
         }
         assert_eq!(
             app.handle_store_directory_input(key(Key::Enter)),

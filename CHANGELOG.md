@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.18] - 2026-09-13
+
+### Fixed
+
+- Show unselected catalog agents in Settings so solo sessions can add saved
+  ACP agents; retain templates for independent duplicate roster slots.
+- Keep the selected path-picker result visible while navigating and resizing.
+- Route mouse-wheel scrolling to the open settings, store, history/report,
+  or path-picker surface instead of the conversation behind it. Block clicks
+  on hidden conversation-footer controls while a panel is open.
+- Preserve workspace-directory input across redraws and keep its Enter/Esc
+  instructions visible above the editor.
+- Show Settings feedback in the status ribbon and keep navigation, model,
+  and roster-order hints within the panel width.
+
 ## [0.10.17] - 2026-09-13
 
 ### Fixed

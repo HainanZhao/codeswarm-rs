@@ -125,6 +125,32 @@
   Ask a question only when missing information would materially change the
   result or make the action unsafe.
 
+## Design philosophy
+
+- Make capabilities discoverable where users need them. An unselected choice
+  is still a choice: Settings must expose enabled catalog agents alongside
+  selected roster slots. Show missing prerequisites with a useful explanation
+  instead of silently hiding the option. Respect explicit user exclusions.
+- Keep what users see aligned with what their actions affect. The visible
+  surface owns navigation, scrolling, and clicks; controls behind a panel
+  must not respond. Keep the selected item visible as lists scroll or resize.
+- Treat user intent as durable state. Redraws, background updates, and layout
+  changes must not erase drafts, alter choices, or move focus unexpectedly.
+  Make committing and discarding edits explicit and predictable.
+- Explain outcomes at the point of action. Show failures and unmet
+  prerequisites while the relevant panel remains open, with a useful next
+  step when known. Do not make users close a panel to discover why an action
+  did nothing; use the established status ribbon for conversation feedback.
+- Fit the interface to the available space. Prioritize the current task,
+  selection, and essential instructions; keep hints readable and separate
+  from editable content. Offer scrolling rather than silently clipping choices.
+- Preserve agency without needless friction. Keep common actions direct,
+  make reversible edits easy to undo or discard, and avoid extra confirmation
+  steps unless an action's consequences warrant them.
+- Test the experience, not just internal state. Regressions should exercise
+  input and rendered output together, including solo sessions, long lists,
+  narrow panes, missing or replaced external data, and repeated redraws.
+
 ## Terminal notifications
 
 - Before the conversation prompt is available, setup, store, configuration,
