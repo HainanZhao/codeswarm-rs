@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.19] - 2026-09-18
+
+### Fixed
+
+- Let users enter exact per-slot model names in Settings instead of relying on
+  an ACP agent's advertised model catalog; an empty value uses the provider
+  default without disturbing the conversation draft.
+- Send model changes through modern ACP `session/set_model` when model state is
+  advertised, while retaining `session/set_config_option` compatibility for
+  legacy ACP agents.
+
 ## [0.10.18] - 2026-09-13
 
 ### Fixed

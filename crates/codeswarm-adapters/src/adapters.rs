@@ -2713,6 +2713,7 @@ pub struct AcpAdapter {
     modes: Vec<Mode>,
     models: Vec<Mode>,
     model_config_id: Option<String>,
+    model_uses_set_model: bool,
     session_id: Option<String>,
     next_request_id: u64,
     prompt_request_id: Option<u64>,
@@ -2742,6 +2743,7 @@ impl AcpAdapter {
             modes: Vec::new(),
             models: Vec::new(),
             model_config_id: None,
+            model_uses_set_model: false,
             session_id: None,
             next_request_id: 1,
             prompt_request_id: None,
@@ -3438,6 +3440,8 @@ impl AcpAdapter {
         }
         self.models.clear();
         self.model_config_id = None;
+        self.model_uses_set_model =
+            session.get("models").is_some() && session.get("configOptions").is_none();
         let current_model =
             parse_model_config(&session).and_then(|(config_id, models, current)| {
                 self.model_config_id = Some(config_id);
@@ -3678,6 +3682,12 @@ impl AgentAdapter for AcpAdapter {
     }
 
     async fn set_model(&mut self, model: String) -> AdapterResult<()> {
+        let model = model.trim();
+        if model.is_empty() || model.chars().any(char::is_control) {
+            return Err(AdapterError::Protocol(
+                "model must be a non-empty, single-line name".into(),
+            ));
+        }
         let session_id = self
             .session_id
             .clone()
@@ -3686,13 +3696,13 @@ impl AgentAdapter for AcpAdapter {
             .model_config_id
             .clone()
             .ok_or(AdapterError::Unsupported("set_model"))?;
-        if !self.models.iter().any(|candidate| candidate.id == model) {
-            return Err(AdapterError::Protocol(
-                "model is not advertised by the agent".into(),
-            ));
-        }
-        let _ = self
-            .request(
+        let (method, params) = if self.model_uses_set_model {
+            (
+                "session/set_model",
+                serde_json::json!({"sessionId": session_id, "modelId": model}),
+            )
+        } else {
+            (
                 "session/set_config_option",
                 serde_json::json!({
                     "sessionId": session_id,
@@ -3700,7 +3710,8 @@ impl AgentAdapter for AcpAdapter {
                     "value": model,
                 }),
             )
-            .await?;
+        };
+        let _ = self.request(method, params).await?;
         Ok(())
     }
 
@@ -5785,8 +5796,8 @@ printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"timeou
     }
 
     #[tokio::test]
-    async fn acp_models_are_discovered_live_and_changed_through_session_config() {
-        let script = r#"read _; echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{}}}'; read _; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session-1","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"fast","options":[{"value":"fast","name":"Fast"},{"value":"smart","name":"Smart"}]}]}}'; read request; case "$request" in *session/set_config_option*\"value\":\"smart\"*) echo '{"jsonrpc":"2.0","id":3,"result":{}}';; *) echo '{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"wrong model request"}}';; esac"#;
+    async fn acp_accepts_a_typed_model_name_through_legacy_session_config() {
+        let script = r#"read _; echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{}}}'; read _; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session-1","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"fast","options":[{"value":"fast","name":"Fast"},{"value":"smart","name":"Smart"}]}]}}'; read request; case "$request" in *session/set_config_option*\"value\":\"provider/custom\"*) echo '{"jsonrpc":"2.0","id":3,"result":{}}';; *) echo '{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"wrong model request"}}';; esac"#;
         let cwd = std::env::current_dir().expect("cwd");
         let mut adapter = AcpAdapter::new(0, cwd, "sh", vec!["-c".into(), script.into()]);
         adapter.start().await.expect("initialize");
@@ -5802,8 +5813,34 @@ printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"timeou
             adapter.next_event().await,
             Some(Ok(AgentEvent::Ready { capabilities, .. })) if capabilities.supports_models
         ));
-        adapter.set_model("smart".into()).await.expect("set model");
-        assert!(adapter.set_model("invented".into()).await.is_err());
+        adapter
+            .set_model("provider/custom".into())
+            .await
+            .expect("set typed model");
+        assert!(adapter.set_model("   ".into()).await.is_err());
+        adapter.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn acp_uses_the_native_set_model_method_for_model_state() {
+        let script = r#"read _; echo '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{}}}'; read _; echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session-1","models":{"currentModelId":"fast","availableModels":[{"modelId":"fast","name":"Fast"}]}}}'; read request; case "$request" in *session/set_model*\"modelId\":\"provider/custom\"*) echo '{"jsonrpc":"2.0","id":3,"result":{}}';; *) echo '{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"wrong model method"}}';; esac"#;
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut adapter = AcpAdapter::new(0, cwd, "sh", vec!["-c".into(), script.into()]);
+        adapter.start().await.expect("initialize");
+        assert!(adapter.capabilities().supports_models);
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::ModelsReplaced { current_model, .. }))
+                if current_model.as_deref() == Some("fast")
+        ));
+        assert!(matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::Ready { capabilities, .. })) if capabilities.supports_models
+        ));
+        adapter
+            .set_model("provider/custom".into())
+            .await
+            .expect("set typed model");
         adapter.stop().await.expect("stop");
     }
 

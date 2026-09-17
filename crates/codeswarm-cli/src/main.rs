@@ -4032,7 +4032,10 @@ fn run_terminal(
         if app.poll_path_index() {
             redraw.invalidate();
         }
-        if app.config_visible() && config_input.take_expired_escape(Instant::now()) {
+        if app.config_visible()
+            && !app.config_editing_model()
+            && config_input.take_expired_escape(Instant::now())
+        {
             let _ = app.handle_config_key(ConfigKey::Cancel);
             redraw.invalidate();
             continue;
@@ -4495,6 +4498,14 @@ fn run_terminal(
                     continue;
                 }
                 if app.config_visible() {
+                    if app.config_editing_model() {
+                        if key.code == KeyCode::Esc {
+                            app.cancel_config_model_edit();
+                        } else {
+                            let _ = app.handle_config_model_input(Input::from(key));
+                        }
+                        continue;
+                    }
                     let config_key = config_input.decode(key, Instant::now());
                     if let Some(config_key) = config_key {
                         if config_key == ConfigKey::Save

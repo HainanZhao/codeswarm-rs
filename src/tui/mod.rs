@@ -1037,6 +1037,8 @@ pub struct App {
     config_agents: Vec<StoreAgent>,
     config_roster_dirty: bool,
     config_snapshot: Option<ConfigSnapshot>,
+    config_editing_model: Option<usize>,
+    config_model_editor: PromptEditor,
     config_collaboration_pending: bool,
     sessions_visible: bool,
     sessions_entries: Vec<SessionListEntry>,
@@ -1160,6 +1162,8 @@ impl Default for App {
             config_agents: Vec::new(),
             config_roster_dirty: false,
             config_snapshot: None,
+            config_editing_model: None,
+            config_model_editor: PromptEditor::default(),
             config_collaboration_pending: false,
             sessions_visible: false,
             sessions_entries: Vec::new(),
@@ -1340,6 +1344,56 @@ impl App {
         self.config_visible
     }
 
+    pub fn config_editing_model(&self) -> bool {
+        self.config_editing_model.is_some()
+    }
+
+    pub fn cancel_config_model_edit(&mut self) {
+        self.config_editing_model = None;
+        self.config_model_editor.clear();
+        self.status = "model unchanged".into();
+    }
+
+    /// Apply input to the model-name editor opened from a selected roster row.
+    /// An empty value means "use the provider default" and clears a saved
+    /// override. Model identifiers are otherwise intentionally provider-owned.
+    pub fn handle_config_model_input(&mut self, input: Input) -> ConfigAction {
+        let Some(index) = self.config_editing_model else {
+            return ConfigAction::Ignored;
+        };
+        if input.key == Key::Enter && !input.ctrl && !input.alt && !input.shift {
+            let value = self.config_model_editor.text();
+            let model = value.trim();
+            if model.chars().any(char::is_control) {
+                self.status = "model name must be one line".into();
+                return ConfigAction::Ignored;
+            }
+            let model = (!model.is_empty()).then(|| model.to_owned());
+            let Some(agent) = self.config_agents.get(index) else {
+                self.cancel_config_model_edit();
+                return ConfigAction::Ignored;
+            };
+            let agent_name = agent.name.clone();
+            let target_slot = self.live_slot_for_config_row(index);
+            self.config_agents[index].model = model.clone();
+            if let (Some(slot), Some(model)) = (target_slot, model.as_ref()) {
+                self.pending_model_changes.insert(slot, model.clone());
+            }
+            self.config_roster_dirty = true;
+            self.config_editing_model = None;
+            self.config_model_editor.clear();
+            self.status = match model {
+                Some(model) => format!("{agent_name} model: {model}"),
+                None => format!("{agent_name} model: provider default"),
+            };
+            return ConfigAction::Changed;
+        }
+        match self.config_model_editor.handle_input(input) {
+            PromptAction::Changed | PromptAction::Completion { .. } => ConfigAction::Changed,
+            PromptAction::Ignored | PromptAction::Submit(_) => ConfigAction::Ignored,
+        }
+    }
+
     fn begin_config(&mut self) {
         if !self.config_visible {
             self.config_snapshot = Some(ConfigSnapshot {
@@ -1360,6 +1414,8 @@ impl App {
             });
         }
         self.pending_model_changes.clear();
+        self.config_editing_model = None;
+        self.config_model_editor.clear();
         self.config_visible = true;
     }
 
@@ -1466,24 +1522,6 @@ impl App {
                     .is_some_and(|candidate| candidate.eq_ignore_ascii_case(identity))
             })
             .nth(occurrence)
-    }
-
-    /// Use this row's live adapter when it exists. A newly added duplicate
-    /// slot can borrow another instance's advertised catalog until its own
-    /// adapter starts, because model IDs are provider-agent configuration.
-    fn model_source_slot_for_config_row(&self, row: usize) -> Option<usize> {
-        if let Some(slot) = self.live_slot_for_config_row(row)
-            && self.agent_models.contains_key(&slot)
-        {
-            return Some(slot);
-        }
-        let identity = &self.config_agents.get(row)?.identity;
-        self.active_roster_slots().into_iter().find(|slot| {
-            self.agent_models.contains_key(slot)
-                && self
-                    .agent_identity(*slot)
-                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(identity))
-        })
     }
 
     pub fn show_store(&mut self, agents: Vec<StoreAgent>) {
@@ -1655,6 +1693,8 @@ impl App {
         match key {
             ConfigKey::Cancel => {
                 self.config_visible = false;
+                self.config_editing_model = None;
+                self.config_model_editor.clear();
                 self.full_repaint_requested = true;
                 if let Some(snapshot) = self.config_snapshot.take() {
                     self.theme = snapshot.theme;
@@ -1682,6 +1722,8 @@ impl App {
             }
             ConfigKey::Save => {
                 self.config_visible = false;
+                self.config_editing_model = None;
+                self.config_model_editor.clear();
                 self.full_repaint_requested = true;
                 self.config_collaboration_pending = self
                     .config_snapshot
@@ -1700,64 +1742,6 @@ impl App {
                     .saturating_add(self.config_roster_count())
                     .saturating_sub(1);
                 self.config_selected = self.config_selected.saturating_add(1).min(max);
-                ConfigAction::Changed
-            }
-            ConfigKey::PreviousValue | ConfigKey::NextValue
-                if self.config_selected >= CONFIG_SETTING_COUNT =>
-            {
-                let index = self.config_selected - CONFIG_SETTING_COUNT;
-                let Some((agent_selected, agent_name)) = self
-                    .config_agents
-                    .get(index)
-                    .map(|agent| (agent.selected, agent.name.clone()))
-                else {
-                    return ConfigAction::Ignored;
-                };
-                if !agent_selected {
-                    self.status = "add this agent to a slot before selecting its model".into();
-                    return ConfigAction::Ignored;
-                }
-                let target_slot = self.live_slot_for_config_row(index);
-                let Some(source_slot) = self.model_source_slot_for_config_row(index) else {
-                    self.status = "model list is available after this agent starts".into();
-                    return ConfigAction::Ignored;
-                };
-                let Some((_config_id, models, current)) =
-                    self.agent_models.get(&source_slot).cloned()
-                else {
-                    self.status = "this agent did not advertise model selection".into();
-                    return ConfigAction::Ignored;
-                };
-                if models.is_empty() {
-                    self.status = "this agent did not advertise model selection".into();
-                    return ConfigAction::Ignored;
-                }
-                let current = self.config_agents[index]
-                    .model
-                    .clone()
-                    .or_else(|| {
-                        target_slot.and_then(|slot| self.pending_model_changes.get(&slot).cloned())
-                    })
-                    .or(current);
-                let position = current
-                    .as_ref()
-                    .and_then(|current| models.iter().position(|model| &model.id == current));
-                let next = match (key, position) {
-                    (ConfigKey::NextValue, Some(position)) => (position + 1) % models.len(),
-                    (ConfigKey::PreviousValue, Some(position)) => {
-                        position.checked_sub(1).unwrap_or(models.len() - 1)
-                    }
-                    (ConfigKey::NextValue, None) => 0,
-                    (ConfigKey::PreviousValue, None) => models.len() - 1,
-                    _ => return ConfigAction::Ignored,
-                };
-                if let Some(slot) = target_slot {
-                    self.pending_model_changes
-                        .insert(slot, models[next].id.clone());
-                }
-                self.config_agents[index].model = Some(models[next].id.clone());
-                self.config_roster_dirty = true;
-                self.status = format!("{agent_name} model: {}", models[next].label);
                 ConfigAction::Changed
             }
             ConfigKey::PreviousValue | ConfigKey::NextValue => ConfigAction::Ignored,
@@ -1847,7 +1831,19 @@ impl App {
             }
             ConfigKey::Confirm => {
                 if self.config_selected >= CONFIG_SETTING_COUNT {
-                    return ConfigAction::Ignored;
+                    let index = self.config_selected - CONFIG_SETTING_COUNT;
+                    let Some(agent) = self.config_agents.get(index) else {
+                        return ConfigAction::Ignored;
+                    };
+                    if !agent.selected {
+                        self.status = "add this agent to a slot before setting its model".into();
+                        return ConfigAction::Ignored;
+                    }
+                    self.config_model_editor
+                        .set_text(agent.model.clone().unwrap_or_default());
+                    self.config_editing_model = Some(index);
+                    self.status = "enter a model name; leave blank for provider default".into();
+                    return ConfigAction::Changed;
                 }
                 match self.config_selected {
                     0 => self.follow_tail = !self.follow_tail,
@@ -4112,6 +4108,9 @@ fn render_content(frame: &mut Frame, app: &mut App) {
     if app.config_visible {
         let panel = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
         render_config(frame, app, panel);
+        if app.config_editing_model() {
+            render_config_model(frame, app, panel);
+        }
         if area.height > 0 {
             render_status_banner(
                 frame.buffer_mut(),
@@ -5072,42 +5071,11 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
                 ),
             ];
             if agent.selected {
-                let target_slot = app.live_slot_for_config_row(roster_index);
-                let chosen = agent
-                    .model
-                    .as_ref()
-                    .or_else(|| target_slot.and_then(|slot| app.pending_model_changes.get(&slot)));
-                let live = app
-                    .model_source_slot_for_config_row(roster_index)
-                    .and_then(|source_slot| app.agent_models.get(&source_slot));
-                if let Some((_config_id, models, current)) = live {
-                    let selected_model = chosen.or(current.as_ref());
-                    if let Some(model) =
-                        selected_model.and_then(|id| models.iter().find(|model| &model.id == id))
-                    {
-                        spans.push(Span::styled(
-                            format!(" · {} ←/→", model.label),
-                            Style::default().fg(ACCENT),
-                        ));
-                    } else if let Some(model) = selected_model {
-                        spans.push(Span::styled(
-                            format!(" · {model} ←/→"),
-                            Style::default().fg(ACCENT),
-                        ));
-                    } else {
-                        spans.push(Span::styled(
-                            " · Inherited ←/→",
-                            Style::default().fg(ACCENT),
-                        ));
-                    }
-                } else if let Some(model) = chosen {
-                    // No adapter has advertised a catalog yet. Show the saved
-                    // selection so selected agents are inspectable pre-launch.
-                    spans.push(Span::styled(
-                        format!(" · {model} (saved)"),
-                        Style::default().fg(Color::Gray),
-                    ));
-                }
+                let model = agent.model.as_deref().unwrap_or("Provider default");
+                spans.push(Span::styled(
+                    format!(" · {model} · Enter edit"),
+                    Style::default().fg(if selected { ACCENT } else { Color::Gray }),
+                ));
             }
             lines.push(Line::from(spans));
             continue;
@@ -5154,9 +5122,9 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
     }
     let navigation = if app.config_selected >= CONFIG_SETTING_COUNT {
         if compact {
-            " Space slot · [/] order"
+            " Enter model · Space slot"
         } else {
-            " ↑/↓ Navigate · Space Slot · ←/→ Model · [/] Order"
+            " ↑/↓ Navigate · Enter Model · Space Slot · [/] Order"
         }
     } else if compact {
         " ↑/↓ Move · Enter Change"
@@ -5179,6 +5147,40 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
                 .border_style(Style::default().fg(SEPARATOR)),
         )
         .render(modal, frame.buffer_mut());
+}
+
+fn render_config_model(frame: &mut Frame, app: &mut App, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area.width.clamp(36, 76);
+    let height = area.height.clamp(5, 7);
+    let modal = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width.min(area.width),
+        height.min(area.height),
+    );
+    frame.render_widget(Clear, modal);
+    Paragraph::new(Line::styled(
+        " Enter apply · Empty uses provider default · Esc cancel",
+        Style::default().fg(Color::Gray),
+    ))
+    .block(
+        Block::default()
+            .title(" Model name ")
+            .title_style(Style::default().fg(ACCENT).bold())
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(SEPARATOR)),
+    )
+    .render(modal, frame.buffer_mut());
+    let input = Rect::new(
+        modal.x.saturating_add(2),
+        modal.y.saturating_add(2),
+        modal.width.saturating_sub(4),
+        1,
+    );
+    app.config_model_editor.render(frame, input);
 }
 
 fn render_store(frame: &mut Frame, app: &App, area: Rect) {
@@ -8391,7 +8393,7 @@ mod tests {
         for name in ["One", "Two", "Three"] {
             assert!(rendered.contains(name), "rendered={rendered:?}");
         }
-        for hint in ["←/→ Model", "[/] Order", "Ctrl+S Save", "Esc Discard"] {
+        for hint in ["Enter Model", "[/] Order", "Ctrl+S Save", "Esc Discard"] {
             assert!(rendered.contains(hint), "rendered={rendered:?}");
         }
         assert_eq!(
@@ -8518,14 +8520,14 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(
-            rendered.contains("opencode-go/muse-spark (saved)"),
+            rendered.contains("opencode-go/muse-spark · Enter edi"),
             "rendered={rendered:?}"
         );
         assert!(rendered.contains("Hidden"), "rendered={rendered:?}");
     }
 
     #[test]
-    fn live_agent_models_are_selected_from_the_advertised_catalog() {
+    fn model_name_is_entered_directly_without_using_the_advertised_catalog() {
         let mut app = App::default();
         app.set_agent_name(0, "Codex");
         app.set_agent_identity(0, "openai.com");
@@ -8553,14 +8555,36 @@ mod tests {
             ],
             current_model: Some("fast".into()),
         });
+        for character in "keep this draft".chars() {
+            app.handle_prompt_input(key(Key::Char(character)));
+        }
         app.open_config();
         app.config_selected = CONFIG_SETTING_COUNT;
         assert_eq!(
-            app.handle_config_key(ConfigKey::NextValue),
+            app.handle_config_key(ConfigKey::Confirm),
+            ConfigAction::Changed
+        );
+        assert!(app.config_editing_model());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw model editor");
+        let editor = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(editor.contains("Model name"), "rendered={editor:?}");
+        for character in "provider/custom-model".chars() {
+            app.handle_config_model_input(key(Key::Char(character)));
+        }
+        assert_eq!(
+            app.handle_config_model_input(key(Key::Enter)),
             ConfigAction::Changed
         );
         assert!(app.config_roster_dirty());
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
         terminal
             .draw(|frame| render(frame, &mut app))
             .expect("draw live model choice");
@@ -8571,73 +8595,42 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Smart ←/→"), "rendered={rendered:?}");
-        assert_eq!(app.take_config_model_changes(), vec![(0, "smart".into())]);
+        assert!(
+            rendered.contains("provider/custom-model"),
+            "rendered={rendered:?}"
+        );
+        assert_eq!(
+            app.take_config_model_changes(),
+            vec![(0, "provider/custom-model".into())]
+        );
+        assert_eq!(app.prompt, "keep this draft");
     }
 
     #[test]
-    fn inherited_model_state_is_not_rendered_as_the_first_catalog_choice() {
-        for (name, identity, first_id, first_label) in [
-            ("Claude", "anthropic.com", "default", "Default"),
-            ("Codex", "openai.com", "gpt-first", "GPT First"),
-        ] {
-            let mut app = App::default();
-            app.set_agent_name(0, name);
-            app.set_agent_identity(0, identity);
-            app.set_config_agents(vec![StoreAgent {
-                identity: identity.into(),
-                name: name.into(),
-                adapter: "native".into(),
-                command: name.to_ascii_lowercase(),
-                available: true,
-                selected: true,
-                model: None,
-            }]);
-            app.apply_event(&codeswarm_adapters::AgentEvent::ModelsReplaced {
-                slot: 0,
-                config_id: "model".into(),
-                models: vec![
-                    codeswarm_adapters::Mode {
-                        id: first_id.into(),
-                        label: first_label.into(),
-                    },
-                    codeswarm_adapters::Mode {
-                        id: "second".into(),
-                        label: "Second".into(),
-                    },
-                ],
-                current_model: None,
-            });
-            app.open_config();
-            app.config_selected = CONFIG_SETTING_COUNT;
-
-            let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
-            terminal
-                .draw(|frame| render(frame, &mut app))
-                .expect("draw inherited model");
-            let rendered = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            assert!(rendered.contains("Inherited ←/→"), "rendered={rendered:?}");
-            assert!(
-                !rendered.contains(&format!("{first_label} ←/→")),
-                "rendered={rendered:?}"
-            );
-
-            assert_eq!(
-                app.handle_config_key(ConfigKey::NextValue),
-                ConfigAction::Changed
-            );
-            assert_eq!(app.take_config_model_changes(), vec![(0, first_id.into())]);
+    fn empty_model_name_clears_the_saved_override() {
+        let mut app = App::default();
+        app.set_config_agents(vec![StoreAgent {
+            identity: "openai.com".into(),
+            name: "Codex".into(),
+            adapter: "ACP".into(),
+            command: "codex --acp".into(),
+            available: true,
+            selected: true,
+            model: Some("old-model".into()),
+        }]);
+        app.open_config();
+        app.config_selected = CONFIG_SETTING_COUNT;
+        app.handle_config_key(ConfigKey::Confirm);
+        for _ in 0.."old-model".len() {
+            app.handle_config_model_input(key(Key::Backspace));
         }
+        app.handle_config_model_input(key(Key::Enter));
+        assert_eq!(app.config_roster_slots()[0].model, None);
+        assert_eq!(app.status, "Codex model: provider default");
     }
 
     #[test]
-    fn duplicate_agent_slots_target_their_own_models() {
+    fn duplicate_agent_slots_accept_independent_typed_models() {
         let mut app = App::default();
         for slot in 0..2 {
             app.set_agent_name(slot, "Claude");
@@ -8680,86 +8673,22 @@ mod tests {
         ]);
         app.open_config();
         app.config_selected = CONFIG_SETTING_COUNT + 1;
+        app.handle_config_key(ConfigKey::Confirm);
+        for _ in 0.."opus".len() {
+            app.handle_config_model_input(key(Key::Backspace));
+        }
+        for character in "provider/experimental".chars() {
+            app.handle_config_model_input(key(Key::Char(character)));
+        }
+        app.handle_config_model_input(key(Key::Enter));
         assert_eq!(
-            app.handle_config_key(ConfigKey::PreviousValue),
-            ConfigAction::Changed
+            app.take_config_model_changes(),
+            vec![(1, "provider/experimental".into())]
         );
-        assert_eq!(app.take_config_model_changes(), vec![(1, "sonnet".into())]);
         assert_eq!(
             app.config_roster_slots()[1].model.as_deref(),
-            Some("sonnet")
+            Some("provider/experimental")
         );
-    }
-
-    #[test]
-    fn pending_duplicate_slot_borrows_the_running_agents_model_catalog() {
-        let mut app = App::default();
-        app.set_agent_name(0, "Claude");
-        app.set_agent_identity(0, "anthropic.com");
-        app.apply_event(&codeswarm_adapters::AgentEvent::ModelsReplaced {
-            slot: 0,
-            config_id: "model".into(),
-            models: vec![
-                codeswarm_adapters::Mode {
-                    id: "sonnet".into(),
-                    label: "Sonnet".into(),
-                },
-                codeswarm_adapters::Mode {
-                    id: "opus".into(),
-                    label: "Opus".into(),
-                },
-            ],
-            current_model: Some("sonnet".into()),
-        });
-        app.set_config_agents(vec![
-            StoreAgent {
-                identity: "anthropic.com".into(),
-                name: "Claude".into(),
-                adapter: "ACP".into(),
-                command: "claude-agent-acp".into(),
-                available: true,
-                selected: true,
-                model: None,
-            },
-            StoreAgent {
-                identity: "anthropic.com".into(),
-                name: "Claude".into(),
-                adapter: "ACP".into(),
-                command: "claude-agent-acp".into(),
-                available: true,
-                selected: true,
-                model: None,
-            },
-        ]);
-        app.open_config();
-        app.config_selected = CONFIG_SETTING_COUNT + 1;
-
-        assert_eq!(
-            app.handle_config_key(ConfigKey::NextValue),
-            ConfigAction::Changed
-        );
-        assert_eq!(app.config_roster_slots()[1].model.as_deref(), Some("opus"));
-        // The pending slot does not accidentally retarget the first adapter.
-        assert!(app.take_config_model_changes().is_empty());
-
-        app.set_agent_name(1, "Claude");
-        app.set_agent_identity(1, "anthropic.com");
-        app.apply_event(&codeswarm_adapters::AgentEvent::ModelsReplaced {
-            slot: 1,
-            config_id: "model".into(),
-            models: vec![
-                codeswarm_adapters::Mode {
-                    id: "sonnet".into(),
-                    label: "Sonnet".into(),
-                },
-                codeswarm_adapters::Mode {
-                    id: "opus".into(),
-                    label: "Opus".into(),
-                },
-            ],
-            current_model: Some("sonnet".into()),
-        });
-        assert_eq!(app.take_config_model_changes(), vec![(1, "opus".into())]);
     }
 
     #[test]
