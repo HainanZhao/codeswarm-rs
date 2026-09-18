@@ -124,17 +124,21 @@ Inside the conversation prompt:
 - `/help` shows keyboard and command help.
 - `/goal OBJECTIVE` sets a shared goal and starts work; `/goal` shows its status.
 - `/settings` opens settings, including the
-  slot-based roster editor (Space adds/removes a slot, ←/→ selects that
-  running slot's model, Alt+↑/↓ reorders, Ctrl+S saves
-  and applies idle-session changes when possible).
+  slot-based roster editor (Enter adds/removes a slot, Space edits its model,
+  Alt+↑/↓ reorders, and Ctrl+S saves).
 - `/export` writes the retained conversation to Markdown.
 - `/cancel` cancels active work and reports when nothing is running.
+- `/queue MESSAGE` defers a message until active work finishes.
 - `/reload` cancels and restarts a silent agent, or retries the most recently
   crashed agent in its roster slot.
 - `/agent SLOT` selects any active roster slot for the next message.
 - Left-drag selects and copies visible text while transcript wheel scrolling
   remains active.
 - `/clear` clears the local transcript; `/exit` exits the session.
+
+A normal message submitted during active work steers the selected/current
+agent: CodeSwarm cancels that turn and dispatches the new message as soon as
+cancellation settles. Pasted multiline text remains one draft until Enter.
 
 Typing `/` opens a compact command palette with descriptions. The conversation
 chrome stays fixed: a transient one-line system banner, an unlabeled composer,

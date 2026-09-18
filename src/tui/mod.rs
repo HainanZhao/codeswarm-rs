@@ -46,6 +46,7 @@ const STATUS_BG: Color = Color::Reset;
 const PANEL_BG: Color = Color::Reset;
 const PRIMARY_TEXT: Color = Color::Reset;
 const CODE_BG: Color = Color::Rgb(38, 40, 46);
+const CODE_TEXT: Color = Color::Rgb(235, 237, 242);
 // Thoughts intentionally use lower contrast than ordinary text (see AGENTS.md).
 const THOUGHT_TEXT: Color = Color::Rgb(128, 128, 133);
 const SECONDARY_TEXT: Color = Color::Rgb(142, 142, 147);
@@ -107,6 +108,7 @@ pub enum PermissionAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalCommand {
     Loop(String),
+    Queue(String),
     Goal(codeswarm_adapters::goal::GoalCommand),
     Handled,
     Exit,
@@ -133,6 +135,11 @@ pub const LOCAL_COMMANDS: &[CommandSpec] = &[
         name: "/loop",
         description: "Repeat a request after completion or every N minutes",
         usage: "/loop [Nm] REQUEST [| REQUEST...] | /loop stop",
+    },
+    CommandSpec {
+        name: "/queue",
+        description: "Queue a message without interrupting active work",
+        usage: "/queue MESSAGE",
     },
     CommandSpec {
         name: "/goal",
@@ -751,6 +758,18 @@ impl PromptEditor {
         }
     }
 
+    /// Insert a bracketed paste atomically. Newlines remain part of the draft
+    /// and can never be interpreted as a series of Enter submissions.
+    pub fn insert_paste(&mut self, text: &str) -> bool {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let changed = self.textarea.insert_str(text);
+        if changed {
+            self.history_position = None;
+            self.reset_completion();
+        }
+        changed
+    }
+
     /// Render the editor as a Ratatui widget. Only the editor viewport is
     /// measured; transcript history is not touched.
     pub fn render(&self, frame: &mut Frame, area: Rect) {
@@ -1071,6 +1090,7 @@ pub struct App {
     cancelling_agents: BTreeSet<usize>,
     failed_agent: Option<usize>,
     queued_prompts: VecDeque<QueuedPrompt>,
+    steering_prompts: VecDeque<QueuedPrompt>,
     next_queue_id: u64,
     selected_queue: Option<usize>,
     keyboard_help: bool,
@@ -1195,6 +1215,7 @@ impl Default for App {
             cancelling_agents: BTreeSet::new(),
             failed_agent: None,
             queued_prompts: VecDeque::new(),
+            steering_prompts: VecDeque::new(),
             next_queue_id: 0,
             selected_queue: None,
             keyboard_help: false,
@@ -1257,6 +1278,7 @@ impl App {
             && spec.name != "/agent"
             && spec.name != "/goal"
             && spec.name != "/loop"
+            && spec.name != "/queue"
             && !argument.is_empty()
         {
             self.status = format!("usage: {}", spec.usage);
@@ -1265,6 +1287,11 @@ impl App {
         let canonical = spec.map_or(command.as_str(), |spec| spec.name);
         let result = match canonical {
             "/loop" => LocalCommand::Loop(argument.into()),
+            "/queue" if argument.is_empty() => {
+                self.status = "usage: /queue MESSAGE".into();
+                LocalCommand::Handled
+            }
+            "/queue" => LocalCommand::Queue(argument.into()),
             "/goal" => match codeswarm_adapters::goal::GoalCommand::parse(argument) {
                 Ok(codeswarm_adapters::goal::GoalCommand::Show) => {
                     self.status = self.goal.as_ref().map_or_else(
@@ -1402,6 +1429,10 @@ impl App {
             PromptAction::Changed | PromptAction::Completion { .. } => ConfigAction::Changed,
             PromptAction::Ignored | PromptAction::Submit(_) => ConfigAction::Ignored,
         }
+    }
+
+    pub fn handle_config_model_paste(&mut self, text: &str) -> bool {
+        self.config_editing_model.is_some() && self.config_model_editor.insert_paste(text)
     }
 
     fn begin_config(&mut self) {
@@ -1578,6 +1609,10 @@ impl App {
             PromptAction::Changed | PromptAction::Completion { .. } => StoreAction::Changed,
             PromptAction::Ignored => StoreAction::Ignored,
         }
+    }
+
+    pub fn handle_store_directory_paste(&mut self, text: &str) -> bool {
+        self.store_editing_directory && self.prompt_editor.insert_paste(text)
     }
 
     pub fn store_visible(&self) -> bool {
@@ -2739,6 +2774,30 @@ impl App {
             })
     }
 
+    /// Clear stale failure indicators and return live slots to reload after a
+    /// settings save. Any reload failure arrives as fresh coordinator state.
+    pub fn begin_failed_agent_retries(&mut self) -> Vec<usize> {
+        let slots = self
+            .agent_states
+            .iter()
+            .filter_map(|(slot, state)| {
+                matches!(state.as_str(), "error" | "unavailable").then_some(*slot)
+            })
+            .collect::<Vec<_>>();
+        for slot in &slots {
+            self.agent_states.insert(*slot, "starting".into());
+            self.cancelling_agents.remove(slot);
+            self.agent_turn_started.remove(slot);
+            self.agent_last_activity.remove(slot);
+        }
+        if !slots.is_empty() {
+            self.failed_agent = None;
+            self.inactivity_warning = None;
+            self.status = format!("retrying {} failed agent(s)", slots.len());
+        }
+        slots
+    }
+
     pub fn mark_agent_reloaded(&mut self, slot: usize) {
         self.failed_agent = None;
         self.agent_turn_started.remove(&slot);
@@ -2982,6 +3041,14 @@ impl App {
         self.prompt = self.prompt_editor.text();
         self.update_path_query();
         action
+    }
+
+    pub fn handle_prompt_paste(&mut self, text: &str) -> bool {
+        self.sync_prompt_editor();
+        let changed = self.prompt_editor.insert_paste(text);
+        self.prompt = self.prompt_editor.text();
+        self.update_path_query();
+        changed
     }
 
     fn update_path_query(&mut self) {
@@ -3948,6 +4015,41 @@ impl App {
         });
         self.selected_queue = Some(self.queued_prompts.len() - 1);
         Some(id)
+    }
+
+    /// Hold steering input only until the active turn has been cancelled.
+    /// Steering is intentionally separate from the user-visible `/queue`.
+    pub fn steer_prompt(
+        &mut self,
+        prompt: impl Into<String>,
+        target: Option<usize>,
+        direct: bool,
+    ) -> Option<u64> {
+        let prompt = prompt.into();
+        if prompt.trim().is_empty() || self.steering_prompts.len() >= MAX_QUEUED_PROMPTS {
+            return None;
+        }
+        let id = self.next_queue_id;
+        self.next_queue_id = self.next_queue_id.saturating_add(1);
+        self.steering_prompts.push_back(QueuedPrompt {
+            id,
+            prompt,
+            target,
+            direct,
+        });
+        Some(id)
+    }
+
+    pub fn next_steering_prompt(&self) -> Option<&QueuedPrompt> {
+        self.steering_prompts.front()
+    }
+
+    pub fn remove_steering_prompt(&mut self, id: u64) -> Option<QueuedPrompt> {
+        let index = self
+            .steering_prompts
+            .iter()
+            .position(|prompt| prompt.id == id)?;
+        self.steering_prompts.remove(index)
     }
 
     pub fn queued_prompts(&self) -> &VecDeque<QueuedPrompt> {
@@ -5105,7 +5207,7 @@ fn render_keyboard_help(buffer: &mut Buffer, area: Rect) {
         " Help · Esc / F1 / ? close · /help toggles",
         " Mouse: drag copy · wheel scroll · PgUp/PgDn · End follow tail",
         " Input: Enter send · Shift+Enter newline · Tab complete · Alt+←/→ word",
-        " Turn: Ctrl+Enter direct · Ctrl+C cancel · Ctrl+K cancel queued",
+        " Turn: Enter steer · /queue wait · Ctrl+K cancel queue",
         " Agents: /agent SLOT /reload · Goal: /goal [objective|run|done|clear]",
         " Session: /resume /sessions /status /summary /clear /exit",
         " Tools: /settings /export · Repeat: /loop [Nm] REQUEST [| ...] /loop stop",
@@ -5890,8 +5992,6 @@ fn render_transcript(
                 };
                 let marker = if let Some(icon) = detail_icon {
                     icon
-                } else if row.code_block && row.kind == crate::transcript::BlockKind::Agent {
-                    "│ "
                 } else if matches!(
                     row.kind,
                     crate::transcript::BlockKind::Thought | crate::transcript::BlockKind::Tool
@@ -6130,22 +6230,14 @@ fn markdown_content_spans(
     in_code: &mut bool,
 ) -> Vec<Span<'static>> {
     if text.trim_start().starts_with("```") || text.trim_start().starts_with("~~~") {
-        let opening = !*in_code;
         *in_code = !*in_code;
-        return vec![Span::styled(
-            if opening {
-                format!(
-                    "╭─ {}",
-                    text.trim_start().trim_start_matches(['`', '~']).trim()
-                )
-            } else {
-                "╰─".into()
-            },
-            Style::default().fg(Color::Gray),
-        )];
+        return Vec::new();
     }
     if *in_code {
-        return vec![Span::styled(text.to_owned(), block_style(kind).bg(CODE_BG))];
+        return vec![Span::styled(
+            text.to_owned(),
+            block_style(kind).fg(CODE_TEXT).bg(CODE_BG),
+        )];
     }
     let trimmed = text.trim_start();
     let hashes = trimmed.chars().take_while(|c| *c == '#').count();
@@ -6217,7 +6309,7 @@ fn markdown_content_spans(
         style = match delimiter {
             "**" => style.add_modifier(Modifier::BOLD),
             "*" => style.add_modifier(Modifier::ITALIC),
-            _ => style.bg(CODE_BG).add_modifier(Modifier::BOLD),
+            _ => style.fg(CODE_TEXT).bg(CODE_BG).add_modifier(Modifier::BOLD),
         };
         spans.push(Span::styled(
             remaining[content_start..end].to_owned(),
@@ -6694,6 +6786,19 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_paste_stays_one_multiline_draft_until_enter() {
+        let mut app = App::default();
+        assert!(app.handle_prompt_paste("first line\r\nsecond line\nthird line"));
+        assert_eq!(app.prompt, "first line\nsecond line\nthird line");
+        assert_eq!(app.queued_count(), 0);
+        assert_eq!(
+            app.handle_prompt_input(key(Key::Enter)),
+            PromptAction::Submit("first line\nsecond line\nthird line".into())
+        );
+        assert!(app.prompt.is_empty());
+    }
+
+    #[test]
     fn app_prompt_tab_completion_updates_compatibility_text() {
         let mut app = App::default();
         app.set_prompt_completions(["/help", "/history"]);
@@ -6951,6 +7056,9 @@ mod tests {
         assert!(!text.contains("## Overview"));
         assert!(text.contains("• A list"));
         assert!(text.contains("    let x = \"**literal**\";"), "{text}");
+        for decoration in ["╭─", "│ const", "│     let", "╰─"] {
+            assert!(!text.contains(decoration), "{text}");
+        }
         let rows = app.transcript.viewport(58, 0, 100, 0);
         let code_row = rows.iter().position(|r| r.text.contains("let x")).unwrap();
         assert!(rows[code_row].code_block);
@@ -6984,14 +7092,13 @@ mod tests {
             spans.iter().any(|span| span.content == "bold"
                 && span.style.add_modifier(Modifier::BOLD) == span.style)
         );
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.content == "code" && span.style.fg == Some(Color::Reset))
-        );
+        assert!(spans.iter().any(|span| span.content == "code"
+            && span.style.fg == Some(super::CODE_TEXT)
+            && span.style.bg == Some(super::CODE_BG)));
         let _ = markdown_spans(BlockKind::Agent, "```rust", &mut in_code);
         let code = markdown_spans(BlockKind::Agent, "let answer = 42;", &mut in_code);
-        assert_eq!(code[0].style.fg, Some(Color::Reset));
+        assert_eq!(code[0].style.fg, Some(super::CODE_TEXT));
+        assert_eq!(code[0].style.bg, Some(super::CODE_BG));
         let mut in_code = false;
         let list = markdown_spans(BlockKind::Agent, "- item", &mut in_code);
         assert_eq!(list[0].content, "• ");
@@ -8244,6 +8351,25 @@ mod tests {
             super::LOCAL_COMMANDS
                 .iter()
                 .any(|spec| spec.name == "/loop")
+        );
+    }
+
+    #[test]
+    fn queue_command_requires_a_message_and_preserves_it_verbatim() {
+        let mut app = App::default();
+        assert_eq!(
+            app.handle_local_command("/queue review this after the round"),
+            Some(LocalCommand::Queue("review this after the round".into()))
+        );
+        assert_eq!(
+            app.handle_local_command("/queue"),
+            Some(LocalCommand::Handled)
+        );
+        assert_eq!(app.status, "usage: /queue MESSAGE");
+        assert!(
+            super::LOCAL_COMMANDS
+                .iter()
+                .any(|spec| spec.name == "/queue")
         );
     }
 

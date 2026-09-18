@@ -50,7 +50,8 @@ impl Theme {
                 Cyan | LightCyan => Reset,
                 super::SECONDARY_TEXT => Reset,
                 super::THOUGHT_TEXT => DarkGray,
-                super::CODE_BG => Reset,
+                super::CODE_BG => Rgb(38, 40, 46),
+                super::CODE_TEXT => White,
                 _ => super::AGENT_COLORS
                     .iter()
                     .position(|candidate| *candidate == color)
@@ -65,6 +66,13 @@ impl Theme {
                     Rgb(235, 237, 240)
                 } else {
                     Rgb(30, 33, 39)
+                }
+            }
+            super::CODE_TEXT => {
+                if light {
+                    Rgb(28, 28, 30)
+                } else {
+                    Rgb(235, 237, 242)
                 }
             }
             Reset if background => {
@@ -217,6 +225,9 @@ mod tests {
                     "{theme:?} {role:?}"
                 );
             }
+            let code_bg = luminance(theme.color(super::super::CODE_BG, true));
+            let code_fg = luminance(theme.color(super::super::CODE_TEXT, false));
+            assert!((code_fg.max(code_bg) + 0.05) / (code_fg.min(code_bg) + 0.05) >= 4.5);
         }
         assert_eq!(Theme::from_setting("invalid"), Theme::Terminal);
         assert_eq!(Theme::Terminal.color(Color::Reset, true), Color::Reset);

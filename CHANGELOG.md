@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.22] - 2026-09-18
+
+### Fixed
+
+- Clear stale agent error indicators after saving Settings and reload failed
+  slots so corrected model or configuration values are retried immediately.
+- Treat bracketed multiline paste as one draft instead of interpreting pasted
+  newlines as several submitted or queued messages.
+
+### Changed
+
+- Make normal messages steer active work by cancelling the current turn and
+  dispatching to its snapshotted recipient. Add `/queue MESSAGE` for explicit
+  non-interrupting FIFO delivery.
+- Render fenced code as a clean background block without decorative box
+  characters, while preserving indentation and scrolling behavior.
+
 ## [0.10.21] - 2026-09-18
 
 ### Fixed

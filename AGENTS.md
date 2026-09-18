@@ -55,12 +55,11 @@
   Private, Pair review, Manual, and solo turns cannot request handoffs.
 - Replacement adapters also receive the retained original public task, even
   after its journal entry has been pruned. Private prompts never replace it.
-- Untagged human messages submitted while an agent is working are queued back
-  to that same agent, in FIFO order, before the relay advances. The next agent
-  receives the active agent's latest response as context. An explicit roster
-  selection overrides that target: the prompt footer names the selected agent
-  as the next recipient, so a queued message has to be delivered to it rather
-  than to whichever agent happened to be working when it was submitted.
+- Untagged human messages submitted while an agent is working steer the turn:
+  cancel the active turn and dispatch the message to that same agent as soon as
+  cancellation settles. An explicit roster selection overrides that target.
+  `/queue MESSAGE` is the only way to defer a message until work finishes; it
+  preserves FIFO order without interrupting the active turn.
 - Pending prompts appear only in the queue; append them to the transcript and
   archive when dispatched. Cancelling a queued prompt must leave no chat message.
 - Snapshot the footer arrow recipient on submission and retain that exact

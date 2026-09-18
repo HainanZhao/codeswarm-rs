@@ -33,8 +33,9 @@ use codeswarm_adapters::{AgentEvent, BufferedEventLog, EventLog};
 use crossterm::{
     cursor::Show,
     event::{
-        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{
@@ -278,6 +279,17 @@ fn request_agent_reload(
     }
 }
 
+fn retry_failed_agents_after_settings(
+    app: &mut App,
+    controls: &tokio::sync::mpsc::UnboundedSender<AdapterControl>,
+) -> usize {
+    let slots = app.begin_failed_agent_retries();
+    for slot in &slots {
+        let _ = controls.send(AdapterControl::Reload(*slot));
+    }
+    slots.len()
+}
+
 #[derive(Debug)]
 struct ConfigInputDecoder {
     escape_at: Option<Instant>,
@@ -382,6 +394,10 @@ impl TerminalSession {
             let _ = session.restore();
             return Err(error);
         }
+        if let Err(error) = execute!(output, EnableBracketedPaste) {
+            let _ = session.restore();
+            return Err(error);
+        }
         if session.capture_enabled
             && let Err(error) = execute!(output, EnableFocusChange)
         {
@@ -413,11 +429,13 @@ impl TerminalSession {
             Ok(())
         };
         let mouse_result = execute!(output, DisableMouseCapture);
+        let paste_result = execute!(output, DisableBracketedPaste);
         let screen_result = execute!(output, LeaveAlternateScreen);
         let raw_result = disable_raw_mode();
         let result = terminal_result
             .and(capture_result)
             .and(mouse_result)
+            .and(paste_result)
             .and(screen_result)
             .and(raw_result);
         // A failed write may be transient. Keep the guard armed so Drop gets
@@ -564,6 +582,44 @@ fn dispatch_next_queued_prompt(
     app.remove_queued_prompt(queued.id);
     record_dispatched_prompt(app, journal, &queued.prompt, queued.direct);
     app.status = "queued prompt dispatched".into();
+    true
+}
+
+fn dispatch_next_pending_prompt(
+    app: &mut App,
+    controls: Option<&tokio::sync::mpsc::UnboundedSender<AdapterControl>>,
+    journal: &mut Option<product::ConversationJournal>,
+) -> bool {
+    if let Some(steering) = app.next_steering_prompt().cloned() {
+        if !dispatch_queued_prompt(controls, &steering) {
+            return false;
+        }
+        app.remove_steering_prompt(steering.id);
+        record_dispatched_prompt(app, journal, &steering.prompt, steering.direct);
+        app.status = "steering dispatched".into();
+        return true;
+    }
+    dispatch_next_queued_prompt(app, controls, journal)
+}
+
+fn request_turn_steering(
+    app: &mut App,
+    controls: &tokio::sync::mpsc::UnboundedSender<AdapterControl>,
+    prompt: String,
+    target: Option<usize>,
+    direct: bool,
+) -> bool {
+    let Some(id) = app.steer_prompt(prompt, target, direct) else {
+        return false;
+    };
+    if !app.cancellation_pending() && controls.send(AdapterControl::Cancel).is_err() {
+        app.remove_steering_prompt(id);
+        return false;
+    }
+    if !app.cancellation_pending() {
+        app.request_turn_cancellation();
+    }
+    app.status = "steering active agent".into();
     true
 }
 
@@ -2549,7 +2605,7 @@ fn stop_worker(
     if terminal_capture_enabled() {
         let _ = execute!(output, DisableFocusChange);
     }
-    let _ = execute!(output, DisableMouseCapture);
+    let _ = execute!(output, DisableMouseCapture, DisableBracketedPaste);
     let _ = worker.join();
 }
 
@@ -2631,7 +2687,7 @@ fn finish_pending_cancellation(
     if cancelled {
         app.finish_turn_cancellation();
     }
-    let dispatched = cancelled && dispatch_next_queued_prompt(app, controls, journal);
+    let dispatched = cancelled && dispatch_next_pending_prompt(app, controls, journal);
     (cancelled, dispatched)
 }
 
@@ -4261,7 +4317,7 @@ fn run_terminal(
                             notify_turn_complete(&app.active_agent);
                         }
                         if matches!(&event, AgentEvent::TurnComplete { .. })
-                            && dispatch_next_queued_prompt(app, controls.as_ref(), &mut journal)
+                            && dispatch_next_pending_prompt(app, controls.as_ref(), &mut journal)
                         {
                             turn_active = true;
                         }
@@ -4461,6 +4517,21 @@ fn run_terminal(
                 }
                 continue;
             }
+            Event::Paste(text) => {
+                if app.config_editing_model() {
+                    app.handle_config_model_paste(&text);
+                } else if app.config_visible() {
+                    app.status = "select a model field before pasting".into();
+                } else if app.store_editing_directory() {
+                    app.handle_store_directory_paste(&text);
+                } else if app.store_visible() || app.product_panel_visible() {
+                    app.status = "close the open panel before pasting a message".into();
+                } else {
+                    app.handle_prompt_paste(&text);
+                    app.status = "pasted into draft; press Enter to send".into();
+                }
+                continue;
+            }
             Event::Key(key) => {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -4618,6 +4689,7 @@ fn run_terminal(
                             for (slot, model) in app.take_config_model_changes() {
                                 let _ = controls.send(AdapterControl::SetModel { slot, model });
                             }
+                            retry_failed_agents_after_settings(app, controls);
                         }
                     }
                     continue;
@@ -4818,12 +4890,11 @@ fn run_terminal(
                             let prompt = app.prompt.clone();
                             let slot = app.next_agent_slot().expect("guarded recipient");
                             if turn_active {
-                                if app.queue_prompt(prompt, Some(slot), true).is_some() {
+                                if request_turn_steering(app, controls, prompt, Some(slot), true) {
                                     let _ = app.take_prompt();
                                     consume_one_shot_route(app, &mut selected_slot);
-                                    app.status = "direct prompt queued".into();
                                 } else {
-                                    app.status = "queue full or prompt empty".into();
+                                    app.status = "unable to steer; agent connection closed".into();
                                 }
                             } else if controls
                                 .send(AdapterControl::Direct {
@@ -4888,6 +4959,21 @@ fn run_terminal(
                                                 }
                                             }
                                             Err(error) => app.status = error,
+                                        }
+                                    }
+                                    LocalCommand::Queue(message) => {
+                                        loop_job = None;
+                                        if !turn_active {
+                                            app.status =
+                                                "nothing active; send the message normally".into();
+                                        } else {
+                                            let target = app.next_agent_slot();
+                                            if app.queue_prompt(message, target, false).is_some() {
+                                                consume_one_shot_route(app, &mut selected_slot);
+                                                app.status = "message queued".into();
+                                            } else {
+                                                app.status = "queue full or message empty".into();
+                                            }
                                         }
                                     }
                                     LocalCommand::Goal(command) => {
@@ -5164,12 +5250,18 @@ fn run_terminal(
                                 loop_job = None;
                                 let target = app.next_agent_slot();
                                 if turn_active {
-                                    if app.queue_prompt(prompt.clone(), target, false).is_some() {
+                                    if request_turn_steering(
+                                        app,
+                                        controls,
+                                        prompt.clone(),
+                                        target,
+                                        false,
+                                    ) {
                                         consume_one_shot_route(app, &mut selected_slot);
-                                        app.status = "prompt queued".into();
                                     } else {
                                         app.prompt = prompt;
-                                        app.status = "queue full or prompt empty".into();
+                                        app.status =
+                                            "unable to steer; agent connection closed".into();
                                     }
                                 } else {
                                     let Some(slot) = target else {
@@ -6373,6 +6465,38 @@ done
         assert!(matches!(receiver.try_recv(), Ok(AdapterControl::Reload(0))));
         assert!(receiver.try_recv().is_err());
         assert!(app.cancellation_pending());
+    }
+
+    #[test]
+    fn saving_settings_clears_error_markers_and_reloads_every_failed_agent() {
+        let mut app = App::default();
+        for (slot, name) in [(0, "Antigravity"), (1, "Claude"), (2, "Codex")] {
+            app.set_agent_name(slot, name);
+        }
+        app.apply_event(&AgentEvent::Failed {
+            slot: 0,
+            started: true,
+            detail: "invalid model".into(),
+        });
+        app.apply_event(&AgentEvent::Failed {
+            slot: 1,
+            started: false,
+            detail: "startup failed".into(),
+        });
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(
+            super::retry_failed_agents_after_settings(&mut app, &sender),
+            2
+        );
+        assert!(matches!(receiver.try_recv(), Ok(AdapterControl::Reload(0))));
+        assert!(matches!(receiver.try_recv(), Ok(AdapterControl::Reload(1))));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(app.failed_agent(), None);
+        assert_eq!(
+            app.active_agents_summary(),
+            "○ Antigravity · starting   ○ Claude · starting   ○ Codex · starting"
+        );
+        assert_eq!(app.status, "retrying 2 failed agent(s)");
     }
 
     #[test]
@@ -7584,6 +7708,43 @@ done
             Some(AdapterControl::Queue { slot: 1, prompt })
                 if prompt == "continue after cancellation"
         ));
+    }
+
+    #[test]
+    fn normal_active_input_steers_before_explicitly_queued_work() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Antigravity");
+        app.apply_event(&AgentEvent::TurnStarted { slot: 0 });
+        app.queue_prompt("wait for the round", Some(0), false)
+            .expect("explicit queue");
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(super::request_turn_steering(
+            &mut app,
+            &sender,
+            "change direction now".into(),
+            Some(0),
+            false,
+        ));
+        assert!(matches!(receiver.try_recv(), Ok(AdapterControl::Cancel)));
+        assert!(app.cancellation_pending());
+        assert_eq!(
+            app.queued_count(),
+            1,
+            "steering is not shown as queued work"
+        );
+        let (cancelled, dispatched) = super::finish_pending_cancellation(
+            &mut app,
+            "turn cancelled",
+            Some(&sender),
+            &mut None,
+        );
+        assert!(cancelled && dispatched);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(AdapterControl::Queue { slot: 0, prompt }) if prompt == "change direction now"
+        ));
+        assert_eq!(app.queued_count(), 1);
+        assert!(app.next_steering_prompt().is_none());
     }
 
     #[tokio::test]
