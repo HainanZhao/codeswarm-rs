@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use serde::{Deserialize, Serialize};
 
+pub mod activity;
 pub mod adapters;
 pub mod agents;
 pub mod collaboration;
@@ -52,6 +53,8 @@ pub struct AgentCapabilities {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolUpdate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Box<activity::ToolActivity>>,
     pub id: String,
     pub title: String,
     pub status: ToolStatus,
@@ -206,6 +209,11 @@ pub enum AgentEvent {
     UsageUpdated {
         slot: RosterSlot,
         usage: UsageUpdate,
+    },
+    /// Provider-reported token counts, separate from context capacity and output.
+    TokenUsageUpdated {
+        slot: RosterSlot,
+        usage: serde_json::Value,
     },
     Text {
         slot: RosterSlot,
@@ -375,6 +383,7 @@ pub fn reduce(state: &mut SessionState, event: AgentEvent) -> Vec<Effect> {
             }
             vec![Effect::Render]
         }
+        AgentEvent::TokenUsageUpdated { .. } => vec![Effect::Render],
         AgentEvent::UsageUpdated { slot, usage } => {
             if let Some(agent) = state.slots.get_mut(slot) {
                 agent.usage = Some(usage);

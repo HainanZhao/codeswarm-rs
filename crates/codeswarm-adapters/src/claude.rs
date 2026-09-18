@@ -47,6 +47,7 @@ fn model_label(model: &str) -> String {
 #[derive(Debug, Default)]
 struct ParserState {
     tools: BTreeMap<String, ToolUpdate>,
+    tool_inputs: BTreeMap<u64, (String, String)>,
     finished_tools: BTreeSet<String>,
     streamed_thoughts: BTreeMap<u64, String>,
 }
@@ -150,12 +151,23 @@ fn parse_tool_uses(slot: RosterSlot, value: &Value, state: &mut ParserState) -> 
                 .tools
                 .entry(id.to_owned())
                 .or_insert_with(|| ToolUpdate {
+                    activity: None,
                     id: id.to_owned(),
                     title: title.clone(),
                     status: ToolStatus::Running,
                     detail: None,
                 });
             update.title = title;
+            let activity = update.activity.get_or_insert_with(Default::default);
+            activity.name = block
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("Tool")
+                .into();
+            if let Some(input) = block.get("input") {
+                activity.arguments = Some(input.clone());
+                activity.capture_edit();
+            }
             Some(AgentEvent::Tool {
                 slot,
                 update: update.clone(),
@@ -176,6 +188,7 @@ fn parse_stream_event(
     let event_type = event.get("type").and_then(Value::as_str)?;
     if event_type == "message_start" {
         state.streamed_thoughts.clear();
+        state.tool_inputs.clear();
         return None;
     }
     let index = event.get("index").and_then(Value::as_u64);
@@ -183,6 +196,19 @@ fn parse_stream_event(
         "content_block_delta" => {
             let delta = event.get("delta")?;
             match delta.get("type").and_then(Value::as_str)? {
+                "input_json_delta" => {
+                    let (id, buffer) = state.tool_inputs.get_mut(&index?)?;
+                    buffer.push_str(delta.get("partial_json")?.as_str()?);
+                    let arguments = serde_json::from_str::<Value>(buffer).ok()?;
+                    let update = state.tools.get_mut(id)?;
+                    let activity = update.activity.get_or_insert_with(Default::default);
+                    activity.arguments = Some(arguments);
+                    activity.capture_edit();
+                    Some(AgentEvent::Tool {
+                        slot,
+                        update: update.clone(),
+                    })
+                }
                 "text_delta" => delta
                     .get("text")
                     .and_then(Value::as_str)
@@ -225,10 +251,20 @@ fn parse_stream_event(
                 .filter(|id| !id.is_empty())
                 .map_or_else(|| format!("claude-tool-{index}"), str::to_owned);
             let title = tool_title(block);
+            state.tool_inputs.insert(index, (id.clone(), String::new()));
             state.finished_tools.remove(&id);
             state.tools.insert(
                 id.clone(),
                 ToolUpdate {
+                    activity: Some(Box::new(crate::activity::ToolActivity {
+                        name: block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Tool")
+                            .into(),
+                        arguments: block.get("input").cloned(),
+                        ..Default::default()
+                    })),
                     id: id.clone(),
                     title: title.clone(),
                     status: ToolStatus::Running,
@@ -237,12 +273,7 @@ fn parse_stream_event(
             );
             Some(AgentEvent::Tool {
                 slot,
-                update: ToolUpdate {
-                    id,
-                    title,
-                    status: ToolStatus::Running,
-                    detail: None,
-                },
+                update: state.tools[&id].clone(),
             })
         }
         "content_block_stop" => {
@@ -325,6 +356,7 @@ fn parse_tool_results(slot: RosterSlot, value: &Value, state: &mut ParserState) 
                 .tools
                 .entry(id.to_owned())
                 .or_insert_with(|| ToolUpdate {
+                    activity: None,
                     id: id.to_owned(),
                     title: "Tool call".into(),
                     status: ToolStatus::Running,
@@ -358,6 +390,14 @@ fn parse_tool_results(slot: RosterSlot, value: &Value, state: &mut ParserState) 
                 ToolStatus::Completed
             };
             tool.detail = result.and_then(content_text);
+            let activity = tool.activity.get_or_insert_with(Default::default);
+            activity.output = result.cloned();
+            if tool.status == ToolStatus::Failed {
+                activity.error = result.cloned();
+            }
+            activity.exit_code = result
+                .and_then(|r| r.get("exit_code").or_else(|| r.get("return_code")))
+                .and_then(Value::as_i64);
             state.finished_tools.insert(id.to_owned());
             Some(AgentEvent::Tool {
                 slot,
@@ -385,7 +425,10 @@ fn parse_tool_progress(
     let update = state.tools.get_mut(id)?;
     update.status = ToolStatus::Running;
     if let Some(seconds) = value.get("elapsed_time_seconds").and_then(Value::as_u64) {
-        update.detail = Some(format!("running for {seconds}s"));
+        update
+            .activity
+            .get_or_insert_with(Default::default)
+            .elapsed_seconds = Some(seconds);
     }
     Some(AgentEvent::Tool {
         slot,
@@ -616,6 +659,14 @@ impl AgentAdapter for ClaudeAdapter {
                 }
                 if value.get("type").and_then(Value::as_str) == Some("result") {
                     result = Some(value.clone());
+                    if let Some(usage) = value.get("usage").filter(|v| v.is_object()) {
+                        let _ = sender
+                            .send(Ok(AgentEvent::TokenUsageUpdated {
+                                slot,
+                                usage: usage.clone(),
+                            }))
+                            .await;
+                    }
                 }
                 if let Some(event) = parse_stream_event(slot, &value, &mut state) {
                     streamed |= matches!(event, AgentEvent::Text { .. });
@@ -972,7 +1023,7 @@ mod tests {
             Some(AgentEvent::Tool { update, .. })
                 if update.id == "tool-3"
                     && update.status == ToolStatus::Running
-                    && update.detail.as_deref() == Some("running for 30s")
+                    && update.activity.as_ref().and_then(|a| a.elapsed_seconds) == Some(30)
         ));
         assert_eq!(state.tools.len(), 1);
     }
@@ -1222,5 +1273,50 @@ mod tests {
             .expect("reload should succeed");
         assert!(adapter.child.is_none());
         adapter.stop().await.unwrap();
+    }
+    #[test]
+    fn fragmented_read_arguments_survive_results_and_progress() {
+        let mut state = ParserState::default();
+        parse_stream_event(
+            0,
+            &json!({"type":"stream_event","event":{
+                "type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"read-1","name":"Read"}
+            }}),
+            &mut state,
+        );
+        for part in [r#"{"file_path":"src/"#, r#"auth.rs","offset":40}"#] {
+            parse_stream_event(
+                0,
+                &json!({"type":"stream_event","event":{
+                    "type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":part}
+                }}),
+                &mut state,
+            );
+        }
+        let activity = state.tools["read-1"].activity.as_ref().unwrap();
+        assert!(
+            activity
+                .summary(ToolStatus::Running, None)
+                .contains("Reading src/auth.rs · line 40")
+        );
+        parse_tool_progress(
+            0,
+            &json!({"type":"tool_progress","tool_use_id":"read-1","elapsed_time_seconds":8}),
+            &mut state,
+        );
+        let events = parse_tool_results(
+            0,
+            &json!({"type":"user","message":{"content":[{
+                "type":"tool_result","tool_use_id":"read-1","content":[{"type":"text","text":"file body"}]
+            }]}}),
+            &mut state,
+        );
+        let AgentEvent::Tool { update, .. } = &events[0] else {
+            panic!("tool")
+        };
+        let activity = update.activity.as_ref().unwrap();
+        assert!(activity.details().contains("src/auth.rs"));
+        assert!(activity.details().contains("file body"));
+        assert_eq!(activity.elapsed_seconds, Some(8));
     }
 }

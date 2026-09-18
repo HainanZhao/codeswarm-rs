@@ -4140,7 +4140,8 @@ fn run_terminal(
                             | AgentEvent::ModelsReplaced { .. }
                             | AgentEvent::ModelUpdated { .. }
                             | AgentEvent::CommandsReplaced { .. }
-                            | AgentEvent::UsageUpdated { .. } => {}
+                            | AgentEvent::UsageUpdated { .. }
+                            | AgentEvent::TokenUsageUpdated { .. } => {}
                         }
                         if let AgentEvent::Permission { slot, request } = &event {
                             let auto = app.mode_policy() == Some("full-access");
@@ -8135,6 +8136,7 @@ done
         let tool = AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
+                activity: None,
                 id: "read".into(),
                 title: "Read file".into(),
                 status: codeswarm_adapters::ToolStatus::Running,

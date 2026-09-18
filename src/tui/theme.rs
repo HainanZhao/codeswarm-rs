@@ -50,6 +50,7 @@ impl Theme {
                 Cyan | LightCyan => Reset,
                 super::SECONDARY_TEXT => Reset,
                 super::THOUGHT_TEXT => DarkGray,
+                super::CODE_BG => Reset,
                 _ => super::AGENT_COLORS
                     .iter()
                     .position(|candidate| *candidate == color)
@@ -59,6 +60,13 @@ impl Theme {
         }
         let light = self == Self::Light;
         match color {
+            super::CODE_BG => {
+                if light {
+                    Rgb(235, 237, 240)
+                } else {
+                    Rgb(30, 33, 39)
+                }
+            }
             Reset if background => {
                 if light {
                     Rgb(250, 250, 250)

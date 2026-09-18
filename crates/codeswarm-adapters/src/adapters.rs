@@ -492,6 +492,9 @@ fn map_event_slot(event: AgentEvent, slot: RosterSlot) -> AgentEvent {
             AgentEvent::CommandsReplaced { slot, commands }
         }
         AgentEvent::UsageUpdated { usage, .. } => AgentEvent::UsageUpdated { slot, usage },
+        AgentEvent::TokenUsageUpdated { usage, .. } => {
+            AgentEvent::TokenUsageUpdated { slot, usage }
+        }
         AgentEvent::Text { text, .. } => AgentEvent::Text { slot, text },
         AgentEvent::Thought { text, .. } => AgentEvent::Thought { slot, text },
         AgentEvent::Tool { update, .. } => AgentEvent::Tool { slot, update },
@@ -2445,8 +2448,9 @@ impl AgentAdapter for AgyAdapter {
             let mut lines = BufReader::new(stdout).lines();
             let mut result: Option<Value> = None;
             let mut streamed_response = false;
+            let mut tool_steps = BTreeMap::new();
             while let Ok(Some(line)) = lines.next_line().await {
-                let value = match serde_json::from_str::<Value>(&line) {
+                let mut value = match serde_json::from_str::<Value>(&line) {
                     Ok(value) => value,
                     Err(_) => {
                         // Native stream-json can contain diagnostic junk on
@@ -2456,6 +2460,7 @@ impl AgentAdapter for AgyAdapter {
                         continue;
                     }
                 };
+                retain_agy_tool_fields(&mut value, &mut tool_steps);
                 if value.get("event").and_then(Value::as_str) == Some("init")
                     && let Some(session_id) = value
                         .get("conversation_id")
@@ -2469,8 +2474,8 @@ impl AgentAdapter for AgyAdapter {
                 if value.get("event").and_then(Value::as_str) == Some("result") {
                     result = value.get("result").cloned();
                 }
-                if let Some(thought) = parse_agy_thought(slot, &value)
-                    && sender.send(Ok(thought)).await.is_err()
+                if let Some(usage) = parse_agy_usage(slot, &value)
+                    && sender.send(Ok(usage)).await.is_err()
                 {
                     break;
                 }
@@ -2603,7 +2608,9 @@ impl AgentAdapter for AgyAdapter {
                 "model must be a non-empty, single-line name".into(),
             ));
         }
-        self.model = Some(model.to_owned());
+        // "default" is CodeSwarm's reset choice, not an Antigravity model ID.
+        // Omitting --model lets the native CLI resolve its configured default.
+        self.model = (!model.eq_ignore_ascii_case("default")).then(|| model.to_owned());
         Ok(())
     }
 
@@ -2687,24 +2694,44 @@ fn parse_agy_value(slot: RosterSlot, value: &Value) -> AdapterResult<Option<Agen
     }
 }
 
-fn parse_agy_thought(slot: RosterSlot, value: &Value) -> Option<AgentEvent> {
-    let update = value.get("step_update")?;
-    if !matches!(
-        update.get("step_type").and_then(Value::as_str),
-        Some("agent_response" | "checkpoint")
-    ) || update.get("state").and_then(Value::as_str) != Some("DONE")
-    {
-        return None;
-    }
-    let tokens = update
-        .get("usage")?
-        .get("thinking_tokens")?
-        .as_u64()
-        .filter(|tokens| *tokens > 0)?;
-    Some(AgentEvent::Thought {
+fn parse_agy_usage(slot: RosterSlot, value: &Value) -> Option<AgentEvent> {
+    let usage = value.get("result")?.get("usage")?;
+    usage.is_object().then(|| AgentEvent::TokenUsageUpdated {
         slot,
-        text: format!("Antigravity reasoning · {tokens} thinking tokens"),
+        usage: usage.clone(),
     })
+}
+
+fn retain_agy_tool_fields(value: &mut Value, steps: &mut BTreeMap<i64, Value>) {
+    let Some(update) = value.get_mut("step_update") else {
+        return;
+    };
+    let Some(index) = update.get("step_index").and_then(Value::as_i64) else {
+        return;
+    };
+    if update.get("step_type").and_then(Value::as_str) != Some("tool")
+        && !steps.contains_key(&index)
+    {
+        return;
+    }
+    let previous = steps.entry(index).or_insert_with(|| serde_json::json!({}));
+    if let (Some(previous), Some(patch)) = (previous.as_object_mut(), update.as_object()) {
+        for (key, incoming) in patch {
+            if key == "tool_info"
+                && let (Some(old), Some(new)) = (
+                    previous.get_mut(key).and_then(Value::as_object_mut),
+                    incoming.as_object(),
+                )
+            {
+                for (field, incoming) in new {
+                    old.insert(field.clone(), incoming.clone());
+                }
+                continue;
+            }
+            previous.insert(key.clone(), incoming.clone());
+        }
+    }
+    *update = previous.clone();
 }
 
 fn parse_agy_tool(slot: RosterSlot, value: &Value) -> Option<AgentEvent> {
@@ -2773,9 +2800,23 @@ fn parse_agy_tool(slot: RosterSlot, value: &Value) -> Option<AgentEvent> {
         ));
     }
     let detail = (!sections.is_empty()).then(|| sections.join("\n\n"));
+    let mut activity = crate::activity::ToolActivity {
+        name: tool_name.into(),
+        arguments: parameters.cloned(),
+        output: tool_info.and_then(|info| info.get("output")).cloned(),
+        error: error.filter(|e| !e.is_null()).cloned(),
+        subagents: update.get("subagent_info").cloned(),
+        elapsed_seconds: update
+            .get("duration_seconds")
+            .and_then(Value::as_f64)
+            .map(|s| s.max(0.0) as u64),
+        ..Default::default()
+    };
+    activity.capture_edit();
     Some(AgentEvent::Tool {
         slot,
         update: ToolUpdate {
+            activity: Some(Box::new(activity)),
             id: format!("agy-tool-{step_index}"),
             title,
             status,
@@ -4141,6 +4182,7 @@ fn normalize_acp_tool(
         tools.remove(id);
     }
     let tool = tools.entry(id.to_owned()).or_insert_with(|| ToolUpdate {
+        activity: None,
         id: id.to_owned(),
         title: "Tool call".into(),
         status: ToolStatus::Pending,
@@ -4148,6 +4190,58 @@ fn normalize_acp_tool(
     });
     if let Some(title) = value.get("title").and_then(Value::as_str) {
         tool.title = title.to_owned();
+    }
+    let activity = tool.activity.get_or_insert_with(Default::default);
+    activity.target = Some(tool.title.clone());
+    if let Some(kind) = value.get("kind").and_then(Value::as_str) {
+        activity.name = kind.into();
+    } else if activity.name.is_empty() {
+        activity.name = tool.title.clone();
+    }
+    if let Some(input) = value.get("rawInput") {
+        activity.arguments = Some(input.clone());
+    }
+    if let Some(locations) = value.get("locations").and_then(Value::as_array) {
+        activity.locations = locations
+            .iter()
+            .filter_map(|location| {
+                let path = location.get("path")?.as_str()?;
+                Some(match location.get("line").and_then(Value::as_u64) {
+                    Some(line) => format!("{path}:{line}"),
+                    None => path.into(),
+                })
+            })
+            .collect();
+    }
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        activity.diffs = content
+            .iter()
+            .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("diff"))
+            .map(|entry| crate::activity::FileDiff {
+                path: entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown file")
+                    .into(),
+                before: entry
+                    .get("oldText")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                after: entry
+                    .get("newText")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+            .collect();
+        activity.output = Some(Value::Array(
+            content
+                .iter()
+                .filter(|entry| entry.get("type").and_then(Value::as_str) != Some("diff"))
+                .cloned()
+                .collect(),
+        ));
+    } else if let Some(output) = value.get("rawOutput") {
+        activity.output = Some(output.clone());
     }
     if let Some(status) =
         value
@@ -4371,7 +4465,7 @@ fn rpc_id_to_string(value: &Value) -> String {
 mod tests {
     use super::{
         AcpAdapter, AdapterHost, AgentAdapter, AgyAdapter, MAX_ACP_LINE_BYTES, MAX_FILE_READ_BYTES,
-        RelayHost, ScriptedAdapter, parse_acp_notification, parse_agy_line, parse_agy_thought,
+        RelayHost, ScriptedAdapter, parse_acp_notification, parse_agy_line, parse_agy_usage,
         parse_agy_value, parse_command_line, parse_model_config, prompt_content_blocks,
         read_bounded_line,
     };
@@ -5490,6 +5584,65 @@ mod tests {
     }
 
     #[test]
+    fn structured_acp_details_survive_status_only_patches_and_explicit_replacement() {
+        let mut tools = std::collections::BTreeMap::new();
+        let first = json!({
+            "sessionUpdate":"tool_call", "toolCallId":"edit", "kind":"edit", "title":"Edit file",
+            "rawInput":{"path":"src/auth.rs"},
+            "locations":[{"path":"src/auth.rs","line":4}],
+            "content":[{"type":"diff","path":"src/auth.rs","oldText":"old","newText":"new"}]
+        });
+        super::normalize_acp_tool(&first, &mut tools).unwrap();
+        let updated = super::normalize_acp_tool(
+            &json!({
+                "sessionUpdate":"tool_call_update","toolCallId":"edit","status":"completed"
+            }),
+            &mut tools,
+        )
+        .unwrap();
+        let activity = updated.activity.unwrap();
+        assert!(
+            activity
+                .summary(updated.status, None)
+                .contains("src/auth.rs")
+        );
+        assert!(activity.details().contains("-old\n+new"));
+        let replaced = super::normalize_acp_tool(
+            &json!({
+                "sessionUpdate":"tool_call_update","toolCallId":"edit","content":[],"locations":[]
+            }),
+            &mut tools,
+        )
+        .unwrap()
+        .activity
+        .unwrap();
+        assert!(replaced.diffs.is_empty());
+        assert!(replaced.locations.is_empty());
+    }
+
+    #[test]
+    fn antigravity_status_patch_keeps_the_file_arguments_and_output() {
+        let mut steps = std::collections::BTreeMap::new();
+        let mut first = json!({"step_update":{
+            "step_type":"tool","step_index":1,"tool_name":"view_file",
+            "tool_info":{"parameters":{"AbsolutePath":"src/auth.rs"},"output":"file body"}
+        }});
+        super::retain_agy_tool_fields(&mut first, &mut steps);
+        let mut end = json!({"event":"step_update","step_update":{"step_index":1,"state":"DONE"}});
+        super::retain_agy_tool_fields(&mut end, &mut steps);
+        let AgentEvent::Tool { update, .. } = parse_agy_value(0, &end).unwrap().unwrap() else {
+            panic!("tool")
+        };
+        let activity = update.activity.unwrap();
+        assert!(
+            activity
+                .summary(update.status, None)
+                .contains("Reading src/auth.rs · done")
+        );
+        assert!(activity.details().contains("file body"));
+    }
+
+    #[test]
     fn native_view_file_preserves_stream_without_substituting_local_contents() {
         let root = unique_test_path("codeswarm-agy-view", "dir");
         std::fs::create_dir_all(root.join("src")).expect("workspace");
@@ -5546,22 +5699,19 @@ mod tests {
                     && update.title.contains("false")
                     && update.detail.as_deref().is_some_and(|detail| detail.contains("status 1"))
         ));
-        let thought = parse_agy_thought(
+        let usage = parse_agy_usage(
             1,
             &json!({
                 "event": "step_update",
-                "step_update": {
-                    "step_type": "agent_response",
-                    "state": "DONE",
-                    "text_delta": "answer",
+                "result": {
                     "usage": {"thinking_tokens": 42}
                 }
             }),
         )
         .expect("reasoning event");
         assert!(matches!(
-            thought,
-            AgentEvent::Thought { text, .. } if text.contains("42 thinking tokens")
+            usage,
+            AgentEvent::TokenUsageUpdated { usage, .. } if usage["thinking_tokens"] == 42
         ));
     }
 
@@ -5710,6 +5860,20 @@ mod tests {
         ) {}
         let args = std::fs::read_to_string(&args_path).expect("args");
         assert!(args.contains("--model gemini-custom"), "{args}");
+        for model in ["default", " DEFAULT ", "gemini-other"] {
+            adapter.set_model(model.into()).await.expect("change model");
+            adapter.send_prompt("test".into()).await.expect("follow-up");
+            while !matches!(
+                adapter.next_event().await,
+                Some(Ok(AgentEvent::TurnComplete { .. }))
+            ) {}
+            let args = std::fs::read_to_string(&args_path).expect("args");
+            if model.trim().eq_ignore_ascii_case("default") {
+                assert!(!args.contains("--model"), "{args}");
+            } else {
+                assert!(args.contains("--model gemini-other"), "{args}");
+            }
+        }
         adapter.stop().await.expect("stop");
         std::fs::remove_file(script_path).expect("cleanup script");
         std::fs::remove_file(args_path).expect("cleanup args");
@@ -7449,6 +7613,7 @@ done
         let tool = AgentEvent::Tool {
             slot: 0,
             update: crate::ToolUpdate {
+                activity: None,
                 id: "read".into(),
                 title: "Read file".into(),
                 status: ToolStatus::Running,
@@ -7542,6 +7707,7 @@ done
         let tool = || AgentEvent::Tool {
             slot: 0,
             update: crate::ToolUpdate {
+                activity: None,
                 id: "read".into(),
                 title: "Read file".into(),
                 status: ToolStatus::Running,
@@ -7654,6 +7820,7 @@ done
         let tool = || AgentEvent::Tool {
             slot: 1,
             update: crate::ToolUpdate {
+                activity: None,
                 id: "read".into(),
                 title: "Read file".into(),
                 status: ToolStatus::Running,

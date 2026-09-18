@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.21] - 2026-09-18
+
+### Fixed
+
+- Treat Antigravity model `default` as clearing the override; omit `--model`
+  on the next prompt instead of forwarding an invalid literal model name.
+
+### Changed
+
+- Show consistent tool activity across Claude, Codex, Antigravity, and ACP:
+  action, file/command/query, status, exit code, and elapsed time. Expand the
+  tool icon to inspect provider-supplied arguments, output, errors, file
+  locations, edit diffs, and subagent metadata.
+- Preserve every tool call in the turn history and update existing calls in
+  place. Keep the active tool visible during quiet periods with a live timer.
+- Preserve Claude's streamed JSON arguments and Antigravity's partial tool
+  updates; retain ACP old/new text and Codex file-change records.
+- Give answers clearer headings, inline code, fenced-code surfaces, and hanging
+  list indentation. Preserve code whitespace and formatting while scrolling.
+- Keep reported token usage in session diagnostics, separate from reasoning
+  text and context-window capacity.
+
 ## [0.10.20] - 2026-09-18
 
 ### Changed

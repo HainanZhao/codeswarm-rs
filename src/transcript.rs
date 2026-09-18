@@ -17,6 +17,7 @@ pub struct TranscriptBlock {
     pub kind: BlockKind,
     pub source: String,
     pub collapsed: bool,
+    pub preview: Option<String>,
 }
 
 /// The renderer's stable, presentation-neutral vocabulary.
@@ -39,6 +40,9 @@ pub struct RenderRow {
     pub kind: BlockKind,
     pub first_in_block: bool,
     pub text: String,
+    /// Code context survives viewport scrolling past the opening fence.
+    pub code_block: bool,
+    pub diff_line: bool,
 }
 
 /// Maps blocks to the terminal rows produced at a particular width.
@@ -83,6 +87,7 @@ impl Transcript {
             kind,
             source: source.into(),
             collapsed,
+            preview: None,
         });
         self.invalidate_from(self.blocks.len() - 1);
         id
@@ -113,6 +118,17 @@ impl Transcript {
 
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
+    }
+
+    pub fn set_preview(&mut self, id: u64, preview: Option<String>) {
+        if let Some(index) = self.blocks.iter().position(|block| block.id == id)
+            && self.blocks[index].preview != preview
+        {
+            self.blocks[index].preview = preview;
+            if self.blocks[index].collapsed {
+                self.invalidate_from(index);
+            }
+        }
     }
 
     /// Export the retained logical conversation without forcing the terminal
@@ -335,6 +351,8 @@ impl Transcript {
                     kind: BlockKind::Human,
                     first_in_block: false,
                     text: String::new(),
+                    code_block: false,
+                    diff_line: false,
                 });
             }
             // Terminal lifecycle stays available for export without adding
@@ -369,6 +387,8 @@ impl Transcript {
                             kind: BlockKind::Agent,
                             first_in_block: false,
                             text: String::new(),
+                            code_block: false,
+                            diff_line: false,
                         });
                     }
                     self.rows.push(RenderRow {
@@ -376,6 +396,8 @@ impl Transcript {
                         kind: BlockKind::Agent,
                         first_in_block: true,
                         text: truncate_chars(&format!("{speaker}: [{timestamp}]"), width),
+                        code_block: false,
+                        diff_line: false,
                     });
                 }
                 let lines = if block.kind == BlockKind::Thought && block.collapsed {
@@ -383,12 +405,21 @@ impl Transcript {
                 } else {
                     wrap(body, width)
                 };
+                let mut code_block = false;
+                let mut diff = false;
                 for line in lines {
+                    let in_code = code_block;
+                    let diff_line = diff_context(&line, &mut diff);
+                    if is_fence(&line) {
+                        code_block = !code_block;
+                    }
                     self.rows.push(RenderRow {
                         block_id: block.id,
                         kind: block.kind,
                         first_in_block: false,
                         text: line,
+                        code_block: in_code,
+                        diff_line,
                     });
                 }
                 header_speaker = Some(speaker.to_owned());
@@ -412,17 +443,28 @@ impl Transcript {
                         kind: block.kind,
                         first_in_block: line_index == 0,
                         text: line,
+                        code_block: false,
+                        diff_line: false,
                     });
                 }
                 continue;
             }
             let lines = wrap(&block.source, width);
+            let mut code_block = false;
+            let mut diff = false;
             for (line_index, line) in lines.into_iter().enumerate() {
+                let in_code = code_block;
+                let diff_line = diff_context(&line, &mut diff);
+                if is_fence(&line) {
+                    code_block = !code_block;
+                }
                 self.rows.push(RenderRow {
                     block_id: block.id,
                     kind: block.kind,
                     first_in_block: line_index == 0,
                     text: line,
+                    code_block: in_code,
+                    diff_line,
                 });
             }
         }
@@ -490,7 +532,22 @@ fn collapsed_activity_preview(
     let attribution = attributed_message(&block.source);
     let source = attribution.map_or_else(|| presentation_source(block), |(_, _, content)| content);
     if label == "Tool" {
-        let preview = rolling_tool_preview(source, width);
+        let preview = block
+            .preview
+            .as_deref()
+            .map(|preview| {
+                if preview.width() <= width || width < 24 {
+                    return truncate_chars(preview, width);
+                }
+                // Preserve both the action and outcome/timer in narrow panes.
+                let head = width / 2;
+                format!(
+                    "{}{}",
+                    truncate_chars(preview, head),
+                    truncate_start_chars(preview, width - head)
+                )
+            })
+            .unwrap_or_else(|| rolling_tool_preview(source, width));
         return attribution.map_or(preview.clone(), |(speaker, timestamp, _)| {
             format!("{speaker}: [{timestamp}] {preview}")
         });
@@ -625,7 +682,94 @@ fn label(kind: BlockKind) -> &'static str {
     }
 }
 
+fn is_fence(line: &str) -> bool {
+    line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~")
+}
+
+fn diff_context(line: &str, active: &mut bool) -> bool {
+    let text = line.trim_start();
+    if text.starts_with("--- ") || text.starts_with("```diff") {
+        *active = true;
+    } else if text.is_empty()
+        || is_fence(line)
+        || (!text.starts_with(['+', '-', '@'])
+            && !line.strip_prefix("  ").unwrap_or(line).starts_with(' '))
+    {
+        *active = false;
+    }
+    *active && (text.starts_with(['+', '-']) || text.starts_with("@@"))
+}
+
 fn wrap(source: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut code = false;
+    let mut rows = Vec::new();
+    for line in source.lines() {
+        if line.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
+        if is_fence(line) {
+            code = !code;
+            rows.push(truncate_chars(line, width));
+        } else if code {
+            let line = line.replace('\t', "    ");
+            let mut row = String::new();
+            let mut columns = 0;
+            for grapheme in line.graphemes(true) {
+                let grapheme = if grapheme.width() > width {
+                    "�"
+                } else {
+                    grapheme
+                };
+                if columns + grapheme.width() > width {
+                    rows.push(std::mem::take(&mut row));
+                    columns = 0;
+                }
+                row.push_str(grapheme);
+                columns += grapheme.width();
+            }
+            rows.push(row);
+        } else {
+            let indent = line.len() - line.trim_start().len();
+            let leading = &line[..indent];
+            let content = line.trim_start();
+            let hashes = content.chars().take_while(|c| *c == '#').count();
+            let heading =
+                (1..=6).contains(&hashes) && content.as_bytes().get(hashes) == Some(&b' ');
+            if heading && rows.last().is_some_and(|row| !row.is_empty()) {
+                rows.push(String::new());
+            }
+            let marker_width = if content.starts_with("- ")
+                || content.starts_with("* ")
+                || content.starts_with("> ")
+            {
+                2
+            } else {
+                content
+                    .split_once(". ")
+                    .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+                    .map_or(0, |(n, _)| n.len() + 2)
+            };
+            let hanging = (leading.width() + marker_width).min(width.saturating_sub(1));
+            let wrapped = wrap_plain(content, width.saturating_sub(hanging).max(1));
+            for (index, row) in wrapped.into_iter().enumerate() {
+                let spaces = if index == 0 {
+                    leading.width().min(hanging)
+                } else {
+                    hanging
+                };
+                rows.push(format!("{}{row}", " ".repeat(spaces)));
+            }
+            if heading {
+                rows.push(String::new());
+            }
+        }
+    }
+    rows
+}
+
+fn wrap_plain(source: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut rows = Vec::new();
     for original_line in source.lines() {

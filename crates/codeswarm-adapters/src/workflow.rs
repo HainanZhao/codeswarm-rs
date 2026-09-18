@@ -362,6 +362,7 @@ mod tests {
         AgentEvent::Tool {
             slot: 1,
             update: ToolUpdate {
+                activity: None,
                 id: id.into(),
                 title: format!("tool {id}"),
                 status,
@@ -439,6 +440,7 @@ mod tests {
         summary.observe(&AgentEvent::Tool {
             slot: 1,
             update: ToolUpdate {
+                activity: None,
                 id: "t1".into(),
                 title: "cargo test".into(),
                 status: ToolStatus::Completed,
@@ -477,6 +479,7 @@ mod tests {
             summary.observe(&AgentEvent::Tool {
                 slot,
                 update: ToolUpdate {
+                    activity: None,
                     id: "same".into(),
                     title: "Read".into(),
                     status: ToolStatus::Completed,
@@ -488,6 +491,7 @@ mod tests {
         summary.observe(&AgentEvent::Tool {
             slot: 0,
             update: ToolUpdate {
+                activity: None,
                 id: "same".into(),
                 title: "Read".into(),
                 status: ToolStatus::Completed,
@@ -522,6 +526,7 @@ mod tests {
         summary.observe(&AgentEvent::History {
             slot: 0,
             content: crate::HistoryContent::Tool(ToolUpdate {
+                activity: None,
                 id: "h1".into(),
                 title: "replayed tool".into(),
                 status: ToolStatus::Completed,
@@ -547,6 +552,7 @@ mod tests {
             AgentEvent::Tool {
                 slot: 0,
                 update: ToolUpdate {
+                    activity: None,
                     id: "a1".into(),
                     title: "edit".into(),
                     status: ToolStatus::Completed,

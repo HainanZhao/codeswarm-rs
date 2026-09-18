@@ -45,6 +45,7 @@ const TRANSCRIPT_BG: Color = Color::Reset;
 const STATUS_BG: Color = Color::Reset;
 const PANEL_BG: Color = Color::Reset;
 const PRIMARY_TEXT: Color = Color::Reset;
+const CODE_BG: Color = Color::Rgb(38, 40, 46);
 // Thoughts intentionally use lower contrast than ordinary text (see AGENTS.md).
 const THOUGHT_TEXT: Color = Color::Rgb(128, 128, 133);
 const SECONDARY_TEXT: Color = Color::Rgb(142, 142, 147);
@@ -985,6 +986,9 @@ struct ToolCall {
     title: String,
     status: ToolStatus,
     detail: Option<String>,
+    activity: Option<Box<codeswarm_adapters::activity::ToolActivity>>,
+    started: Instant,
+    elapsed: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -992,9 +996,9 @@ struct ToolWindow {
     block_id: u64,
     prefix: String,
     calls: VecDeque<ToolCall>,
+    latest: String,
+    last_tick: Option<Instant>,
 }
-
-const MAX_TOOL_HISTORY_ROWS: usize = 20;
 
 #[derive(Debug)]
 pub struct App {
@@ -1060,6 +1064,7 @@ pub struct App {
     pending_model_changes: BTreeMap<usize, String>,
     agent_commands: BTreeMap<usize, Vec<AgentCommand>>,
     agent_usage: BTreeMap<usize, UsageUpdate>,
+    agent_token_usage: BTreeMap<usize, serde_json::Value>,
     agent_turn_started: BTreeMap<usize, Instant>,
     agent_last_activity: BTreeMap<usize, Instant>,
     inactivity_warning: Option<String>,
@@ -1070,8 +1075,7 @@ pub struct App {
     selected_queue: Option<usize>,
     keyboard_help: bool,
     streaming_blocks: BTreeMap<(usize, crate::transcript::BlockKind), u64>,
-    /// One compact rolling tool window per active agent turn. Each window
-    /// keeps the latest two calls and retains full details for Ctrl+O.
+    /// One compact tool preview per turn; complete call details remain available.
     tool_windows: BTreeMap<usize, ToolWindow>,
     history_blocks: BTreeMap<usize, (crate::transcript::BlockKind, u64)>,
     history_tools: BTreeMap<(usize, String), u64>,
@@ -1108,6 +1112,7 @@ fn agent_event_slot(event: &AgentEvent) -> Option<usize> {
         | AgentEvent::UserText { slot, .. }
         | AgentEvent::CommandsReplaced { slot, .. }
         | AgentEvent::UsageUpdated { slot, .. }
+        | AgentEvent::TokenUsageUpdated { slot, .. }
         | AgentEvent::Text { slot, .. }
         | AgentEvent::Thought { slot, .. }
         | AgentEvent::Tool { slot, .. }
@@ -1183,6 +1188,7 @@ impl Default for App {
             pending_model_changes: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_usage: BTreeMap::new(),
+            agent_token_usage: BTreeMap::new(),
             agent_turn_started: BTreeMap::new(),
             agent_last_activity: BTreeMap::new(),
             inactivity_warning: None,
@@ -2218,6 +2224,9 @@ impl App {
                     .unwrap_or("starting");
                 let identity = self.agent_identity(*slot).unwrap_or("unknown provider");
                 lines.push(format!("  slot {slot}: {name} — {state} · {identity}"));
+                if let Some(usage) = self.agent_token_usage.get(slot) {
+                    lines.push(format!("    reported token usage: {usage}"));
+                }
             }
             if let Some(selected) = self.selected_agent {
                 lines.push(format!(
@@ -2553,6 +2562,7 @@ impl App {
         self.agent_models.remove(&slot);
         self.agent_commands.remove(&slot);
         self.agent_usage.remove(&slot);
+        self.agent_token_usage.remove(&slot);
         self.agent_turn_started.remove(&slot);
         if self.next_agent == Some(slot) {
             self.next_agent = self.next_roster_slot_after(slot);
@@ -2745,6 +2755,7 @@ impl App {
         self.agent_models.remove(&slot);
         self.agent_commands.remove(&slot);
         self.agent_usage.remove(&slot);
+        self.agent_token_usage.remove(&slot);
         self.agent_turn_started.remove(&slot);
         if self.next_agent == Some(slot) {
             self.next_agent = self.next_roster_slot_after(slot);
@@ -2817,6 +2828,14 @@ impl App {
             self.agent_commands.insert(first, second_commands);
         }
         let first_usage = self.agent_usage.remove(&first);
+        let first_tokens = self.agent_token_usage.remove(&first);
+        let second_tokens = self.agent_token_usage.remove(&second);
+        if let Some(usage) = first_tokens {
+            self.agent_token_usage.insert(second, usage);
+        }
+        if let Some(usage) = second_tokens {
+            self.agent_token_usage.insert(first, usage);
+        }
         let second_usage = self.agent_usage.remove(&second);
         if let Some(first_usage) = first_usage {
             self.agent_usage.insert(second, first_usage);
@@ -3313,6 +3332,29 @@ impl App {
         }
     }
 
+    fn finish_tool_window(&mut self, slot: usize) {
+        let Some(mut window) = self.tool_windows.remove(&slot) else {
+            return;
+        };
+        for call in &mut window.calls {
+            if call.elapsed.is_none() {
+                call.elapsed = Some(call.started.elapsed().as_secs());
+                if let Some(activity) = &mut call.activity {
+                    activity.outcome = Some("completion not reported".into());
+                }
+            }
+        }
+        let collapsed = self.transcript.is_collapsed(window.block_id) != Some(false);
+        self.transcript.replace(
+            window.block_id,
+            crate::transcript::BlockKind::Tool,
+            tool_window_source(&window),
+            collapsed,
+        );
+        self.transcript
+            .set_preview(window.block_id, tool_window_preview(&window));
+    }
+
     fn apply_history(&mut self, slot: usize, content: &codeswarm_adapters::HistoryContent) {
         use crate::transcript::BlockKind;
         use codeswarm_adapters::HistoryContent;
@@ -3323,7 +3365,7 @@ impl App {
             HistoryContent::Tool(update) => {
                 self.history_blocks.remove(&slot);
                 let key = (slot, update.id.clone());
-                let source = format!(
+                let mut source = format!(
                     "{}{}{}",
                     agent_message_prefix(&self.agent_name(slot)),
                     tool_call_summary(&update.title, update.status),
@@ -3333,12 +3375,31 @@ impl App {
                         .map(|detail| format!("\n{detail}"))
                         .unwrap_or_default()
                 );
+                let preview = update
+                    .activity
+                    .as_ref()
+                    .map(|activity| activity.summary(update.status, None));
+                if let Some(activity) = &update.activity {
+                    source = format!(
+                        "{}{}\n{}",
+                        agent_message_prefix(&self.agent_name(slot)),
+                        activity.summary(update.status, None),
+                        activity
+                            .details()
+                            .lines()
+                            .map(|line| format!("  {line}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                }
                 if let Some(id) = self.history_tools.get(&key).copied() {
                     let collapsed = self.transcript.is_collapsed(id) != Some(false);
                     self.transcript
                         .replace(id, BlockKind::Tool, source, collapsed);
+                    self.transcript.set_preview(id, preview);
                 } else {
                     let id = self.transcript.append(BlockKind::Tool, source, true);
+                    self.transcript.set_preview(id, preview);
                     self.history_tools.insert(key, id);
                 }
                 return;
@@ -3518,6 +3579,9 @@ impl App {
             AgentEvent::UsageUpdated { slot, usage } => {
                 self.agent_usage.insert(*slot, usage.clone());
             }
+            AgentEvent::TokenUsageUpdated { slot, usage } => {
+                self.agent_token_usage.insert(*slot, usage.clone());
+            }
             AgentEvent::Text { slot, text } => {
                 self.mark_agent_turn_started(*slot);
                 self.thinking_agents.remove(slot);
@@ -3569,11 +3633,12 @@ impl App {
             }
             AgentEvent::Tool { slot, update } => {
                 self.mark_agent_turn_started(*slot);
-                if update
-                    .title
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("wait")
+                if update.activity.is_none()
+                    && update
+                        .title
+                        .trim_start()
+                        .to_ascii_lowercase()
+                        .starts_with("wait")
                 {
                     self.active_agent = self.agent_name(*slot);
                     self.agent_states.insert(*slot, "working".into());
@@ -3593,6 +3658,8 @@ impl App {
                             block_id,
                             prefix,
                             calls: VecDeque::new(),
+                            latest: update.id.clone(),
+                            last_tick: None,
                         },
                     );
                 }
@@ -3601,15 +3668,28 @@ impl App {
                         .tool_windows
                         .get_mut(slot)
                         .expect("tool window inserted");
-                    window.calls.retain(|call| call.id != update.id);
-                    window.calls.push_back(ToolCall {
+                    window.latest = update.id.clone();
+                    let position = window.calls.iter().position(|call| call.id == update.id);
+                    let started = position
+                        .map(|i| window.calls[i].started)
+                        .unwrap_or_else(Instant::now);
+                    let call = ToolCall {
                         id: update.id.clone(),
                         title: update.title.clone(),
                         status: update.status,
                         detail: update.detail.clone(),
-                    });
-                    while window.calls.len() > MAX_TOOL_HISTORY_ROWS {
-                        window.calls.pop_front();
+                        activity: update.activity.clone(),
+                        started,
+                        elapsed: matches!(
+                            update.status,
+                            ToolStatus::Completed | ToolStatus::Failed
+                        )
+                        .then(|| started.elapsed().as_secs()),
+                    };
+                    if let Some(position) = position {
+                        window.calls[position] = call;
+                    } else {
+                        window.calls.push_back(call);
                     }
                     (window.block_id, tool_window_source(window))
                 };
@@ -3619,6 +3699,8 @@ impl App {
                     source,
                     self.transcript.is_collapsed(block_id) != Some(false),
                 );
+                self.transcript
+                    .set_preview(block_id, tool_window_preview(&self.tool_windows[slot]));
                 let executing = matches!(update.status, ToolStatus::Pending | ToolStatus::Running);
                 if executing || update.status == ToolStatus::Failed {
                     self.thinking_agents.remove(slot);
@@ -3681,7 +3763,7 @@ impl App {
                     .remove(&(*slot, crate::transcript::BlockKind::Agent));
                 self.streaming_blocks
                     .remove(&(*slot, crate::transcript::BlockKind::Thought));
-                self.tool_windows.remove(slot);
+                self.finish_tool_window(*slot);
                 self.streaming_blocks
                     .remove(&(*slot, crate::transcript::BlockKind::Human));
                 if self
@@ -3714,7 +3796,7 @@ impl App {
                 self.thinking_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
-                self.tool_windows.remove(slot);
+                self.finish_tool_window(*slot);
                 self.streaming_blocks
                     .remove(&(*slot, crate::transcript::BlockKind::Agent));
                 self.streaming_blocks
@@ -3758,7 +3840,7 @@ impl App {
                 self.thinking_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
-                self.tool_windows.remove(slot);
+                self.finish_tool_window(*slot);
                 self.streaming_blocks
                     .remove(&(*slot, crate::transcript::BlockKind::Agent));
                 self.streaming_blocks
@@ -4113,6 +4195,20 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_content(frame: &mut Frame, app: &mut App) {
+    let now = Instant::now();
+    for window in app.tool_windows.values_mut() {
+        if window.calls.iter().any(|call| {
+            call.activity.is_some()
+                && matches!(call.status, ToolStatus::Pending | ToolStatus::Running)
+        }) && window
+            .last_tick
+            .is_none_or(|tick| now.duration_since(tick) >= Duration::from_secs(1))
+        {
+            window.last_tick = Some(now);
+            app.transcript
+                .set_preview(window.block_id, tool_window_preview(window));
+        }
+    }
     if !app.store_editing_directory {
         app.sync_prompt_editor();
     }
@@ -4314,6 +4410,22 @@ fn tool_window_source(window: &ToolWindow) -> String {
         .calls
         .iter()
         .map(|call| {
+            if let Some(activity) = &call.activity {
+                let summary = activity.summary(
+                    call.status,
+                    Some(
+                        call.elapsed
+                            .unwrap_or_else(|| call.started.elapsed().as_secs()),
+                    ),
+                );
+                let detail = activity
+                    .details()
+                    .lines()
+                    .map(|line| format!("  {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return format!("{summary}\n{detail}");
+            }
             let mut summary = tool_call_summary(&call.title, call.status);
             if let Some(detail) = call.detail.as_deref().filter(|detail| !detail.is_empty()) {
                 if let Some(preview) = detail.lines().rev().find(|line| !line.trim().is_empty()) {
@@ -4340,6 +4452,27 @@ fn tool_window_source(window: &ToolWindow) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("{}{}", window.prefix, calls)
+}
+
+fn tool_window_preview(window: &ToolWindow) -> Option<String> {
+    let call = window
+        .calls
+        .iter()
+        .rev()
+        .find(|call| {
+            call.activity.is_some()
+                && matches!(call.status, ToolStatus::Pending | ToolStatus::Running)
+        })
+        .or_else(|| window.calls.iter().find(|call| call.id == window.latest))?;
+    call.activity.as_ref().map(|activity| {
+        activity.summary(
+            call.status,
+            Some(
+                call.elapsed
+                    .unwrap_or_else(|| call.started.elapsed().as_secs()),
+            ),
+        )
+    })
 }
 
 fn footer_mode_label(app: &App) -> String {
@@ -5731,14 +5864,11 @@ fn render_transcript(
     let lines = if rows.is_empty() {
         Vec::new()
     } else {
-        let mut in_code = false;
         let mut seen_details = std::collections::BTreeSet::new();
         rows.into_iter()
             .enumerate()
             .map(|(row_index, row)| {
-                if row.first_in_block {
-                    in_code = false;
-                }
+                let mut in_code = row.code_block;
                 let detail_icon = if area.width >= 2
                     && matches!(
                         row.kind,
@@ -5760,6 +5890,8 @@ fn render_transcript(
                 };
                 let marker = if let Some(icon) = detail_icon {
                     icon
+                } else if row.code_block && row.kind == crate::transcript::BlockKind::Agent {
+                    "│ "
                 } else if matches!(
                     row.kind,
                     crate::transcript::BlockKind::Thought | crate::transcript::BlockKind::Tool
@@ -5809,7 +5941,25 @@ fn render_transcript(
                 }
                 let mut spans = vec![Span::styled(marker, marker_style(row.kind, &row.text))];
                 spans.extend(markdown_spans(row.kind, &row.text, &mut in_code));
-                Line::from(spans)
+                if row.diff_line {
+                    let text = row.text.trim_start();
+                    let color = if text.starts_with('+') && !text.starts_with("+++") {
+                        Color::Green
+                    } else if text.starts_with('-') && !text.starts_with("---") {
+                        Color::Red
+                    } else {
+                        SECONDARY_TEXT
+                    };
+                    for span in spans.iter_mut().skip(1) {
+                        span.style = span.style.fg(color);
+                    }
+                }
+                let line = Line::from(spans);
+                if row.code_block && row.kind == crate::transcript::BlockKind::Agent {
+                    line.style(Style::default().bg(CODE_BG))
+                } else {
+                    line
+                }
             })
             .collect::<Vec<_>>()
     };
@@ -5979,15 +6129,32 @@ fn markdown_content_spans(
     text: &str,
     in_code: &mut bool,
 ) -> Vec<Span<'static>> {
-    if text.trim_start().starts_with("```") {
+    if text.trim_start().starts_with("```") || text.trim_start().starts_with("~~~") {
+        let opening = !*in_code;
         *in_code = !*in_code;
         return vec![Span::styled(
-            text.to_owned(),
+            if opening {
+                format!(
+                    "╭─ {}",
+                    text.trim_start().trim_start_matches(['`', '~']).trim()
+                )
+            } else {
+                "╰─".into()
+            },
             Style::default().fg(Color::Gray),
         )];
     }
     if *in_code {
-        return vec![Span::styled(text.to_owned(), block_style(kind))];
+        return vec![Span::styled(text.to_owned(), block_style(kind).bg(CODE_BG))];
+    }
+    let trimmed = text.trim_start();
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&hashes) && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+        let mut spans = markdown_content_spans(kind, &trimmed[hashes + 1..], in_code);
+        for span in &mut spans {
+            span.style = span.style.bold();
+        }
+        return spans;
     }
     let base = markdown_style(kind, text);
     let mut spans = Vec::new();
@@ -6019,7 +6186,11 @@ fn markdown_content_spans(
         let marker_end = leading + marker_len;
         let marker_style = base.add_modifier(Modifier::BOLD);
         spans.push(Span::styled(
-            text[leading..marker_end].to_owned(),
+            match &text[leading..marker_end] {
+                "- " | "* " => "• ".to_owned(),
+                "> " => "│ ".to_owned(),
+                other => other.to_owned(),
+            },
             marker_style,
         ));
         remaining = &text[marker_end..];
@@ -6046,7 +6217,7 @@ fn markdown_content_spans(
         style = match delimiter {
             "**" => style.add_modifier(Modifier::BOLD),
             "*" => style.add_modifier(Modifier::ITALIC),
-            _ => style,
+            _ => style.bg(CODE_BG).add_modifier(Modifier::BOLD),
         };
         spans.push(Span::styled(
             remaining[content_start..end].to_owned(),
@@ -6191,10 +6362,10 @@ mod tests {
 
     use super::{
         ACCENT, AGENT_COLORS, App, CONFIG_SETTING_COUNT, ConfigAction, ConfigKey, FooterAction,
-        LocalCommand, MAX_TOOL_HISTORY_ROWS, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PanelAction,
-        PathPickerAction, PermissionAction, PermissionKey, PermissionPrompt, PromptAction,
-        PromptEditor, SECONDARY_TEXT, STATUS_BG, SessionListEntry, StoreAction, StoreAgent,
-        StoreKey, TRANSCRIPT_BG, agent_header_color, agent_slot_color, block_style, cell_width,
+        LocalCommand, PANEL_BG, PRIMARY_TEXT, PROMPT_RULE, PanelAction, PathPickerAction,
+        PermissionAction, PermissionKey, PermissionPrompt, PromptAction, PromptEditor,
+        SECONDARY_TEXT, STATUS_BG, SessionListEntry, StoreAction, StoreAgent, StoreKey,
+        TRANSCRIPT_BG, agent_header_color, agent_slot_color, block_style, cell_width,
         compact_cell_label, compact_workspace_path, file_reference_spans, footer_agent_label,
         format_turn_elapsed, markdown_spans, markdown_style, marker_style, render,
         render_prompt_separator, row_style, selected_style,
@@ -6759,6 +6930,41 @@ mod tests {
     }
 
     #[test]
+    fn answer_formatting_preserves_code_and_survives_scrolling_past_fences() {
+        let mut app = App::default();
+        app.set_theme("dark");
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
+            slot:0,
+            text:"## Overview\nA **clear answer** with `inline code`.\n\n- A list item with enough text to wrap across a narrow pane\n\n```rust\n    let x = \"**literal**\";\n    return x;\n```\n".into(),
+        });
+        app.follow_tail = false;
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Overview"));
+        assert!(!text.contains("## Overview"));
+        assert!(text.contains("• A list"));
+        assert!(text.contains("    let x = \"**literal**\";"), "{text}");
+        let rows = app.transcript.viewport(58, 0, 100, 0);
+        let code_row = rows.iter().position(|r| r.text.contains("let x")).unwrap();
+        assert!(rows[code_row].code_block);
+        app.scroll_y = code_row;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let first_row = terminal.backend().buffer().content()[..60]
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(first_row.contains("**literal**"), "{first_row}");
+        assert!(app.export_markdown().contains("## Overview"));
+    }
+
+    #[test]
     fn markdown_headings_keep_lightweight_visual_hierarchy() {
         assert_eq!(
             markdown_style(BlockKind::Agent, "## Summary").fg,
@@ -6788,7 +6994,7 @@ mod tests {
         assert_eq!(code[0].style.fg, Some(Color::Reset));
         let mut in_code = false;
         let list = markdown_spans(BlockKind::Agent, "- item", &mut in_code);
-        assert_eq!(list[0].content, "- ");
+        assert_eq!(list[0].content, "• ");
         assert_eq!(list[0].style.fg, Some(Color::Reset));
         let quote = markdown_spans(BlockKind::Agent, "> note", &mut in_code);
         assert_eq!(quote[0].style.fg, Some(Color::Reset));
@@ -7565,6 +7771,7 @@ mod tests {
                 HistoryContent::UserText("another question".into()),
                 HistoryContent::Text("another answer".into()),
                 HistoryContent::Tool(codeswarm_adapters::ToolUpdate {
+                    activity: None,
                     id: "old-tool".into(),
                     title: "Read".into(),
                     status: codeswarm_adapters::ToolStatus::Running,
@@ -7652,6 +7859,7 @@ mod tests {
             app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
                 slot: 0,
                 update: codeswarm_adapters::ToolUpdate {
+                    activity: None,
                     id: "wait".into(),
                     title: "Wait".into(),
                     status,
@@ -7666,6 +7874,7 @@ mod tests {
         app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
+                activity: None,
                 id: "generic".into(),
                 title: "Tool call".into(),
                 status: codeswarm_adapters::ToolStatus::Completed,
@@ -7680,6 +7889,7 @@ mod tests {
             app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
                 slot: 0,
                 update: codeswarm_adapters::ToolUpdate {
+                    activity: None,
                     id: id.into(),
                     title: title.into(),
                     status: codeswarm_adapters::ToolStatus::Completed,
@@ -7923,6 +8133,7 @@ mod tests {
             content: HistoryContent::Text("old response".into()),
         });
         let tool = codeswarm_adapters::ToolUpdate {
+            activity: None,
             id: "old-tool".into(),
             title: "Read file".into(),
             status: codeswarm_adapters::ToolStatus::Completed,
@@ -8956,6 +9167,7 @@ mod tests {
         app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
+                activity: None,
                 id: "tool".into(),
                 title: "Run".into(),
                 status: codeswarm_adapters::ToolStatus::Completed,
@@ -9066,6 +9278,7 @@ mod tests {
         let tool = |status| codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
+                activity: None,
                 id: "tool".into(),
                 title: "Run".into(),
                 status,
@@ -9699,6 +9912,7 @@ mod tests {
         let tool = |status| AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
+                activity: None,
                 id: "read".into(),
                 title: "Read file".into(),
                 status,
@@ -9763,6 +9977,7 @@ mod tests {
             codeswarm_adapters::AgentEvent::Tool {
                 slot: 0,
                 update: codeswarm_adapters::ToolUpdate {
+                    activity: None,
                     id: "read".into(),
                     title: "Read file".into(),
                     status: codeswarm_adapters::ToolStatus::Running,
@@ -9866,6 +10081,7 @@ mod tests {
             app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
                 slot: 0,
                 update: codeswarm_adapters::ToolUpdate {
+                    activity: None,
                     id: "read".into(),
                     title: "Read file".into(),
                     status: codeswarm_adapters::ToolStatus::Completed,
@@ -9963,6 +10179,7 @@ mod tests {
         let tool = |id: &str, status| codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
+                activity: None,
                 id: id.into(),
                 title: format!("Noisy {id}"),
                 status,
@@ -10034,6 +10251,7 @@ mod tests {
         let event = |status, detail| codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
+                activity: None,
                 id: "generic".into(),
                 title: "Tool call".into(),
                 status,
@@ -10087,6 +10305,7 @@ mod tests {
             app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
                 slot: 0,
                 update: codeswarm_adapters::ToolUpdate {
+                    activity: None,
                     id: "meaningful".into(),
                     title: "Read file".into(),
                     status: codeswarm_adapters::ToolStatus::Completed,
@@ -10096,6 +10315,7 @@ mod tests {
             app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
                 slot: 0,
                 update: codeswarm_adapters::ToolUpdate {
+                    activity: None,
                     id: "empty".into(),
                     title: "Tool call".into(),
                     status: codeswarm_adapters::ToolStatus::Completed,
@@ -10121,6 +10341,7 @@ mod tests {
         app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
+                activity: None,
                 id: "shell".into(),
                 title: "Run command".into(),
                 status: codeswarm_adapters::ToolStatus::Running,
@@ -10171,6 +10392,7 @@ mod tests {
         app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
+                activity: None,
                 id: "error-tool".into(),
                 title: "🔧 error".into(),
                 status: codeswarm_adapters::ToolStatus::Failed,
@@ -10204,6 +10426,7 @@ mod tests {
         app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
             slot: 0,
             update: codeswarm_adapters::ToolUpdate {
+                activity: None,
                 id: "tool-1".into(),
                 title: "Run tests".into(),
                 status: codeswarm_adapters::ToolStatus::Completed,
@@ -10240,12 +10463,62 @@ mod tests {
     }
 
     #[test]
-    fn expanded_tool_history_is_capped_and_keeps_full_details() {
+    fn structured_activity_updates_in_place_with_timer_and_complete_history() {
+        let mut app = App::default();
+        let activity = codeswarm_adapters::activity::ToolActivity {
+            name: "Bash".into(),
+            arguments: Some(serde_json::json!({"command":"cargo test","cwd":"/workspace"})),
+            ..Default::default()
+        };
+        let mut update = codeswarm_adapters::ToolUpdate {
+            id: "command".into(),
+            title: "Bash".into(),
+            status: codeswarm_adapters::ToolStatus::Running,
+            detail: None,
+            activity: Some(Box::new(activity)),
+        };
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
+            slot: 0,
+            update: update.clone(),
+        });
+        let block = app.tool_windows[&0].block_id;
+        app.tool_windows.get_mut(&0).unwrap().calls[0].started =
+            std::time::Instant::now() - std::time::Duration::from_secs(8);
+        let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Running cargo test · running · 8s"),
+            "{rendered}"
+        );
+        update.status = codeswarm_adapters::ToolStatus::Completed;
+        update.activity.as_mut().unwrap().output = Some(serde_json::json!("first line\nlast line"));
+        update.activity.as_mut().unwrap().exit_code = Some(0);
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool { slot: 0, update });
+        assert_eq!(app.tool_windows[&0].block_id, block);
+        assert_eq!(app.tool_windows[&0].calls.len(), 1);
+        assert_eq!(app.toggle_focused_detail(), Some(false));
+        let rows = app.transcript.viewport(90, 0, 100, 0);
+        assert!(rows.iter().any(|r| r.text.contains("/workspace")));
+        assert!(rows.iter().any(|r| r.text.contains("first line")));
+        assert!(rows.iter().any(|r| r.text.contains("done · exit 0")));
+        assert!(app.export_markdown().contains("last line"));
+    }
+
+    #[test]
+    fn expanded_tool_history_retains_earlier_calls_and_full_details() {
         let mut app = App::default();
         for index in 0..25 {
             app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
                 slot: 0,
                 update: codeswarm_adapters::ToolUpdate {
+                    activity: None,
                     id: format!("call-{index}"),
                     title: format!("Tool {index}"),
                     status: codeswarm_adapters::ToolStatus::Completed,
@@ -10254,10 +10527,10 @@ mod tests {
             });
         }
         let window = &app.tool_windows[&0];
-        assert_eq!(window.calls.len(), MAX_TOOL_HISTORY_ROWS);
+        assert_eq!(window.calls.len(), 25);
         assert_eq!(
             window.calls.front().map(|call| call.id.as_str()),
-            Some("call-5")
+            Some("call-0")
         );
 
         assert_eq!(app.toggle_focused_detail(), Some(false));
@@ -10266,7 +10539,7 @@ mod tests {
             rows.iter()
                 .filter(|row| row.text.contains("old output"))
                 .count(),
-            MAX_TOOL_HISTORY_ROWS
+            25
         );
         assert!(rows.iter().any(|row| row.text.contains("Tool 5")));
         assert!(rows.iter().any(|row| row.text.contains("Tool 24")));

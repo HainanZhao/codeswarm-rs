@@ -159,6 +159,7 @@ fn parse_tool(
         .tools
         .entry(id.to_owned())
         .or_insert_with(|| ToolUpdate {
+            activity: None,
             id: id.to_owned(),
             title: title.clone(),
             status: ToolStatus::Pending,
@@ -166,6 +167,55 @@ fn parse_tool(
         });
     update.title = title;
     update.status = tool_status(item, event_type);
+    let activity = update.activity.get_or_insert_with(Default::default);
+    activity.name = item
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or(kind)
+        .into();
+    if let Some(arguments) = item.get("arguments").or_else(|| item.get("input")) {
+        activity.arguments = Some(arguments.clone());
+    } else if let Some(command) = item.get("command") {
+        activity.arguments = Some(serde_json::json!({"command": command, "cwd": item.get("cwd")}));
+    }
+    if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+        activity.locations = changes
+            .iter()
+            .filter_map(|change| {
+                change
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        // Keep provider change records even when they contain only paths/kinds.
+        activity.arguments = Some(serde_json::json!({"changes": changes}));
+        let patches = changes
+            .iter()
+            .filter_map(|change| {
+                let diff = change.get("diff")?.as_str()?;
+                Some(format!(
+                    "{}\n{diff}",
+                    change.get("path").and_then(Value::as_str).unwrap_or("file")
+                ))
+            })
+            .collect::<Vec<_>>();
+        if !patches.is_empty() {
+            activity.output = Some(Value::String(patches.join("\n\n")));
+        }
+    }
+    if let Some(code) = item.get("exit_code").and_then(Value::as_i64) {
+        activity.exit_code = Some(code);
+    }
+    if let Some(error) = item.get("error") {
+        activity.error = Some(error.clone());
+    }
+    for key in ["aggregated_output", "output", "result", "detail"] {
+        if let Some(output) = item.get(key) {
+            activity.output = Some(output.clone());
+            break;
+        }
+    }
     for key in ["aggregated_output", "output", "result", "error", "detail"] {
         if let Some(detail) = text_value(item.get(key)) {
             update.detail = Some(detail);
@@ -686,6 +736,14 @@ impl AgentAdapter for CodexAdapter {
                 }
                 if event_type == "turn.completed" {
                     turn_completed = true;
+                    if let Some(usage) = value.get("usage").filter(|v| v.is_object()) {
+                        let _ = sender
+                            .send(Ok(AgentEvent::TokenUsageUpdated {
+                                slot,
+                                usage: usage.clone(),
+                            }))
+                            .await;
+                    }
                 }
                 if event_type == "turn.failed" || event_type == "error" {
                     failure = failure_detail(&value);

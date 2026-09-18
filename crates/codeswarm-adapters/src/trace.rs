@@ -111,6 +111,7 @@ mod tests {
             AgentEvent::Tool {
                 slot: 0,
                 update: ToolUpdate {
+                    activity: None,
                     id: "tool-1".into(),
                     title: "shell".into(),
                     status: ToolStatus::Completed,
