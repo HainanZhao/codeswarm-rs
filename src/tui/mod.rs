@@ -224,7 +224,7 @@ pub enum ConfigKey {
     NextValue,
     MoveUp,
     MoveDown,
-    ToggleSlot,
+    EditModel,
     Confirm,
     Save,
     Cancel,
@@ -1384,9 +1384,13 @@ impl App {
             self.config_model_editor.clear();
             self.status = match model {
                 Some(model) => format!("{agent_name} model: {model}"),
-                None => format!("{agent_name} model: provider default"),
+                None => format!("{agent_name}: model override cleared for new sessions"),
             };
             return ConfigAction::Changed;
+        }
+        if input.key == Key::Enter {
+            self.status = "model name must be one line".into();
+            return ConfigAction::Ignored;
         }
         match self.config_model_editor.handle_input(input) {
             PromptAction::Changed | PromptAction::Completion { .. } => ConfigAction::Changed,
@@ -1439,16 +1443,17 @@ impl App {
 
     pub fn take_config_model_changes(&mut self) -> Vec<(usize, String)> {
         self.pending_model_changes.clear();
-        let live_slots = self.active_roster_slots();
         self.config_agents
             .iter()
-            .filter(|agent| agent.selected)
             .enumerate()
-            .filter_map(|(position, agent)| {
-                let slot = *live_slots.get(position)?;
+            .filter(|(_, agent)| agent.selected)
+            .filter_map(|(row, agent)| {
+                let slot = self.live_slot_for_config_row(row)?;
                 let model = agent.model.clone()?;
-                let (_, _, current) = self.agent_models.get(&slot)?;
-                let current = current.as_ref();
+                let current = self
+                    .agent_models
+                    .get(&slot)
+                    .and_then(|(_, _, current)| current.as_ref());
                 (current != Some(&model)).then_some((slot, model))
             })
             .collect()
@@ -1690,6 +1695,9 @@ impl App {
             self.config_collaboration_pending = false;
             return ConfigAction::Ignored;
         }
+        if self.config_editing_model() {
+            return ConfigAction::Ignored;
+        }
         match key {
             ConfigKey::Cancel => {
                 self.config_visible = false;
@@ -1745,6 +1753,24 @@ impl App {
                 ConfigAction::Changed
             }
             ConfigKey::PreviousValue | ConfigKey::NextValue => ConfigAction::Ignored,
+            ConfigKey::EditModel => {
+                if self.config_selected < CONFIG_SETTING_COUNT {
+                    return ConfigAction::Ignored;
+                }
+                let index = self.config_selected - CONFIG_SETTING_COUNT;
+                let Some(agent) = self.config_agents.get(index) else {
+                    return ConfigAction::Ignored;
+                };
+                if !agent.selected {
+                    self.status = "add this agent before setting its model".into();
+                    return ConfigAction::Ignored;
+                }
+                self.config_model_editor
+                    .set_text(agent.model.clone().unwrap_or_default());
+                self.config_editing_model = Some(index);
+                self.status = "type the model name, then press Enter".into();
+                ConfigAction::Changed
+            }
             ConfigKey::MoveUp | ConfigKey::MoveDown
                 if self.config_selected >= CONFIG_SETTING_COUNT =>
             {
@@ -1796,53 +1822,35 @@ impl App {
                 self.config_roster_dirty = true;
                 ConfigAction::Changed
             }
-            ConfigKey::ToggleSlot => {
-                if self.config_selected < CONFIG_SETTING_COUNT {
-                    return ConfigAction::Ignored;
-                }
-                let index = self.config_selected - CONFIG_SETTING_COUNT;
-                if let Some(agent) = self.config_agents.get(index).cloned() {
-                    if agent.selected {
-                        self.config_agents.remove(index);
-                        let max = CONFIG_SETTING_COUNT
-                            .saturating_add(self.config_roster_count())
-                            .saturating_sub(1);
-                        self.config_selected = self.config_selected.min(max);
-                    } else {
-                        let mut slot = agent.clone();
-                        slot.selected = true;
-                        slot.model = None;
-                        let insert_at = self
-                            .config_agents
-                            .iter()
-                            .position(|agent| !agent.selected)
-                            .unwrap_or(self.config_agents.len());
-                        self.config_agents.insert(insert_at, slot);
-                        self.config_selected = CONFIG_SETTING_COUNT + insert_at;
-                    }
-                    self.config_roster_dirty = true;
-                    self.status = if agent.selected {
-                        format!("{} slot removed", agent.name)
-                    } else {
-                        format!("{} slot added", agent.name)
-                    };
-                }
-                ConfigAction::Changed
-            }
             ConfigKey::Confirm => {
                 if self.config_selected >= CONFIG_SETTING_COUNT {
                     let index = self.config_selected - CONFIG_SETTING_COUNT;
-                    let Some(agent) = self.config_agents.get(index) else {
-                        return ConfigAction::Ignored;
-                    };
-                    if !agent.selected {
-                        self.status = "add this agent to a slot before setting its model".into();
-                        return ConfigAction::Ignored;
+                    if let Some(agent) = self.config_agents.get(index).cloned() {
+                        if agent.selected {
+                            self.config_agents.remove(index);
+                            let max = CONFIG_SETTING_COUNT
+                                .saturating_add(self.config_roster_count())
+                                .saturating_sub(1);
+                            self.config_selected = self.config_selected.min(max);
+                        } else {
+                            let mut slot = agent.clone();
+                            slot.selected = true;
+                            slot.model = None;
+                            let insert_at = self
+                                .config_agents
+                                .iter()
+                                .position(|agent| !agent.selected)
+                                .unwrap_or(self.config_agents.len());
+                            self.config_agents.insert(insert_at, slot);
+                            self.config_selected = CONFIG_SETTING_COUNT + insert_at;
+                        }
+                        self.config_roster_dirty = true;
+                        self.status = if agent.selected {
+                            format!("{} slot removed", agent.name)
+                        } else {
+                            format!("{} slot added", agent.name)
+                        };
                     }
-                    self.config_model_editor
-                        .set_text(agent.model.clone().unwrap_or_default());
-                    self.config_editing_model = Some(index);
-                    self.status = "enter a model name; leave blank for provider default".into();
                     return ConfigAction::Changed;
                 }
                 match self.config_selected {
@@ -3469,9 +3477,23 @@ impl App {
                 slot,
                 current_model,
             } => {
-                if let Some((_config_id, _models, current)) = self.agent_models.get_mut(slot) {
-                    *current = Some(current_model.clone());
+                let entry = self.agent_models.entry(*slot).or_insert_with(|| {
+                    (
+                        "model".into(),
+                        vec![codeswarm_adapters::Mode {
+                            id: current_model.clone(),
+                            label: current_model.clone(),
+                        }],
+                        None,
+                    )
+                });
+                if !entry.1.iter().any(|model| model.id == *current_model) {
+                    entry.1.push(codeswarm_adapters::Mode {
+                        id: current_model.clone(),
+                        label: current_model.clone(),
+                    });
                 }
+                entry.2 = Some(current_model.clone());
             }
             AgentEvent::UserText { slot, .. } => {
                 // `user_message_chunk` is the agent echoing our own prompt,
@@ -4108,9 +4130,6 @@ fn render_content(frame: &mut Frame, app: &mut App) {
     if app.config_visible {
         let panel = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
         render_config(frame, app, panel);
-        if app.config_editing_model() {
-            render_config_model(frame, app, panel);
-        }
         if area.height > 0 {
             render_status_banner(
                 frame.buffer_mut(),
@@ -4295,18 +4314,27 @@ fn tool_window_source(window: &ToolWindow) -> String {
         .calls
         .iter()
         .map(|call| {
-            let mut row = tool_call_summary(&call.title, call.status);
-            if let Some(detail) = call
-                .detail
-                .as_deref()
-                .and_then(|detail| detail.lines().rev().find(|line| !line.trim().is_empty()))
-            {
-                if !row.trim().is_empty() {
-                    row.push_str(" · ");
+            let mut summary = tool_call_summary(&call.title, call.status);
+            if let Some(detail) = call.detail.as_deref().filter(|detail| !detail.is_empty()) {
+                if let Some(preview) = detail.lines().rev().find(|line| !line.trim().is_empty()) {
+                    if !summary.is_empty() {
+                        summary.push_str(" · ");
+                    }
+                    summary.push_str(&preview.split_whitespace().collect::<Vec<_>>().join(" "));
                 }
-                row.push_str(&detail.split_whitespace().collect::<Vec<_>>().join(" "));
+                let detail = detail
+                    .lines()
+                    .map(|line| format!("  {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if summary.is_empty() {
+                    detail
+                } else {
+                    format!("{detail}\n{summary}")
+                }
+            } else {
+                summary
             }
-            row
         })
         .filter(|row| !row.trim().is_empty())
         .collect::<Vec<_>>()
@@ -5019,7 +5047,7 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
             true,
         ),
         ("Theme", app.theme.label(), true),
-        ("Roster", "Space toggle · Alt/Shift+↑/↓ or [ ] order", false),
+        ("Roster", "Enter add/remove · [/] order", false),
     ];
     let total_rows = rows.len().saturating_add(app.config_roster_count());
     let mut lines = Vec::with_capacity(total_rows + 3);
@@ -5052,29 +5080,53 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(PRIMARY_TEXT)
             };
-            let availability = if agent.available { "ready" } else { "missing" };
-            let name = if compact {
-                compact_label(&agent.name, 18)
-            } else {
-                agent.name.clone()
-            };
+            let name_width = if compact { 10 } else { 20 };
+            let name = compact_label(&agent.name, name_width);
             let mut spans = vec![
                 Span::styled(format!(" {marker} {checked} "), line_style),
-                Span::styled(format!("{name:<20}"), line_style),
-                Span::styled(
-                    format!(" {availability} · {}", agent.adapter),
-                    Style::default().fg(if agent.available {
-                        Color::Green
-                    } else {
-                        Color::Yellow
-                    }),
-                ),
+                Span::styled(format!("{name:<name_width$}"), line_style),
             ];
-            if agent.selected {
-                let model = agent.model.as_deref().unwrap_or("Provider default");
+            if !agent.available {
                 spans.push(Span::styled(
-                    format!(" · {model} · Enter edit"),
-                    Style::default().fg(if selected { ACCENT } else { Color::Gray }),
+                    " not installed",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            if agent.selected {
+                let editing = app.config_editing_model == Some(roster_index);
+                let model = if editing {
+                    let mut value = app.config_model_editor.text();
+                    let cursor = app.config_model_editor.cursor().1;
+                    let byte = value
+                        .char_indices()
+                        .nth(cursor)
+                        .map_or(value.len(), |(byte, _)| byte);
+                    value.insert(byte, '▏');
+                    let budget = usize::from(modal.width)
+                        .saturating_sub(name_width + 15 + if agent.available { 0 } else { 14 })
+                        .max(1);
+                    let mut start = 0;
+                    while cell_width(&value[start..byte]) + 1 > budget {
+                        start += value[start..].chars().next().unwrap().len_utf8();
+                    }
+                    value[start..].to_owned()
+                } else {
+                    agent
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| "Provider default".into())
+                };
+                spans.push(Span::styled(
+                    if editing {
+                        format!(" Model: {model}")
+                    } else {
+                        format!(" Model: {model} · Space edit")
+                    },
+                    Style::default().fg(if selected || editing {
+                        ACCENT
+                    } else {
+                        Color::Gray
+                    }),
                 ));
             }
             lines.push(Line::from(spans));
@@ -5121,10 +5173,20 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
         ]));
     }
     let navigation = if app.config_selected >= CONFIG_SETTING_COUNT {
-        if compact {
-            " Enter model · Space slot"
+        let selected = app
+            .config_agents
+            .get(app.config_selected - CONFIG_SETTING_COUNT)
+            .is_some_and(|agent| agent.selected);
+        if app.config_editing_model() {
+            " Type model name · Enter Apply · Esc Cancel"
+        } else if compact && selected {
+            " Space model · Enter remove"
+        } else if selected {
+            " ↑/↓ Navigate · Space Edit model · Enter Remove · [/] Order"
+        } else if compact {
+            " Enter add"
         } else {
-            " ↑/↓ Navigate · Enter Model · Space Slot · [/] Order"
+            " ↑/↓ Navigate · Enter Add to roster"
         }
     } else if compact {
         " ↑/↓ Move · Enter Change"
@@ -5147,40 +5209,6 @@ fn render_config(frame: &mut Frame, app: &App, area: Rect) {
                 .border_style(Style::default().fg(SEPARATOR)),
         )
         .render(modal, frame.buffer_mut());
-}
-
-fn render_config_model(frame: &mut Frame, app: &mut App, area: Rect) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let width = area.width.clamp(36, 76);
-    let height = area.height.clamp(5, 7);
-    let modal = Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width.min(area.width),
-        height.min(area.height),
-    );
-    frame.render_widget(Clear, modal);
-    Paragraph::new(Line::styled(
-        " Enter apply · Empty uses provider default · Esc cancel",
-        Style::default().fg(Color::Gray),
-    ))
-    .block(
-        Block::default()
-            .title(" Model name ")
-            .title_style(Style::default().fg(ACCENT).bold())
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(SEPARATOR)),
-    )
-    .render(modal, frame.buffer_mut());
-    let input = Rect::new(
-        modal.x.saturating_add(2),
-        modal.y.saturating_add(2),
-        modal.width.saturating_sub(4),
-        1,
-    );
-    app.config_model_editor.render(frame, input);
 }
 
 fn render_store(frame: &mut Frame, app: &App, area: Rect) {
@@ -5838,7 +5866,7 @@ fn render_split_diff(buffer: &mut Buffer, area: Rect, rows: Vec<RenderRow>) {
 
 const AGENT_COLORS: [Color; 4] = [
     Color::Rgb(175, 82, 222),
-    Color::Rgb(217, 119, 6),
+    Color::Rgb(64, 112, 224),
     Color::Rgb(214, 58, 104),
     Color::Rgb(36, 138, 61),
 ];
@@ -7789,7 +7817,7 @@ mod tests {
         assert_eq!(agent_header_color("Claude"), agent_header_color("Claude"));
         assert_ne!(agent_header_color("a"), agent_header_color("b"));
         assert_eq!(agent_slot_color(0), Color::Rgb(175, 82, 222));
-        assert_eq!(agent_slot_color(1), Color::Rgb(217, 119, 6));
+        assert_eq!(agent_slot_color(1), Color::Rgb(64, 112, 224));
         assert_eq!(agent_slot_color(2), Color::Rgb(214, 58, 104));
         assert_eq!(agent_slot_color(3), Color::Rgb(36, 138, 61));
         assert!(AGENT_COLORS.iter().all(|color| {
@@ -7840,7 +7868,7 @@ mod tests {
             .find(|cell| cell.symbol() == "G")
             .map(|cell| cell.fg)
             .expect("Gemini footer/header cell");
-        assert_eq!(footer_color, Color::Yellow);
+        assert_eq!(footer_color, Color::LightBlue);
         assert!(cells.iter().filter(|cell| cell.symbol() == "G").count() >= 2);
         assert!(
             cells
@@ -8393,7 +8421,7 @@ mod tests {
         for name in ["One", "Two", "Three"] {
             assert!(rendered.contains(name), "rendered={rendered:?}");
         }
-        for hint in ["Enter Model", "[/] Order", "Ctrl+S Save", "Esc Discard"] {
+        for hint in ["Enter Add", "[/] order", "Ctrl+S Save", "Esc Discard"] {
             assert!(rendered.contains(hint), "rendered={rendered:?}");
         }
         assert_eq!(
@@ -8404,14 +8432,14 @@ mod tests {
             app.handle_config_key(ConfigKey::NextValue),
             ConfigAction::Ignored
         );
-        app.handle_config_key(ConfigKey::ToggleSlot);
+        app.handle_config_key(ConfigKey::Confirm);
         assert_eq!(
             app.config_roster_identities(),
             ["one.example", "two.example", "three.example"]
         );
         // Adding a slot preserves its template for another independent slot.
         assert_eq!(app.config_roster_count(), 4);
-        app.handle_config_key(ConfigKey::ToggleSlot);
+        app.handle_config_key(ConfigKey::Confirm);
         assert_eq!(app.config_roster_count(), 3);
         app.handle_config_key(ConfigKey::Up);
         assert_eq!(
@@ -8425,7 +8453,7 @@ mod tests {
         assert!(app.config_roster_dirty());
         // Toggling removes the focused selected slot.
         assert_eq!(
-            app.handle_config_key(ConfigKey::ToggleSlot),
+            app.handle_config_key(ConfigKey::Confirm),
             ConfigAction::Changed
         );
         assert_eq!(app.config_roster_identities(), ["one.example"]);
@@ -8520,7 +8548,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(
-            rendered.contains("opencode-go/muse-spark · Enter edi"),
+            rendered.contains("Model: opencode-go/muse-spark · Space edit"),
             "rendered={rendered:?}"
         );
         assert!(rendered.contains("Hidden"), "rendered={rendered:?}");
@@ -8561,7 +8589,7 @@ mod tests {
         app.open_config();
         app.config_selected = CONFIG_SETTING_COUNT;
         assert_eq!(
-            app.handle_config_key(ConfigKey::Confirm),
+            app.handle_config_key(ConfigKey::EditModel),
             ConfigAction::Changed
         );
         assert!(app.config_editing_model());
@@ -8576,10 +8604,24 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(editor.contains("Model name"), "rendered={editor:?}");
+        assert!(editor.contains("Model: ▏"), "rendered={editor:?}");
         for character in "provider/custom-model".chars() {
             app.handle_config_model_input(key(Key::Char(character)));
         }
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("draw typed model name inline");
+        let editor = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            editor.contains("Model: provider/custom-model▏"),
+            "rendered={editor:?}"
+        );
         assert_eq!(
             app.handle_config_model_input(key(Key::Enter)),
             ConfigAction::Changed
@@ -8607,6 +8649,40 @@ mod tests {
     }
 
     #[test]
+    fn inline_model_cursor_survives_narrow_redraw_and_navigation() {
+        let mut app = App::default();
+        app.set_config_agents(vec![StoreAgent {
+            identity: "test".into(),
+            name: "Antigravity".into(),
+            adapter: "native".into(),
+            command: "agy".into(),
+            available: true,
+            selected: true,
+            model: None,
+        }]);
+        app.open_config();
+        app.config_selected = CONFIG_SETTING_COUNT;
+        app.handle_config_key(ConfigKey::EditModel);
+        for ch in "provider/very-long-model-name".chars() {
+            app.handle_config_model_input(key(Key::Char(ch)));
+        }
+        app.handle_config_key(ConfigKey::Up);
+        assert_eq!(app.config_selected, CONFIG_SETTING_COUNT);
+        let mut terminal = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("name▏"), "{rendered}");
+        app.cancel_config_model_edit();
+        assert_eq!(app.config_roster_slots()[0].model, None);
+    }
+
+    #[test]
     fn empty_model_name_clears_the_saved_override() {
         let mut app = App::default();
         app.set_config_agents(vec![StoreAgent {
@@ -8620,13 +8696,13 @@ mod tests {
         }]);
         app.open_config();
         app.config_selected = CONFIG_SETTING_COUNT;
-        app.handle_config_key(ConfigKey::Confirm);
+        app.handle_config_key(ConfigKey::EditModel);
         for _ in 0.."old-model".len() {
             app.handle_config_model_input(key(Key::Backspace));
         }
         app.handle_config_model_input(key(Key::Enter));
         assert_eq!(app.config_roster_slots()[0].model, None);
-        assert_eq!(app.status, "Codex model: provider default");
+        assert_eq!(app.status, "Codex: model override cleared for new sessions");
     }
 
     #[test]
@@ -8673,7 +8749,7 @@ mod tests {
         ]);
         app.open_config();
         app.config_selected = CONFIG_SETTING_COUNT + 1;
-        app.handle_config_key(ConfigKey::Confirm);
+        app.handle_config_key(ConfigKey::EditModel);
         for _ in 0.."opus".len() {
             app.handle_config_model_input(key(Key::Backspace));
         }
@@ -9879,7 +9955,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_render_under_the_agent_header_as_a_one_line_sliding_window() {
+    fn tools_use_a_one_line_preview_and_retain_full_expanded_details() {
         let backend = TestBackend::new(72, 12);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let mut app = App::default();
@@ -9919,7 +9995,7 @@ mod tests {
         assert_eq!(rows.iter().filter(|row| row.contains("🔧")).count(), 1);
         assert_eq!(app.toggle_focused_detail(), Some(false));
         let history = app.transcript.viewport(72, 0, 10, 0);
-        assert_eq!(history.len(), 4);
+        assert_eq!(history.len(), 7);
         for title in ["Noisy one", "Noisy two", "Noisy three"] {
             assert_eq!(
                 history
@@ -9929,6 +10005,13 @@ mod tests {
                 1
             );
         }
+        assert_eq!(
+            history
+                .iter()
+                .filter(|row| row.text.contains("tool output that remains available"))
+                .count(),
+            6
+        );
         assert!(
             app.export_markdown()
                 .contains("tool output that remains available")
@@ -10136,8 +10219,7 @@ mod tests {
                 .any(|row| row.text.contains("Run tests") && row.text.contains("second line")),
             "collapsed={collapsed:?}"
         );
-        // Expanding the focused detail keeps one physical row per call with
-        // the same excerpt rather than replaying the full output history.
+        // Expanding the focused detail exposes every retained output line.
         assert_eq!(app.toggle_focused_detail(), Some(false));
         let expanded = app.transcript.viewport(80, 0, 10, 0);
         assert!(
@@ -10146,7 +10228,8 @@ mod tests {
                 .any(|row| row.text.contains("Run tests") && row.text.contains("second line")),
             "expanded={expanded:?}"
         );
-        // Export carries the retained call summary, excerpt included.
+        assert!(expanded.iter().any(|row| row.text.contains("large output")));
+        // Export carries both the complete detail and the compact call summary.
         let markdown = app.export_markdown();
         assert!(markdown.contains("## Tool"), "markdown={markdown:?}");
         assert!(
@@ -10157,7 +10240,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_tool_history_is_capped_and_keeps_one_row_per_call() {
+    fn expanded_tool_history_is_capped_and_keeps_full_details() {
         let mut app = App::default();
         for index in 0..25 {
             app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
@@ -10179,10 +10262,14 @@ mod tests {
 
         assert_eq!(app.toggle_focused_detail(), Some(false));
         let rows = app.transcript.viewport(48, 0, 100, 0);
-        assert_eq!(rows.len(), MAX_TOOL_HISTORY_ROWS + 1);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.text.contains("old output"))
+                .count(),
+            MAX_TOOL_HISTORY_ROWS
+        );
         assert!(rows.iter().any(|row| row.text.contains("Tool 5")));
         assert!(rows.iter().any(|row| row.text.contains("Tool 24")));
-        assert!(rows.iter().all(|row| !row.text.contains("old output")));
         assert!(rows.iter().all(|row| !row.text.contains("tool calls")));
     }
 

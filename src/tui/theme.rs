@@ -53,7 +53,7 @@ impl Theme {
                 _ => super::AGENT_COLORS
                     .iter()
                     .position(|candidate| *candidate == color)
-                    .map(|index| [Magenta, Yellow, Red, Green][index])
+                    .map(|index| [Magenta, LightBlue, Red, Green][index])
                     .unwrap_or(color),
             };
         }
@@ -138,14 +138,14 @@ impl Theme {
                     if light {
                         [
                             Rgb(130, 45, 175),
-                            Rgb(150, 80, 0),
+                            Rgb(35, 80, 170),
                             Rgb(170, 35, 80),
                             Rgb(25, 110, 45),
                         ][index]
                     } else {
                         [
                             Rgb(205, 145, 245),
-                            Rgb(240, 180, 100),
+                            Rgb(130, 175, 255),
                             Rgb(255, 135, 175),
                             Rgb(110, 210, 140),
                         ][index]

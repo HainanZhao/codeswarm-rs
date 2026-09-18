@@ -2256,6 +2256,7 @@ pub struct AgyAdapter {
     command: String,
     mode: String,
     mode_policy: String,
+    model: Option<String>,
     session_id: Option<String>,
     child: Option<Child>,
     sender: mpsc::Sender<AdapterResult<AgentEvent>>,
@@ -2276,6 +2277,7 @@ impl AgyAdapter {
             command: command.into(),
             mode: "default".into(),
             mode_policy: "agy:full-access".into(),
+            model: None,
             session_id: None,
             child: None,
             sender,
@@ -2343,7 +2345,7 @@ impl AgentAdapter for AgyAdapter {
             supports_permissions: false,
             supports_terminals: true,
             supports_session_load: true,
-            supports_models: false,
+            supports_models: true,
         }
     }
 
@@ -2397,6 +2399,9 @@ impl AgentAdapter for AgyAdapter {
         }
         if self.mode != "default" {
             command.arg("--mode").arg(&self.mode);
+        }
+        if let Some(model) = &self.model {
+            command.arg("--model").arg(model);
         }
         let mut child = command
             .spawn()
@@ -2463,6 +2468,11 @@ impl AgentAdapter for AgyAdapter {
                 }
                 if value.get("event").and_then(Value::as_str) == Some("result") {
                     result = value.get("result").cloned();
+                }
+                if let Some(thought) = parse_agy_thought(slot, &value)
+                    && sender.send(Ok(thought)).await.is_err()
+                {
+                    break;
                 }
                 match parse_agy_value(slot, &value) {
                     Ok(Some(event)) => {
@@ -2586,6 +2596,17 @@ impl AgentAdapter for AgyAdapter {
         Ok(())
     }
 
+    async fn set_model(&mut self, model: String) -> AdapterResult<()> {
+        let model = model.trim();
+        if model.is_empty() || model.chars().any(char::is_control) {
+            return Err(AdapterError::Protocol(
+                "model must be a non-empty, single-line name".into(),
+            ));
+        }
+        self.model = Some(model.to_owned());
+        Ok(())
+    }
+
     async fn reload(&mut self) -> AdapterResult<()> {
         self.stop().await?;
         self.start().await
@@ -2666,28 +2687,92 @@ fn parse_agy_value(slot: RosterSlot, value: &Value) -> AdapterResult<Option<Agen
     }
 }
 
+fn parse_agy_thought(slot: RosterSlot, value: &Value) -> Option<AgentEvent> {
+    let update = value.get("step_update")?;
+    if !matches!(
+        update.get("step_type").and_then(Value::as_str),
+        Some("agent_response" | "checkpoint")
+    ) || update.get("state").and_then(Value::as_str) != Some("DONE")
+    {
+        return None;
+    }
+    let tokens = update
+        .get("usage")?
+        .get("thinking_tokens")?
+        .as_u64()
+        .filter(|tokens| *tokens > 0)?;
+    Some(AgentEvent::Thought {
+        slot,
+        text: format!("Antigravity reasoning · {tokens} thinking tokens"),
+    })
+}
+
 fn parse_agy_tool(slot: RosterSlot, value: &Value) -> Option<AgentEvent> {
     let update = value.get("step_update")?;
     if update.get("step_type")?.as_str()? != "tool" {
         return None;
     }
     let step_index = update.get("step_index")?.as_i64()?;
-    let title = update
+    let tool_name = update
         .get("tool_name")
         .and_then(Value::as_str)
-        .unwrap_or("Tool call")
-        .replace('_', " ");
+        .or_else(|| {
+            update
+                .get("tool_info")
+                .and_then(|info| info.get("name"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("tool");
+    let tool_info = update.get("tool_info");
+    let parameters = tool_info.and_then(|info| info.get("parameters"));
+    let error = tool_info.and_then(|info| info.get("error"));
+    let title = parameters.and_then(agy_tool_target).map_or_else(
+        || tool_name.replace('_', " "),
+        |target| format!("{} · {target}", tool_name.replace('_', " ")),
+    );
     let status = match update.get("state").and_then(Value::as_str) {
         Some("DONE") => ToolStatus::Completed,
-        Some("FAILED") => ToolStatus::Failed,
+        Some("FAILED" | "ERROR") => ToolStatus::Failed,
         Some("ACTIVE") => ToolStatus::Running,
         _ => ToolStatus::Pending,
     };
-    let detail = update
-        .get("tool_info")
-        .and_then(|info| info.get("output"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let status = if error.is_some_and(|error| !error.is_null()) {
+        ToolStatus::Failed
+    } else {
+        status
+    };
+    let mut sections = Vec::new();
+    if let Some(parameters) = parameters {
+        sections.push(format!(
+            "Parameters\n{}",
+            serde_json::to_string_pretty(parameters).unwrap_or_else(|_| parameters.to_string())
+        ));
+    }
+    if let Some(output) = tool_info.and_then(|info| info.get("output")) {
+        let output = output.as_str().map(str::to_owned).unwrap_or_else(|| {
+            serde_json::to_string_pretty(output).unwrap_or_else(|_| output.to_string())
+        });
+        if !output.is_empty() {
+            sections.push(format!("Output\n{output}"));
+        }
+    }
+    if let Some(error) = error.filter(|error| !error.is_null()) {
+        let error = error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                serde_json::to_string_pretty(error).unwrap_or_else(|_| error.to_string())
+            });
+        sections.push(format!("Error\n{error}"));
+    }
+    if let Some(subagents) = update.get("subagent_info") {
+        sections.push(format!(
+            "Subagents\n{}",
+            serde_json::to_string_pretty(subagents).unwrap_or_else(|_| subagents.to_string())
+        ));
+    }
+    let detail = (!sections.is_empty()).then(|| sections.join("\n\n"));
     Some(AgentEvent::Tool {
         slot,
         update: ToolUpdate {
@@ -2697,6 +2782,21 @@ fn parse_agy_tool(slot: RosterSlot, value: &Value) -> Option<AgentEvent> {
             detail,
         },
     })
+}
+
+fn agy_tool_target(parameters: &Value) -> Option<String> {
+    [
+        "AbsolutePath",
+        "TargetFile",
+        "DirectoryPath",
+        "SearchPath",
+        "Url",
+        "CommandLine",
+    ]
+    .into_iter()
+    .find_map(|key| parameters.get(key).and_then(Value::as_str))
+    .filter(|target| !target.is_empty())
+    .map(str::to_owned)
 }
 
 /// Stdio ACP transport. Protocol-specific response handling belongs here,
@@ -4271,8 +4371,9 @@ fn rpc_id_to_string(value: &Value) -> String {
 mod tests {
     use super::{
         AcpAdapter, AdapterHost, AgentAdapter, AgyAdapter, MAX_ACP_LINE_BYTES, MAX_FILE_READ_BYTES,
-        RelayHost, ScriptedAdapter, parse_acp_notification, parse_agy_line, parse_command_line,
-        parse_model_config, prompt_content_blocks, read_bounded_line,
+        RelayHost, ScriptedAdapter, parse_acp_notification, parse_agy_line, parse_agy_thought,
+        parse_agy_value, parse_command_line, parse_model_config, prompt_content_blocks,
+        read_bounded_line,
     };
     #[cfg(target_os = "linux")]
     use super::{isolate_process_group, terminate_child};
@@ -4283,7 +4384,7 @@ mod tests {
         relay::{CollaborationStrategy, DEFAULT_STOP_ACKNOWLEDGMENT, RelayDecision, STOP_TOKEN},
     };
     use async_trait::async_trait;
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::collections::VecDeque;
     use std::sync::{
         Arc, Mutex,
@@ -5389,6 +5490,82 @@ mod tests {
     }
 
     #[test]
+    fn native_view_file_preserves_stream_without_substituting_local_contents() {
+        let root = unique_test_path("codeswarm-agy-view", "dir");
+        std::fs::create_dir_all(root.join("src")).expect("workspace");
+        let path = root.join("src/example.rs");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").expect("fixture");
+        let event = parse_agy_value(
+            1,
+            &json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "tool",
+                    "step_index": 7,
+                    "tool_name": "view_file",
+                    "state": "DONE",
+                    "tool_info": {
+                        "name": "view_file",
+                        "parameters": {
+                            "AbsolutePath": path,
+                            "StartLine": 2,
+                            "EndLine": 3
+                        },
+                        "output": "4 lines, 19 bytes"
+                    }
+                }
+            }),
+        )
+        .expect("valid view-file update")
+        .expect("tool event");
+        assert!(matches!(
+            event,
+            AgentEvent::Tool { update, .. }
+                if update.title.contains("src/example.rs")
+                    && update.detail.as_deref().is_some_and(|detail| {
+                        detail.contains("StartLine")
+                            && !detail.contains("two\nthree")
+                            && detail.contains("4 lines, 19 bytes")
+                    })
+        ));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn native_stream_preserves_tool_errors_and_reasoning_token_signal() {
+        let tool = parse_agy_line(
+            1,
+            r#"{"event":"step_update","step_update":{"step_type":"tool","step_index":2,"tool_name":"run_command","state":"ERROR","tool_info":{"parameters":{"CommandLine":"false"},"error":{"type":"exit","message":"status 1"}}}}"#,
+        )
+        .expect("valid tool update")
+        .expect("tool event");
+        assert!(matches!(
+            tool,
+            AgentEvent::Tool { update, .. }
+                if update.status == ToolStatus::Failed
+                    && update.title.contains("false")
+                    && update.detail.as_deref().is_some_and(|detail| detail.contains("status 1"))
+        ));
+        let thought = parse_agy_thought(
+            1,
+            &json!({
+                "event": "step_update",
+                "step_update": {
+                    "step_type": "agent_response",
+                    "state": "DONE",
+                    "text_delta": "answer",
+                    "usage": {"thinking_tokens": 42}
+                }
+            }),
+        )
+        .expect("reasoning event");
+        assert!(matches!(
+            thought,
+            AgentEvent::Thought { text, .. } if text.contains("42 thinking tokens")
+        ));
+    }
+
+    #[test]
     fn parses_terminal_lifecycle_from_acp_and_native_events() {
         let created = parse_acp_notification(
             0,
@@ -5499,6 +5676,43 @@ mod tests {
             adapter.next_event().await,
             Some(Ok(AgentEvent::ModesReplaced { current_mode: Some(mode), .. })) if mode == "agy:full-access"
         ));
+    }
+
+    #[tokio::test]
+    async fn native_antigravity_forwards_the_typed_model_name() {
+        let script_path = unique_test_path("codeswarm-agy-model", "sh");
+        let args_path = unique_test_path("codeswarm-agy-model-args", "txt");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\n' '{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"ok\"}}}}'\n",
+                args_path.display()
+            ),
+        )
+        .expect("script");
+        let mut adapter = AgyAdapter::new(
+            0,
+            std::env::current_dir().expect("cwd"),
+            format!("sh {}", script_path.display()),
+        );
+        adapter
+            .set_model("gemini-custom".into())
+            .await
+            .expect("typed model");
+        adapter.start().await.expect("start");
+        assert!(adapter.capabilities().supports_models);
+        assert!(adapter.next_event().await.is_some());
+        assert!(adapter.next_event().await.is_some());
+        adapter.send_prompt("test".into()).await.expect("prompt");
+        while !matches!(
+            adapter.next_event().await,
+            Some(Ok(AgentEvent::TurnComplete { .. }))
+        ) {}
+        let args = std::fs::read_to_string(&args_path).expect("args");
+        assert!(args.contains("--model gemini-custom"), "{args}");
+        adapter.stop().await.expect("stop");
+        std::fs::remove_file(script_path).expect("cleanup script");
+        std::fs::remove_file(args_path).expect("cleanup args");
     }
 
     #[tokio::test]

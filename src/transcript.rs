@@ -380,10 +380,6 @@ impl Transcript {
                 }
                 let lines = if block.kind == BlockKind::Thought && block.collapsed {
                     body.split('\n').map(str::to_owned).collect()
-                } else if block.kind == BlockKind::Tool && !block.collapsed {
-                    body.lines()
-                        .map(|line| truncate_chars(line, width))
-                        .collect()
                 } else {
                     wrap(body, width)
                 };
@@ -420,15 +416,7 @@ impl Transcript {
                 }
                 continue;
             }
-            let lines = if block.kind == BlockKind::Tool {
-                block
-                    .source
-                    .lines()
-                    .map(|line| truncate_chars(line, width))
-                    .collect()
-            } else {
-                wrap(&block.source, width)
-            };
+            let lines = wrap(&block.source, width);
             for (line_index, line) in lines.into_iter().enumerate() {
                 self.rows.push(RenderRow {
                     block_id: block.id,
@@ -519,7 +507,7 @@ fn rolling_tool_preview(source: &str, width: usize) -> String {
     let latest = source
         .lines()
         .rev()
-        .find(|line| !line.trim().is_empty())
+        .find(|line| !line.trim().is_empty() && !line.starts_with("  "))
         .unwrap_or(source);
     let content = latest
         .trim_start_matches('🔧')

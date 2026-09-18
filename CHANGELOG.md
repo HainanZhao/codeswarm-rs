@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.20] - 2026-09-18
+
+### Changed
+
+- Edit roster model names inline with Space, remove protocol/readiness clutter
+  from roster rows, and use a blue identity accent for the second agent.
+- Keep the model cursor visible in narrow panes and preserve edit focus while
+  scrolling. Wrap expanded tool output so long lines remain readable.
+
+### Fixed
+
+- Preserve Antigravity tool parameters, errors, subagent metadata, and full
+  streamed output in expanded details. Show file paths without substituting
+  current local file contents for the agent's actual output.
+- Forward typed model names to Antigravity with `--model` and surface its
+  reasoning-token signal instead of silently dropping it.
+
 ## [0.10.19] - 2026-09-18
 
 ### Fixed

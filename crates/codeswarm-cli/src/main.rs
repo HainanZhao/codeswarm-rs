@@ -332,7 +332,7 @@ impl ConfigInputDecoder {
             KeyCode::Down => Some(ConfigKey::Down),
             KeyCode::Left => Some(ConfigKey::PreviousValue),
             KeyCode::Right => Some(ConfigKey::NextValue),
-            KeyCode::Char(' ') => Some(ConfigKey::ToggleSlot),
+            KeyCode::Char(' ') => Some(ConfigKey::EditModel),
             KeyCode::Enter => Some(ConfigKey::Confirm),
             KeyCode::Esc => {
                 self.escape_at = Some(now);
@@ -5542,15 +5542,15 @@ mod tests {
             assert!(visible.contains("Solo ACP"));
             assert!(visible.contains(peer), "saved ACP peer must be visible");
             assert!(
-                visible.contains("missing"),
+                visible.contains("not installed"),
                 "missing commands stay inspectable"
             );
             assert!(!visible.contains("Invalid ACP"));
             if peer == "Replacement ACP" {
                 assert!(!visible.contains("First saved ACP"));
             }
-            // The final catalog row is the saved peer, and Space must reach it.
-            app.handle_config_key(ConfigKey::ToggleSlot);
+            // The final catalog row is the saved peer, and Enter must reach it.
+            app.handle_config_key(ConfigKey::Confirm);
             assert_eq!(
                 app.config_roster_identities(),
                 ["solo.example", "peer.example"]
@@ -6159,7 +6159,7 @@ done
                 10
             ));
         }
-        app.handle_config_key(ConfigKey::ToggleSlot);
+        app.handle_config_key(ConfigKey::Confirm);
         assert_eq!(app.config_roster_identities(), ["agent-11"]);
         assert_eq!(app.scroll_y, 7);
         app.handle_config_key(ConfigKey::Cancel);
@@ -6254,7 +6254,7 @@ done
         );
         assert_eq!(
             decoder.decode(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), now),
-            Some(ConfigKey::ToggleSlot)
+            Some(ConfigKey::EditModel)
         );
         let mut decoder = ConfigInputDecoder::new(Duration::from_millis(650));
         assert_eq!(
