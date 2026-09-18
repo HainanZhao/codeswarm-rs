@@ -4224,19 +4224,6 @@ fn run_terminal(
                             pending_permission = None;
                             app.clear_terminal_alerts();
                         }
-                        if let Some(log) = &event_log {
-                            let _ = log.append(&event);
-                            // Checkpoint only at turn boundaries. Streamed
-                            // chunks stay off the terminal thread's fsync
-                            // path while still making completed turns
-                            // recoverable after an abrupt process exit.
-                            if matches!(
-                                &event,
-                                AgentEvent::TurnComplete { .. } | AgentEvent::BatchComplete { .. }
-                            ) {
-                                let _ = log.flush();
-                            }
-                        }
                         app.apply_event(&event);
                         if should_apply_configured_models(&event)
                             && let Some(controls) = &controls
@@ -4320,6 +4307,18 @@ fn run_terminal(
                             && dispatch_next_pending_prompt(app, controls.as_ref(), &mut journal)
                         {
                             turn_active = true;
+                        }
+                        if let Some(log) = &event_log {
+                            let checkpoint = matches!(
+                                &event,
+                                AgentEvent::TurnComplete { .. } | AgentEvent::BatchComplete { .. }
+                            );
+                            // Ownership moves into the writer so even JSON
+                            // serialization stays off the terminal thread.
+                            let _ = log.append_owned(event);
+                            if checkpoint {
+                                let _ = log.flush();
+                            }
                         }
                     }
                     Err(error) => {

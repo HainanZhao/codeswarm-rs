@@ -545,10 +545,12 @@ impl EventLog {
 }
 
 enum BufferedLogCommand {
-    Append(String),
+    Append(AgentEvent),
     Flush(Sender<std::io::Result<()>>),
     Shutdown(Sender<std::io::Result<()>>),
 }
+
+const MAX_EVENT_LOG_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Background event-log writer used to keep terminal input/render handling
 /// independent from filesystem latency. The channel is intentionally
@@ -581,13 +583,17 @@ impl BufferedEventLog {
         })
     }
 
-    /// Serialize and queue a normalized event without opening a file or
-    /// waiting on a filesystem operation in the caller.
+    /// Queue a normalized event without serializing it, opening a file, or
+    /// waiting on filesystem work in the caller.
     pub fn append(&self, event: &AgentEvent) -> std::io::Result<()> {
-        let encoded = serde_json::to_string(event)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        self.append_owned(event.clone())
+    }
+
+    /// Queue an owned event so JSON serialization also happens off the
+    /// terminal thread. Prefer this when the caller no longer needs the event.
+    pub fn append_owned(&self, event: AgentEvent) -> std::io::Result<()> {
         self.sender
-            .send(BufferedLogCommand::Append(format!("{encoded}\n")))
+            .send(BufferedLogCommand::Append(event))
             .map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -636,11 +642,36 @@ fn buffered_log_worker(
     path: PathBuf,
     receiver: Receiver<BufferedLogCommand>,
 ) -> std::io::Result<()> {
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    buffered_log_worker_with_limit(path, receiver, MAX_EVENT_LOG_BYTES)
+}
+
+fn buffered_log_worker_with_limit(
+    path: PathBuf,
+    receiver: Receiver<BufferedLogCommand>,
+    max_bytes: u64,
+) -> std::io::Result<()> {
+    rotate_event_log(&path, max_bytes)?;
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
     let mut writer = BufWriter::new(file);
+    let mut bytes = writer.get_ref().metadata()?.len();
     while let Ok(command) = receiver.recv() {
         match command {
-            BufferedLogCommand::Append(line) => writer.write_all(line.as_bytes())?,
+            BufferedLogCommand::Append(event) => {
+                let mut line = serde_json::to_vec(&event)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                line.push(b'\n');
+                if bytes > 0 && bytes.saturating_add(line.len() as u64) > max_bytes {
+                    writer.flush()?;
+                    writer.get_ref().sync_data()?;
+                    drop(writer);
+                    rotate_event_log(&path, 0)?;
+                    writer =
+                        BufWriter::new(OpenOptions::new().create(true).append(true).open(&path)?);
+                    bytes = 0;
+                }
+                writer.write_all(&line)?;
+                bytes = bytes.saturating_add(line.len() as u64);
+            }
             BufferedLogCommand::Flush(reply) => {
                 let result = writer.flush().and_then(|()| writer.get_ref().sync_data());
                 let _ = reply.send(result);
@@ -666,8 +697,30 @@ fn buffered_log_worker(
     writer.flush()
 }
 
+fn rotate_event_log(path: &Path, max_bytes: u64) -> std::io::Result<()> {
+    let size = match std::fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if size <= max_bytes {
+        return Ok(());
+    }
+    let mut previous = path.as_os_str().to_owned();
+    previous.push(".previous");
+    let previous = PathBuf::from(previous);
+    match std::fs::remove_file(&previous) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::fs::rename(path, previous)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{AgentCapabilities, AgentEvent, Effect, Mode, SessionState, reduce};
@@ -836,6 +889,43 @@ mod tests {
         );
         drop(buffered);
         std::fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn buffered_event_log_rotates_without_losing_the_latest_event() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("codeswarm-rotate-{unique}.jsonl"));
+        let (sender, receiver) = mpsc::channel();
+        let worker_path = path.clone();
+        let worker = std::thread::spawn(move || {
+            super::buffered_log_worker_with_limit(worker_path, receiver, 100)
+        });
+        for text in [
+            "first event with enough content to rotate",
+            "latest event remains",
+        ] {
+            sender
+                .send(super::BufferedLogCommand::Append(AgentEvent::Text {
+                    slot: 0,
+                    text: text.repeat(3),
+                }))
+                .unwrap();
+        }
+        let (reply, result) = mpsc::channel();
+        sender
+            .send(super::BufferedLogCommand::Shutdown(reply))
+            .unwrap();
+        result.recv().unwrap().unwrap();
+        worker.join().unwrap().unwrap();
+        let current = super::EventLog::open(&path).read().unwrap();
+        assert!(matches!(&current[..], [AgentEvent::Text { text, .. }] if text.contains("latest")));
+        let previous = PathBuf::from(format!("{}.previous", path.display()));
+        assert!(previous.exists());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(previous).unwrap();
     }
 
     #[test]

@@ -1001,6 +1001,7 @@ struct StatusBanner {
 
 #[derive(Clone, Debug)]
 struct ToolCall {
+    block_id: u64,
     id: String,
     title: String,
     status: ToolStatus,
@@ -1012,10 +1013,8 @@ struct ToolCall {
 
 #[derive(Debug)]
 struct ToolWindow {
-    block_id: u64,
     prefix: String,
     calls: VecDeque<ToolCall>,
-    latest: String,
     last_tick: Option<Instant>,
 }
 
@@ -3410,16 +3409,16 @@ impl App {
                     activity.outcome = Some("completion not reported".into());
                 }
             }
+            let collapsed = self.transcript.is_collapsed(call.block_id) != Some(false);
+            self.transcript.replace(
+                call.block_id,
+                crate::transcript::BlockKind::Tool,
+                tool_call_source(&window.prefix, call),
+                collapsed,
+            );
+            self.transcript
+                .set_preview(call.block_id, tool_call_preview(call));
         }
-        let collapsed = self.transcript.is_collapsed(window.block_id) != Some(false);
-        self.transcript.replace(
-            window.block_id,
-            crate::transcript::BlockKind::Tool,
-            tool_window_source(&window),
-            collapsed,
-        );
-        self.transcript
-            .set_preview(window.block_id, tool_window_preview(&window));
     }
 
     fn apply_history(&mut self, slot: usize, content: &codeswarm_adapters::HistoryContent) {
@@ -3664,7 +3663,11 @@ impl App {
                         .streaming_blocks
                         .get(&(*slot, crate::transcript::BlockKind::Thought))
                         .copied();
-                    let tool = self.tool_windows.get(slot).map(|window| window.block_id);
+                    let tool = self
+                        .tool_windows
+                        .get(slot)
+                        .and_then(|window| window.calls.front())
+                        .map(|call| call.block_id);
                     // Output stays above its live details even when thoughts/tools arrive first.
                     for detail in thought.into_iter().chain(tool) {
                         self.transcript.move_before(id, detail);
@@ -3687,8 +3690,13 @@ impl App {
                         !self.show_thoughts,
                     );
                     self.streaming_blocks.insert(key, id);
-                    if let Some(window) = self.tool_windows.get(slot) {
-                        self.transcript.move_before(id, window.block_id);
+                    if let Some(block_id) = self
+                        .tool_windows
+                        .get(slot)
+                        .and_then(|window| window.calls.front())
+                        .map(|call| call.block_id)
+                    {
+                        self.transcript.move_before(id, block_id);
                     }
                     id
                 });
@@ -3714,60 +3722,65 @@ impl App {
                 }
                 if !self.tool_windows.contains_key(slot) {
                     let prefix = agent_message_prefix(&self.agent_name(*slot));
-                    let block_id = self.transcript.append(
-                        crate::transcript::BlockKind::Tool,
-                        prefix.clone(),
-                        true,
-                    );
                     self.tool_windows.insert(
                         *slot,
                         ToolWindow {
-                            block_id,
                             prefix,
                             calls: VecDeque::new(),
-                            latest: update.id.clone(),
                             last_tick: None,
                         },
                     );
                 }
-                let (block_id, source) = {
-                    let window = self
-                        .tool_windows
-                        .get_mut(slot)
-                        .expect("tool window inserted");
-                    window.latest = update.id.clone();
-                    let position = window.calls.iter().position(|call| call.id == update.id);
-                    let started = position
-                        .map(|i| window.calls[i].started)
-                        .unwrap_or_else(Instant::now);
-                    let call = ToolCall {
-                        id: update.id.clone(),
-                        title: update.title.clone(),
-                        status: update.status,
-                        detail: update.detail.clone(),
-                        activity: update.activity.clone(),
-                        started,
-                        elapsed: matches!(
-                            update.status,
-                            ToolStatus::Completed | ToolStatus::Failed
+                let position = self.tool_windows[slot]
+                    .calls
+                    .iter()
+                    .position(|call| call.id == update.id);
+                let started = position
+                    .map(|index| self.tool_windows[slot].calls[index].started)
+                    .unwrap_or_else(Instant::now);
+                let block_id = position
+                    .map(|index| self.tool_windows[slot].calls[index].block_id)
+                    .unwrap_or_else(|| {
+                        self.transcript.append(
+                            crate::transcript::BlockKind::Tool,
+                            self.tool_windows[slot].prefix.clone(),
+                            true,
                         )
+                    });
+                let call = ToolCall {
+                    block_id,
+                    id: update.id.clone(),
+                    title: update.title.clone(),
+                    status: update.status,
+                    detail: update.detail.clone(),
+                    activity: update.activity.clone(),
+                    started,
+                    elapsed: matches!(update.status, ToolStatus::Completed | ToolStatus::Failed)
                         .then(|| started.elapsed().as_secs()),
-                    };
-                    if let Some(position) = position {
-                        window.calls[position] = call;
-                    } else {
-                        window.calls.push_back(call);
-                    }
-                    (window.block_id, tool_window_source(window))
                 };
+                if let Some(position) = position {
+                    self.tool_windows.get_mut(slot).expect("tool window").calls[position] = call;
+                } else {
+                    self.tool_windows
+                        .get_mut(slot)
+                        .expect("tool window")
+                        .calls
+                        .push_back(call);
+                }
+                let window = &self.tool_windows[slot];
+                let call = window
+                    .calls
+                    .iter()
+                    .find(|call| call.id == update.id)
+                    .expect("tool call inserted");
                 let _ = self.transcript.replace(
                     block_id,
                     crate::transcript::BlockKind::Tool,
-                    source,
+                    tool_call_source(&window.prefix, call),
                     self.transcript.is_collapsed(block_id) != Some(false),
                 );
                 self.transcript
-                    .set_preview(block_id, tool_window_preview(&self.tool_windows[slot]));
+                    .set_preview(block_id, tool_call_preview(call));
                 let executing = matches!(update.status, ToolStatus::Pending | ToolStatus::Running);
                 if executing || update.status == ToolStatus::Failed {
                     self.thinking_agents.remove(slot);
@@ -4307,8 +4320,13 @@ fn render_content(frame: &mut Frame, app: &mut App) {
             .is_none_or(|tick| now.duration_since(tick) >= Duration::from_secs(1))
         {
             window.last_tick = Some(now);
-            app.transcript
-                .set_preview(window.block_id, tool_window_preview(window));
+            for call in window.calls.iter().filter(|call| {
+                call.activity.is_some()
+                    && matches!(call.status, ToolStatus::Pending | ToolStatus::Running)
+            }) {
+                app.transcript
+                    .set_preview(call.block_id, tool_call_preview(call));
+            }
         }
     }
     if !app.store_editing_directory {
@@ -4507,65 +4525,49 @@ fn tool_call_summary(title: &str, status: ToolStatus) -> String {
     parts.join(" · ")
 }
 
-fn tool_window_source(window: &ToolWindow) -> String {
-    let calls = window
-        .calls
-        .iter()
-        .map(|call| {
-            if let Some(activity) = &call.activity {
-                let summary = activity.summary(
-                    call.status,
-                    Some(
-                        call.elapsed
-                            .unwrap_or_else(|| call.started.elapsed().as_secs()),
-                    ),
-                );
-                let detail = activity
-                    .details()
-                    .lines()
-                    .map(|line| format!("  {line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                return format!("{summary}\n{detail}");
+fn tool_call_source(prefix: &str, call: &ToolCall) -> String {
+    let body = if let Some(activity) = &call.activity {
+        let summary = activity.summary(
+            call.status,
+            Some(
+                call.elapsed
+                    .unwrap_or_else(|| call.started.elapsed().as_secs()),
+            ),
+        );
+        let detail = activity
+            .details()
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{summary}\n{detail}")
+    } else {
+        let mut summary = tool_call_summary(&call.title, call.status);
+        if let Some(detail) = call.detail.as_deref().filter(|detail| !detail.is_empty()) {
+            if let Some(preview) = detail.lines().rev().find(|line| !line.trim().is_empty()) {
+                if !summary.is_empty() {
+                    summary.push_str(" · ");
+                }
+                summary.push_str(&preview.split_whitespace().collect::<Vec<_>>().join(" "));
             }
-            let mut summary = tool_call_summary(&call.title, call.status);
-            if let Some(detail) = call.detail.as_deref().filter(|detail| !detail.is_empty()) {
-                if let Some(preview) = detail.lines().rev().find(|line| !line.trim().is_empty()) {
-                    if !summary.is_empty() {
-                        summary.push_str(" · ");
-                    }
-                    summary.push_str(&preview.split_whitespace().collect::<Vec<_>>().join(" "));
-                }
-                let detail = detail
-                    .lines()
-                    .map(|line| format!("  {line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if summary.is_empty() {
-                    detail
-                } else {
-                    format!("{detail}\n{summary}")
-                }
+            let detail = detail
+                .lines()
+                .map(|line| format!("  {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if summary.is_empty() {
+                detail
             } else {
-                summary
+                format!("{detail}\n{summary}")
             }
-        })
-        .filter(|row| !row.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("{}{}", window.prefix, calls)
+        } else {
+            summary
+        }
+    };
+    format!("{prefix}{body}")
 }
 
-fn tool_window_preview(window: &ToolWindow) -> Option<String> {
-    let call = window
-        .calls
-        .iter()
-        .rev()
-        .find(|call| {
-            call.activity.is_some()
-                && matches!(call.status, ToolStatus::Pending | ToolStatus::Running)
-        })
-        .or_else(|| window.calls.iter().find(|call| call.id == window.latest))?;
+fn tool_call_preview(call: &ToolCall) -> Option<String> {
     call.activity.as_ref().map(|activity| {
         activity.summary(
             call.status,
@@ -8005,7 +8007,10 @@ mod tests {
             });
         }
         assert!(!footer_agent_label(&app, 0, 1).contains("tool"));
-        assert_eq!(app.transcript.row_count(80), 2);
+        assert_eq!(app.transcript.row_count(80), 3);
+        let rows = app.transcript.viewport(80, 0, 10, 0);
+        assert!(rows.iter().any(|row| row.text.contains("Read files")));
+        assert!(rows.iter().any(|row| row.text.contains("Search code")));
 
         app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
         assert!(!footer_agent_label(&app, 0, 1).contains("1:05"));
@@ -10050,7 +10055,7 @@ mod tests {
             text: "reasoning now".into(),
         };
         app.apply_event(&tool(codeswarm_adapters::ToolStatus::Completed));
-        let tool_id = app.tool_windows[&0].block_id;
+        let tool_id = app.tool_windows[&0].calls[0].block_id;
         app.apply_event(&thought);
         let rows = app.transcript.viewport(78, 0, 20, 0);
         assert!(rows.iter().any(|row| row.kind == BlockKind::Thought));
@@ -10215,7 +10220,7 @@ mod tests {
                 },
             });
             let thought = app.streaming_blocks[&(0, BlockKind::Thought)];
-            let tool = app.tool_windows[&0].block_id;
+            let tool = app.tool_windows[&0].calls[0].block_id;
             if expanded {
                 app.transcript.set_collapsed(thought, false);
                 app.transcript.set_collapsed(tool, false);
@@ -10315,13 +10320,13 @@ mod tests {
         app.apply_event(&tool("one", codeswarm_adapters::ToolStatus::Pending));
         app.apply_event(&tool("two", codeswarm_adapters::ToolStatus::Running));
         app.apply_event(&tool("three", codeswarm_adapters::ToolStatus::Running));
-        assert_eq!(app.transcript.len(), 1);
+        assert_eq!(app.transcript.len(), 3);
         assert_eq!(app.tool_windows[&0].calls.len(), 3);
         let preview = app.transcript.viewport(72, 0, 10, 0);
-        assert_eq!(preview.len(), 2);
+        assert_eq!(preview.len(), 4);
         assert!(preview[0].text.starts_with("Antigravity: ["));
-        assert!(preview[1].text.starts_with("Noisy three"));
-        assert!(preview[1].text.contains("tool output"));
+        assert!(preview[3].text.starts_with("Noisy three"));
+        assert!(preview[3].text.contains("tool output"));
 
         terminal
             .draw(|frame| render(frame, &mut app))
@@ -10335,10 +10340,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rows.iter().any(|row| row.contains("Antigravity")));
         assert!(!rows.iter().any(|row| row.contains("Tool ·")));
-        assert_eq!(rows.iter().filter(|row| row.contains("🔧")).count(), 1);
+        assert_eq!(rows.iter().filter(|row| row.contains("🔧")).count(), 3);
         assert_eq!(app.toggle_focused_detail(), Some(false));
         let history = app.transcript.viewport(72, 0, 10, 0);
-        assert_eq!(history.len(), 7);
         for title in ["Noisy one", "Noisy two", "Noisy three"] {
             assert_eq!(
                 history
@@ -10348,12 +10352,10 @@ mod tests {
                 1
             );
         }
-        assert_eq!(
+        assert!(
             history
                 .iter()
-                .filter(|row| row.text.contains("tool output that remains available"))
-                .count(),
-            6
+                .any(|row| row.text.contains("tool output that remains available"))
         );
         assert!(
             app.export_markdown()
@@ -10607,7 +10609,7 @@ mod tests {
             slot: 0,
             update: update.clone(),
         });
-        let block = app.tool_windows[&0].block_id;
+        let block = app.tool_windows[&0].calls[0].block_id;
         app.tool_windows.get_mut(&0).unwrap().calls[0].started =
             std::time::Instant::now() - std::time::Duration::from_secs(8);
         let mut terminal = Terminal::new(TestBackend::new(90, 20)).unwrap();
@@ -10627,7 +10629,7 @@ mod tests {
         update.activity.as_mut().unwrap().output = Some(serde_json::json!("first line\nlast line"));
         update.activity.as_mut().unwrap().exit_code = Some(0);
         app.apply_event(&codeswarm_adapters::AgentEvent::Tool { slot: 0, update });
-        assert_eq!(app.tool_windows[&0].block_id, block);
+        assert_eq!(app.tool_windows[&0].calls[0].block_id, block);
         assert_eq!(app.tool_windows[&0].calls.len(), 1);
         assert_eq!(app.toggle_focused_detail(), Some(false));
         let rows = app.transcript.viewport(90, 0, 100, 0);
@@ -10658,15 +10660,35 @@ mod tests {
             window.calls.front().map(|call| call.id.as_str()),
             Some("call-0")
         );
+        let block_ids = window
+            .calls
+            .iter()
+            .map(|call| call.block_id)
+            .collect::<Vec<_>>();
+        let first_source = app.transcript.source(block_ids[0]).unwrap().to_owned();
+        app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
+            slot: 0,
+            update: codeswarm_adapters::ToolUpdate {
+                activity: None,
+                id: "call-24".into(),
+                title: "Tool 24".into(),
+                status: codeswarm_adapters::ToolStatus::Completed,
+                detail: Some("old output\nrevised latest output 24".into()),
+            },
+        });
+        assert_eq!(app.transcript.len(), 25);
+        assert_eq!(
+            app.transcript.source(block_ids[0]),
+            Some(first_source.as_str())
+        );
 
         assert_eq!(app.toggle_focused_detail(), Some(false));
         let rows = app.transcript.viewport(48, 0, 100, 0);
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.text.contains("old output"))
-                .count(),
-            25
-        );
+        assert!(block_ids.iter().all(|block_id| {
+            app.transcript
+                .source(*block_id)
+                .is_some_and(|source| source.contains("old output"))
+        }));
         assert!(rows.iter().any(|row| row.text.contains("Tool 5")));
         assert!(rows.iter().any(|row| row.text.contains("Tool 24")));
         assert!(rows.iter().all(|row| !row.text.contains("tool calls")));
