@@ -1099,6 +1099,7 @@ pub struct App {
     history_blocks: BTreeMap<usize, (crate::transcript::BlockKind, u64)>,
     history_tools: BTreeMap<(usize, String), u64>,
     thinking_agents: BTreeSet<usize>,
+    turn_text_agents: BTreeSet<usize>,
     focused_detail: Option<u64>,
     detail_controls: Vec<(Rect, u64)>,
     /// Background workspace index used only by the optional `@path` picker.
@@ -1223,6 +1224,7 @@ impl Default for App {
             history_blocks: BTreeMap::new(),
             history_tools: BTreeMap::new(),
             thinking_agents: BTreeSet::new(),
+            turn_text_agents: BTreeSet::new(),
             focused_detail: None,
             detail_controls: Vec::new(),
             path_index: None,
@@ -1335,6 +1337,7 @@ impl App {
                 self.streaming_blocks.clear();
                 self.tool_windows.clear();
                 self.thinking_agents.clear();
+                self.turn_text_agents.clear();
                 self.history_blocks.clear();
                 self.history_tools.clear();
                 self.detail_controls.clear();
@@ -2598,6 +2601,7 @@ impl App {
         self.agent_usage.remove(&slot);
         self.agent_token_usage.remove(&slot);
         self.agent_turn_started.remove(&slot);
+        self.turn_text_agents.remove(&slot);
         if self.next_agent == Some(slot) {
             self.next_agent = self.next_roster_slot_after(slot);
         }
@@ -2678,6 +2682,7 @@ impl App {
     pub fn finish_turn_cancellation(&mut self) {
         for slot in std::mem::take(&mut self.cancelling_agents) {
             self.thinking_agents.remove(&slot);
+            self.turn_text_agents.remove(&slot);
             self.agent_turn_started.remove(&slot);
             self.agent_states.insert(slot, "ready".into());
         }
@@ -2800,6 +2805,7 @@ impl App {
     pub fn mark_agent_reloaded(&mut self, slot: usize) {
         self.failed_agent = None;
         self.agent_turn_started.remove(&slot);
+        self.turn_text_agents.remove(&slot);
         self.agent_states.insert(slot, "starting".into());
         self.status = "reloading agent".into();
     }
@@ -2815,6 +2821,7 @@ impl App {
         self.agent_usage.remove(&slot);
         self.agent_token_usage.remove(&slot);
         self.agent_turn_started.remove(&slot);
+        self.turn_text_agents.remove(&slot);
         if self.next_agent == Some(slot) {
             self.next_agent = self.next_roster_slot_after(slot);
         }
@@ -3492,8 +3499,8 @@ impl App {
     }
 
     /// Apply normalized adapter state without exposing protocol-specific
-    /// objects to the renderer. Text chunks are coalesced into one transcript
-    /// block per active agent turn.
+    /// objects to the renderer. Contiguous chunks of the same kind coalesce,
+    /// while text, thoughts, and tools retain their event timeline.
     pub fn apply_event(&mut self, event: &AgentEvent) {
         // A dropped slot is a tombstone. Adapter transports may already have
         // queued Ready/model/text events when the coordinator drops it; those
@@ -3563,6 +3570,11 @@ impl App {
                 self.status = self.ready_status(*slot);
             }
             AgentEvent::TurnStarted { slot } => {
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Agent));
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Thought));
+                self.turn_text_agents.remove(slot);
                 self.mark_agent_turn_started(*slot);
                 self.active_agent = self.agent_name(*slot);
                 self.agent_states.insert(*slot, "working".into());
@@ -3651,6 +3663,8 @@ impl App {
             AgentEvent::Text { slot, text } => {
                 self.mark_agent_turn_started(*slot);
                 self.thinking_agents.remove(slot);
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Thought));
                 let key = (*slot, crate::transcript::BlockKind::Agent);
                 let block = self.streaming_blocks.get(&key).copied().unwrap_or_else(|| {
                     let id = self.transcript.append(
@@ -3659,22 +3673,10 @@ impl App {
                         false,
                     );
                     self.streaming_blocks.insert(key, id);
-                    let thought = self
-                        .streaming_blocks
-                        .get(&(*slot, crate::transcript::BlockKind::Thought))
-                        .copied();
-                    let tool = self
-                        .tool_windows
-                        .get(slot)
-                        .and_then(|window| window.calls.front())
-                        .map(|call| call.block_id);
-                    // Output stays above its live details even when thoughts/tools arrive first.
-                    for detail in thought.into_iter().chain(tool) {
-                        self.transcript.move_before(id, detail);
-                    }
                     id
                 });
                 self.transcript.extend(block, text);
+                self.turn_text_agents.insert(*slot);
                 self.active_agent = self.agent_name(*slot);
                 self.agent_states.insert(*slot, "working".into());
                 self.status = "streaming".into();
@@ -3682,6 +3684,8 @@ impl App {
             AgentEvent::Thought { slot, text } => {
                 self.mark_agent_turn_started(*slot);
                 self.thinking_agents.insert(*slot);
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Agent));
                 let key = (*slot, crate::transcript::BlockKind::Thought);
                 let id = self.streaming_blocks.get(&key).copied().unwrap_or_else(|| {
                     let id = self.transcript.append(
@@ -3690,14 +3694,6 @@ impl App {
                         !self.show_thoughts,
                     );
                     self.streaming_blocks.insert(key, id);
-                    if let Some(block_id) = self
-                        .tool_windows
-                        .get(slot)
-                        .and_then(|window| window.calls.front())
-                        .map(|call| call.block_id)
-                    {
-                        self.transcript.move_before(id, block_id);
-                    }
                     id
                 });
                 self.transcript.extend(id, text);
@@ -3708,6 +3704,10 @@ impl App {
             }
             AgentEvent::Tool { slot, update } => {
                 self.mark_agent_turn_started(*slot);
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Agent));
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Thought));
                 if update.activity.is_none()
                     && update
                         .title
@@ -3803,6 +3803,10 @@ impl App {
             }
             AgentEvent::Permission { slot, request } => {
                 self.mark_agent_turn_started(*slot);
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Agent));
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Thought));
                 self.active_agent = self.agent_name(*slot);
                 self.agent_states.insert(*slot, "working".into());
                 self.status = format!("permission: {}", request.title);
@@ -3817,6 +3821,10 @@ impl App {
             }
             AgentEvent::Terminal { slot, event } => {
                 self.mark_agent_turn_started(*slot);
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Agent));
+                self.streaming_blocks
+                    .remove(&(*slot, crate::transcript::BlockKind::Thought));
                 let text = match event {
                     TerminalEvent::Created { command, .. } => {
                         format!("{}: {command}", self.agent_name(*slot))
@@ -3837,6 +3845,7 @@ impl App {
             }
             AgentEvent::TurnComplete { slot } => {
                 self.thinking_agents.remove(slot);
+                self.turn_text_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
                 self.streaming_blocks
@@ -3870,9 +3879,7 @@ impl App {
                 self.status = "batch complete".into();
             }
             AgentEvent::UsageLimitReached { slot, detail } => {
-                let had_visible_response = self
-                    .streaming_blocks
-                    .contains_key(&(*slot, crate::transcript::BlockKind::Agent));
+                let had_visible_response = self.turn_text_agents.remove(slot);
                 self.thinking_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
@@ -3914,9 +3921,7 @@ impl App {
                 started,
                 detail,
             } => {
-                let had_visible_response = self
-                    .streaming_blocks
-                    .contains_key(&(*slot, crate::transcript::BlockKind::Agent));
+                let had_visible_response = self.turn_text_agents.remove(slot);
                 self.thinking_agents.remove(slot);
                 self.cancelling_agents.remove(slot);
                 self.agent_turn_started.remove(slot);
@@ -5969,28 +5974,38 @@ fn render_transcript(
         Vec::new()
     } else {
         let mut seen_details = std::collections::BTreeSet::new();
+        let mut detail_run: Option<crate::transcript::BlockKind> = None;
         rows.into_iter()
             .enumerate()
             .map(|(row_index, row)| {
                 let mut in_code = row.code_block;
-                let detail_icon = if area.width >= 2
-                    && matches!(
-                        row.kind,
-                        crate::transcript::BlockKind::Thought | crate::transcript::BlockKind::Tool
-                    )
-                    && seen_details.insert(row.block_id)
-                {
+                let is_detail = matches!(
+                    row.kind,
+                    crate::transcript::BlockKind::Thought | crate::transcript::BlockKind::Tool
+                );
+                let leads_block = is_detail && seen_details.insert(row.block_id);
+                let detail_icon = if area.width >= 2 && leads_block {
+                    // Every row stays clickable, but only the first of a
+                    // consecutive same-kind run repeats the emoji: ten reads in
+                    // a row are one list, not ten icons.
                     app.detail_controls.push((
                         Rect::new(area.x, area.y + row_index as u16, 2, 1),
                         row.block_id,
                     ));
-                    Some(if row.kind == crate::transcript::BlockKind::Thought {
-                        "💭 "
-                    } else {
-                        "🔧 "
+                    (detail_run != Some(row.kind)).then(|| {
+                        if row.kind == crate::transcript::BlockKind::Thought {
+                            "💭 "
+                        } else {
+                            "🔧 "
+                        }
                     })
                 } else {
                     None
+                };
+                detail_run = match (is_detail, leads_block) {
+                    (true, true) => Some(row.kind),
+                    (true, false) => detail_run,
+                    (false, _) => None,
                 };
                 let marker = if let Some(icon) = detail_icon {
                     icon
@@ -10095,7 +10110,7 @@ mod tests {
     }
 
     #[test]
-    fn live_details_follow_the_message_for_every_initial_event_order() {
+    fn live_text_thoughts_and_tools_follow_their_event_timeline() {
         let events = [
             codeswarm_adapters::AgentEvent::Text {
                 slot: 0,
@@ -10130,31 +10145,20 @@ mod tests {
                 app.transcript.row_count(78);
                 app.transcript.row_count(77);
             }
-            app.apply_event(&codeswarm_adapters::AgentEvent::Text {
-                slot: 0,
-                text: " continued".into(),
-            });
-            app.apply_event(&codeswarm_adapters::AgentEvent::Thought {
-                slot: 0,
-                text: " latest".into(),
-            });
             let rows = app.transcript.viewport(78, 0, 20, 0);
-            assert_eq!(rows[1].text, "answer continued", "{order:?}");
-            assert_eq!(rows[2].text, "reasoning latest");
-            assert!(rows[3].text.starts_with("Read file"));
-            let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
-            terminal.draw(|frame| render(frame, &mut app)).unwrap();
-            for y in [2, 3] {
-                let cell = &terminal.backend().buffer()[(3, y)];
-                assert_eq!(cell.fg, Color::DarkGray);
-                assert!(cell.modifier.contains(Modifier::ITALIC));
-            }
-            app.apply_event(&codeswarm_adapters::AgentEvent::TurnComplete { slot: 0 });
-            app.record_human_message("next task", false);
-            app.apply_event(&events[1]);
-            app.apply_event(&events[0]);
-            let later = app.transcript.viewport(78, 0, 30, 0);
-            assert_eq!(&later[..4], &rows[..4]);
+            let actual = rows
+                .iter()
+                .filter(|row| !row.first_in_block && !row.text.is_empty())
+                .map(|row| row.kind)
+                .collect::<Vec<_>>();
+            let expected = order
+                .map(|index| match index {
+                    0 => BlockKind::Agent,
+                    1 => BlockKind::Thought,
+                    _ => BlockKind::Tool,
+                })
+                .to_vec();
+            assert_eq!(actual, expected, "{order:?}: {rows:?}");
         }
     }
 
@@ -10209,6 +10213,7 @@ mod tests {
                 slot: 0,
                 text: "reasoning".into(),
             });
+            let thought = app.streaming_blocks[&(0, BlockKind::Thought)];
             app.apply_event(&codeswarm_adapters::AgentEvent::Tool {
                 slot: 0,
                 update: codeswarm_adapters::ToolUpdate {
@@ -10219,7 +10224,6 @@ mod tests {
                     detail: Some("result".into()),
                 },
             });
-            let thought = app.streaming_blocks[&(0, BlockKind::Thought)];
             let tool = app.tool_windows[&0].calls[0].block_id;
             if expanded {
                 app.transcript.set_collapsed(thought, false);
@@ -10340,7 +10344,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rows.iter().any(|row| row.contains("Antigravity")));
         assert!(!rows.iter().any(|row| row.contains("Tool ·")));
-        assert_eq!(rows.iter().filter(|row| row.contains("🔧")).count(), 3);
+        // Three consecutive tool calls are one run: a single gutter icon.
+        assert_eq!(rows.iter().filter(|row| row.contains("🔧")).count(), 1);
         assert_eq!(app.toggle_focused_detail(), Some(false));
         let history = app.transcript.viewport(72, 0, 10, 0);
         for title in ["Noisy one", "Noisy two", "Noisy three"] {
@@ -10512,6 +10517,67 @@ mod tests {
             super::tool_call_summary("🔧 error", codeswarm_adapters::ToolStatus::Failed),
             "error · failed"
         );
+    }
+
+    #[test]
+    fn a_run_of_tool_calls_shares_one_gutter_icon_and_stays_clickable() {
+        let mut app = App::default();
+        app.set_agent_name(0, "Antigravity");
+        let tool = |id: &str| codeswarm_adapters::AgentEvent::Tool {
+            slot: 0,
+            update: codeswarm_adapters::ToolUpdate {
+                activity: None,
+                id: id.into(),
+                title: "Read file".into(),
+                status: codeswarm_adapters::ToolStatus::Completed,
+                detail: Some(format!("contents of {id}")),
+            },
+        };
+        for id in ["a", "b", "c", "d", "e"] {
+            app.apply_event(&tool(id));
+        }
+        // Prose ends the run, so the tools after it lead a new one.
+        app.apply_event(&codeswarm_adapters::AgentEvent::Text {
+            slot: 0,
+            text: "reading more".into(),
+        });
+        for id in ["f", "g"] {
+            app.apply_event(&tool(id));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(72, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(72)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered.iter().filter(|row| row.contains("🔧")).count(),
+            2,
+            "rendered={rendered:?}"
+        );
+        // Grouping the gutter hides no call: every one keeps its own row.
+        for id in ["a", "b", "c", "d", "e", "f", "g"] {
+            assert!(
+                rendered
+                    .iter()
+                    .any(|row| row.contains(&format!("contents of {id}"))),
+                "{id} missing from {rendered:?}"
+            );
+        }
+        assert_eq!(app.detail_controls.len(), 7);
+        let second = app.tool_windows[&0].calls[1].block_id;
+        let (area, id) = *app
+            .detail_controls
+            .iter()
+            .find(|(_, id)| *id == second)
+            .expect("suppressed row keeps its hit target");
+        assert_eq!(terminal.backend().buffer()[(area.x, area.y)].symbol(), " ");
+        assert_eq!(app.transcript.is_collapsed(id), Some(true));
+        assert_eq!(app.click_detail(area.x, area.y), Some(false));
+        assert_eq!(app.transcript.is_collapsed(id), Some(false));
     }
 
     #[test]

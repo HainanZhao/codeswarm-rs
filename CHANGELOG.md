@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.24] - 2026-09-19
+
+### Changed
+
+- Render agent prose, thoughts, and tool calls in their actual event timeline;
+  prose that resumes after a tool starts a new segment at that position instead
+  of moving all tool activity to the bottom of the turn.
+- Show one 💭/🔧 gutter icon per consecutive run of details instead of repeating
+  it on every row, so a wall of ten tool calls reads as one list. Each call
+  still keeps its own row and click target; a prose row re-arms the icon.
+
 ## [0.10.23] - 2026-09-18
 
 ### Fixed

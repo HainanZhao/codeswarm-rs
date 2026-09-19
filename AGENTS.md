@@ -169,8 +169,9 @@
   muted metadata and thoughts. Do not reuse teal/cyan for output formatting,
   transcript notices, or diff hunk headers. Red/green diff semantics and the
   distinct non-teal roster identity colors remain supported.
-  Within each agent turn, render message text before its thought and tool
-  details, regardless of adapter event order. Thoughts use a word-wrapped,
+  Within each agent turn, render message text, thoughts, and tool calls in
+  their adapter event order. A message resumed after a tool or thought starts
+  a new transcript segment at that point in the timeline. Thoughts use a word-wrapped,
   rolling three-line preview: a full bottom line moves up as a new line begins,
   and only the newest three lines remain visible. Tools keep a one-line tail
   preview. Flatten paragraph whitespace in collapsed thoughts so blank lines
@@ -182,6 +183,10 @@
   completion counts. Keep meaningful tool names and running/failure status.
   Hide completed tool summaries with no name or output; never render an empty
   tool row containing only its icon.
+  A consecutive run of same-kind details shares its first icon: later rows in
+  the run keep a blank gutter, one row per call, and their own hit target, so
+  grouping the emoji never hides a call or makes it unexpandable. Any prose,
+  human, or opposite-kind row ends the run and re-arms the icon.
   Each icon toggles expansion;
   keep Ctrl+O as the keyboard shortcut. Controls must not consume
   preview width, and hit targets must be rebuilt on redraw/scroll/resize.
